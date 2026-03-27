@@ -3,6 +3,10 @@ node_modules/
 data/artifacts/
 data/runs/
 data/site-suite-summary.json
+data/*.png
+data/*.jpg
+data/*.jpeg
+data/*.webp
 src/shared/ids.js
 *.log
 .env

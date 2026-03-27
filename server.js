@@ -4,15 +4,24 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
 
 const __filename = fileURLToPath(import.meta.url);
 const rootDir = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+const swaggerUiAssetDir = path.dirname(require.resolve("swagger-ui-dist/package.json"));
+const documentationPaths = {
+  openApi: "/openapi.json",
+  docs: "/docs",
+  playground: "/playground",
+  swaggerAssets: "/swagger-ui",
+};
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.1.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.1.1",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -2027,6 +2036,1244 @@ function asyncRoute(handler) {
   };
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function getBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.get("host") || `127.0.0.1:${config.port}`;
+  return `${proto}://${host}`;
+}
+
+function buildOpenApiSpec(req) {
+  const baseUrl = getBaseUrl(req);
+  const api = config.apiBasePath;
+
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: `${config.serviceName} API`,
+      version: config.serviceVersion,
+      description: "Stateful Playwright REST API with Streamable MCP support, Swagger UI, and a local demo page for offline automation checks.",
+    },
+    servers: [{ url: baseUrl }],
+    tags: [
+      { name: "Docs", description: "Built-in documentation and demo endpoints." },
+      { name: "Scripts", description: "Script registry and validation APIs." },
+      { name: "Runs", description: "Playwright test run orchestration APIs." },
+      { name: "Sessions", description: "Stateful low-level browser automation APIs." },
+      { name: "MCP", description: "Streamable MCP HTTP endpoint for AI agents." },
+    ],
+    components: {
+      schemas: {
+        Locator: {
+          type: "object",
+          description: "Structured Playwright-friendly locator.",
+          properties: {
+            role: { type: "string", example: "button" },
+            name: { type: "string", example: "Login" },
+            text: { type: "string", example: "Ready" },
+            label: { type: "string", example: "Email" },
+            placeholder: { type: "string", example: "Type a message" },
+            testId: { type: "string", example: "status" },
+            css: { type: "string", example: "#submit-button" },
+            xpath: { type: "string", example: "//button[@type='submit']" },
+            selector: { type: "string", example: "[data-testid='status']" },
+            exact: { type: "boolean" },
+            nth: { type: "integer", minimum: 0 },
+          },
+        },
+        CreateRunRequest: {
+          type: "object",
+          required: ["scriptKey"],
+          properties: {
+            scriptKey: { type: "string", example: "checkout/guest-order" },
+            project: { type: "string", example: "chromium" },
+            grep: { type: "string", example: "@smoke" },
+            env: { type: "string", example: "staging" },
+            baseURL: { type: "string", example: "https://stg.example.com" },
+            headed: { type: "boolean", default: false },
+            trace: { type: "string", example: "on-first-retry" },
+            video: { type: "string", example: "retain-on-failure" },
+            storageStateRef: { type: "string", example: "auth/customer.json" },
+            shard: { type: "string", example: "1/3" },
+            variables: { type: "object", additionalProperties: true },
+          },
+        },
+        CreateSessionRequest: {
+          type: "object",
+          properties: {
+            browserType: { type: "string", enum: ["chromium", "firefox", "webkit"], default: "chromium" },
+            headless: { type: "boolean", default: true },
+            ttlMs: { type: "integer", example: 1800000 },
+          },
+        },
+        CreateContextRequest: {
+          type: "object",
+          properties: {
+            baseURL: { type: "string", example: `${baseUrl}/demo/test-page` },
+            locale: { type: "string", example: "ko-KR" },
+            timezoneId: { type: "string", example: "Asia/Seoul" },
+            viewport: {
+              type: "object",
+              properties: {
+                width: { type: "integer", example: 1440 },
+                height: { type: "integer", example: 960 },
+              },
+            },
+          },
+        },
+        ExecuteBatchRequest: {
+          type: "object",
+          required: ["pageId", "steps"],
+          properties: {
+            pageId: { type: "string", example: "page_1234567890abcdef" },
+            steps: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  action: { type: "string", example: "goto" },
+                  url: { type: "string", example: `${baseUrl}/demo/test-page` },
+                  locator: { $ref: "#/components/schemas/Locator" },
+                  value: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+        ErrorEnvelope: {
+          type: "object",
+          properties: {
+            success: { type: "boolean", example: false },
+            error: {
+              type: "object",
+              properties: {
+                code: { type: "string", example: "LOCATOR_TIMEOUT" },
+                message: { type: "string", example: "button locator timeout" },
+                details: { type: "object", additionalProperties: true },
+              },
+            },
+            artifacts: { type: "object", additionalProperties: true },
+          },
+        },
+      },
+    },
+    paths: {
+      "/": {
+        get: {
+          tags: ["Docs"],
+          summary: "Landing page",
+          responses: { 200: { description: "HTML landing page" } },
+        },
+      },
+      [documentationPaths.openApi]: {
+        get: {
+          tags: ["Docs"],
+          summary: "OpenAPI JSON",
+          responses: { 200: { description: "OpenAPI document" } },
+        },
+      },
+      [documentationPaths.docs]: {
+        get: {
+          tags: ["Docs"],
+          summary: "Swagger UI",
+          responses: { 200: { description: "Swagger UI page" } },
+        },
+      },
+      [documentationPaths.playground]: {
+        get: {
+          tags: ["Docs"],
+          summary: "Interactive API playground",
+          responses: { 200: { description: "Playground page" } },
+        },
+      },
+      "/demo/test-page": {
+        get: {
+          tags: ["Docs"],
+          summary: "Local automation demo page",
+          responses: { 200: { description: "Demo test page" } },
+        },
+      },
+      "/health": {
+        get: {
+          tags: ["Docs"],
+          summary: "Health check",
+          responses: { 200: { description: "Service health summary" } },
+        },
+      },
+      [`${api}/scripts`]: {
+        get: {
+          tags: ["Scripts"],
+          summary: "List registered scripts",
+          responses: { 200: { description: "Script list" } },
+        },
+      },
+      [`${api}/scripts/sync`]: {
+        post: {
+          tags: ["Scripts"],
+          summary: "Refresh script registry",
+          responses: { 200: { description: "Updated registry" } },
+        },
+      },
+      [`${api}/scripts/validate`]: {
+        post: {
+          tags: ["Scripts"],
+          summary: "Validate a script request",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  oneOf: [
+                    { $ref: "#/components/schemas/CreateRunRequest" },
+                    {
+                      type: "object",
+                      properties: {
+                        inlineScript: { type: "string" },
+                        filename: { type: "string" },
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Validation result" } },
+        },
+      },
+      [`${api}/scripts/{scriptKey}`]: {
+        get: {
+          tags: ["Scripts"],
+          summary: "Get script details",
+          parameters: [{ name: "scriptKey", in: "path", required: true, schema: { type: "string" } }],
+          responses: {
+            200: { description: "Script metadata" },
+            404: { description: "Script not found", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } },
+          },
+        },
+      },
+      [`${api}/runs`]: {
+        get: {
+          tags: ["Runs"],
+          summary: "List runs",
+          responses: { 200: { description: "Run list" } },
+        },
+        post: {
+          tags: ["Runs"],
+          summary: "Create a run",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CreateRunRequest" },
+              },
+            },
+          },
+          responses: { 201: { description: "Created run" } },
+        },
+      },
+      [`${api}/runs/{runId}`]: {
+        get: {
+          tags: ["Runs"],
+          summary: "Get run status",
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Run details" } },
+        },
+      },
+      [`${api}/runs/{runId}/cancel`]: {
+        post: {
+          tags: ["Runs"],
+          summary: "Cancel a run",
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Cancellation result" } },
+        },
+      },
+      [`${api}/runs/{runId}/artifacts`]: {
+        get: {
+          tags: ["Runs"],
+          summary: "List run artifacts",
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Artifacts created by the run" } },
+        },
+      },
+      [`${api}/runs/{runId}/report`]: {
+        get: {
+          tags: ["Runs"],
+          summary: "Get run report",
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Summary report" } },
+        },
+      },
+      [`${api}/runs/{runId}/logs`]: {
+        get: {
+          tags: ["Runs"],
+          summary: "Get run logs",
+          parameters: [{ name: "runId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Structured logs" } },
+        },
+      },
+      [`${api}/sessions`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Create a browser session",
+          requestBody: {
+            required: false,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CreateSessionRequest" },
+              },
+            },
+          },
+          responses: { 201: { description: "Created session" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "Get session state",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Session details" } },
+        },
+        delete: {
+          tags: ["Sessions"],
+          summary: "Close session",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Session closure result" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/contexts`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Create a browser context",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: false,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CreateContextRequest" },
+              },
+            },
+          },
+          responses: { 201: { description: "Created context" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/pages`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Create a page in a context",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "contextId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: { 201: { description: "Created page" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/execute`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Execute a batch of page actions",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ExecuteBatchRequest" },
+              },
+            },
+          },
+          responses: { 200: { description: "Batch execution result" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/goto`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Navigate a page",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "pageId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["url"],
+                  properties: {
+                    url: { type: "string", example: `${baseUrl}/demo/test-page` },
+                    waitUntil: { type: "string", example: "domcontentloaded" },
+                    timeoutMs: { type: "integer", example: 10000 },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Navigation result" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/click`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Low-level click action",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "pageId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["locator"],
+                  properties: {
+                    locator: { $ref: "#/components/schemas/Locator" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Updated page state" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/fill`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Low-level fill action",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "pageId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["locator", "value"],
+                  properties: {
+                    locator: { $ref: "#/components/schemas/Locator" },
+                    value: { type: "string", example: "hello from playground" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Updated page state" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/assert/text`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Assert locator text",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "pageId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["locator", "value"],
+                  properties: {
+                    locator: { $ref: "#/components/schemas/Locator" },
+                    value: { type: "string", example: "Primary clicked" },
+                    match: { type: "string", example: "contains" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Assertion result" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/screenshot`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Capture a screenshot",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "pageId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: { 200: { description: "Created screenshot artifact" } },
+        },
+      },
+      [config.mcpBasePath]: {
+        get: {
+          tags: ["MCP"],
+          summary: "MCP GET probe",
+          responses: { 405: { description: "SSE stream is not enabled on this endpoint" } },
+        },
+        post: {
+          tags: ["MCP"],
+          summary: "Send Streamable MCP JSON-RPC request",
+          responses: { 200: { description: "JSON-RPC response" }, 202: { description: "Accepted without response payload" } },
+        },
+        delete: {
+          tags: ["MCP"],
+          summary: "Delete MCP session",
+          parameters: [{ name: "Mcp-Session-Id", in: "header", required: true, schema: { type: "string" } }],
+          responses: { 204: { description: "MCP session closed" } },
+        },
+      },
+    },
+  };
+}
+
+function renderHomePage(req) {
+  const baseUrl = getBaseUrl(req);
+  const entries = [
+    { href: documentationPaths.docs, label: "Swagger UI", description: "Browse the REST and MCP API in an offline-friendly UI." },
+    { href: documentationPaths.playground, label: "API Playground", description: "Call the service interactively, create sessions, and capture screenshots." },
+    { href: "/demo/test-page", label: "Demo Test Page", description: "Simple local page for stable Playwright automation checks." },
+    { href: documentationPaths.openApi, label: "OpenAPI JSON", description: "Raw OpenAPI document for client generation or import." },
+    { href: "/health", label: "Health", description: "Quick service status and counters." },
+  ];
+
+  const cards = entries.map((entry) => `
+    <a class="card" href="${escapeHtml(entry.href)}">
+      <strong>${escapeHtml(entry.label)}</strong>
+      <span>${escapeHtml(entry.description)}</span>
+      <code>${escapeHtml(baseUrl + entry.href)}</code>
+    </a>
+  `).join("");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(config.serviceName)} Home</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe7;
+      --panel: rgba(255,255,255,0.9);
+      --ink: #1d2433;
+      --muted: #5b6476;
+      --line: rgba(29,36,51,0.12);
+      --accent: #0f766e;
+      --accent-2: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.18), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(239,68,68,0.14), transparent 36%),
+        linear-gradient(180deg, #f6f1e7 0%, #ece9e4 100%);
+      min-height: 100vh;
+    }
+    main {
+      width: min(1040px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    .hero {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: 0 18px 50px rgba(29,36,51,0.08);
+      backdrop-filter: blur(12px);
+    }
+    .hero h1 {
+      margin: 0 0 10px;
+      font-size: clamp(2rem, 4vw, 3.5rem);
+      letter-spacing: -0.04em;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 720px;
+      line-height: 1.65;
+      font-size: 1.05rem;
+    }
+    .grid {
+      margin-top: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      display: grid;
+      gap: 8px;
+      padding: 18px;
+      text-decoration: none;
+      color: inherit;
+      background: rgba(255,255,255,0.86);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: 0 12px 34px rgba(29,36,51,0.06);
+      transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(15,118,110,0.35);
+      box-shadow: 0 20px 40px rgba(29,36,51,0.12);
+    }
+    .card strong { font-size: 1.05rem; }
+    .card span {
+      color: var(--muted);
+      line-height: 1.55;
+      min-height: 3.1em;
+    }
+    .card code {
+      color: var(--accent);
+      word-break: break-all;
+      font-size: .9rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>${escapeHtml(config.serviceName)}</h1>
+      <p>
+        This container serves the stateful Playwright REST API, Streamable MCP endpoint, Swagger UI, and a local demo page for offline browser automation.
+        Use the links below to inspect the API surface quickly or drive the built-in test page with screenshot capture.
+      </p>
+    </section>
+    <section class="grid">${cards}</section>
+  </main>
+</body>
+</html>`;
+}
+
+function renderSwaggerPage(req) {
+  const openApiUrl = `${getBaseUrl(req)}${documentationPaths.openApi}`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(config.serviceName)} Swagger UI</title>
+  <link rel="stylesheet" href="${documentationPaths.swaggerAssets}/swagger-ui.css">
+  <style>
+    html { box-sizing: border-box; overflow-y: scroll; }
+    *, *::before, *::after { box-sizing: inherit; }
+    body { margin: 0; background: #f8fafc; }
+    .topbar { display: none; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="${documentationPaths.swaggerAssets}/swagger-ui-bundle.js"></script>
+  <script src="${documentationPaths.swaggerAssets}/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: ${JSON.stringify(openApiUrl)},
+      dom_id: '#swagger-ui',
+      deepLinking: true,
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+      layout: 'StandaloneLayout',
+      displayRequestDuration: true,
+      defaultModelsExpandDepth: 2,
+      defaultModelExpandDepth: 2,
+      tryItOutEnabled: true
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderPlaygroundPage() {
+  const clientConfig = {
+    apiBasePath: config.apiBasePath,
+    docsPath: documentationPaths.docs,
+    openApiPath: documentationPaths.openApi,
+    demoPath: "/demo/test-page",
+  };
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(config.serviceName)} Playground</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --panel: rgba(255,255,255,0.94);
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: rgba(17,24,39,0.12);
+      --primary: #0f766e;
+      --accent: #c2410c;
+      --shadow: 0 18px 48px rgba(17,24,39,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.15), transparent 28%),
+        radial-gradient(circle at top right, rgba(194,65,12,0.12), transparent 28%),
+        linear-gradient(180deg, #f5f2ec 0%, #ece6df 100%);
+      min-height: 100vh;
+    }
+    main { width: min(1180px, calc(100vw - 24px)); margin: 0 auto; padding: 20px 0 28px; display: grid; gap: 18px; }
+    .hero, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); }
+    .hero { padding: 24px; }
+    .hero h1 { margin: 0 0 10px; font-size: clamp(1.9rem, 4vw, 3.2rem); letter-spacing: -0.05em; }
+    .hero p, .panel p { margin: 0 0 14px; color: var(--muted); line-height: 1.6; }
+    .hero nav, .row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .layout { display: grid; grid-template-columns: 1.15fr .85fr; gap: 18px; }
+    .left, .right, .stack, .grid2 { display: grid; gap: 12px; }
+    .panel { padding: 18px; }
+    .grid2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    a, button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      background: var(--primary);
+      color: #fff;
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    button.secondary, a.secondary { background: #e5e7eb; color: #111827; }
+    button.warn { background: var(--accent); }
+    label { display: grid; gap: 6px; font-size: .94rem; font-weight: 600; }
+    input, select, textarea, pre {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      padding: 11px 12px;
+      font: inherit;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    .status {
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(15,118,110,0.08);
+      color: #0f766e;
+      font-weight: 600;
+    }
+    .status.error { background: rgba(194,65,12,0.1); color: #9a3412; }
+    pre { margin: 0; min-height: 280px; overflow: auto; background: #0f172a; color: #dbeafe; line-height: 1.5; }
+    .preview {
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      min-height: 180px;
+      background: linear-gradient(135deg, rgba(15,118,110,0.1), rgba(194,65,12,0.08));
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+    }
+    .preview img { display: block; max-width: 100%; height: auto; }
+    @media (max-width: 980px) {
+      .layout, .grid2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>API Playground</h1>
+      <p>Use this page to call the built-in REST API against the current container, create a live browser session, navigate to the local demo page, and preview screenshot artifacts without leaving the browser.</p>
+      <nav>
+        <a href="${documentationPaths.docs}">Open Swagger UI</a>
+        <a class="secondary" href="/demo/test-page" target="_blank" rel="noreferrer">Open Demo Test Page</a>
+        <a class="secondary" href="${documentationPaths.openApi}" target="_blank" rel="noreferrer">OpenAPI JSON</a>
+      </nav>
+    </section>
+
+    <section class="layout">
+      <div class="left">
+        <section class="panel">
+          <h2>Quick Calls</h2>
+          <p>Basic endpoints for connectivity and script registry checks.</p>
+          <div class="row">
+            <button type="button" id="healthBtn">GET /health</button>
+            <button type="button" id="syncScriptsBtn" class="secondary">POST /api/scripts/sync</button>
+            <button type="button" id="loadScriptsBtn" class="secondary">GET /api/scripts</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Create Run</h2>
+          <p>Submit a script execution request using the registered script list from this container.</p>
+          <div class="grid2">
+            <label>Script<select id="scriptKey"></select></label>
+            <label>Project<input id="project" value="chromium"></label>
+            <label>Environment<input id="envName" value="local"></label>
+            <label>Base URL<input id="baseUrl" value=""></label>
+            <label>Grep<input id="grep" placeholder="@smoke"></label>
+            <label>Storage State Ref<input id="storageStateRef" placeholder="auth/customer.json"></label>
+          </div>
+          <label>Variables JSON
+            <textarea id="variablesJson">{
+  "locale": "ko-KR",
+  "source": "playground"
+}</textarea>
+          </label>
+          <div class="row">
+            <button type="button" id="createRunBtn">POST /api/runs</button>
+            <button type="button" id="listRunsBtn" class="secondary">GET /api/runs</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Session Flow</h2>
+          <p>Create a low-level session, open the local demo page, click and type, then capture a screenshot artifact.</p>
+          <div class="grid2">
+            <label>Session ID<input id="sessionId" readonly placeholder="Created session id"></label>
+            <label>Context ID<input id="contextId" readonly placeholder="Created context id"></label>
+            <label>Page ID<input id="pageId" readonly placeholder="Created page id"></label>
+            <label>Chat Message<input id="messageText" value="hello from playground"></label>
+          </div>
+          <div class="row">
+            <button type="button" id="createSessionBtn">Create Session</button>
+            <button type="button" id="createContextBtn" class="secondary">Create Context</button>
+            <button type="button" id="createPageBtn" class="secondary">Create Page</button>
+          </div>
+          <div class="row">
+            <button type="button" id="gotoDemoBtn">Goto Demo</button>
+            <button type="button" id="clickPrimaryBtn" class="secondary">Click Primary</button>
+            <button type="button" id="sendMessageBtn" class="secondary">Send Message</button>
+            <button type="button" id="takeScreenshotBtn">Take Screenshot</button>
+            <button type="button" id="closeSessionBtn" class="warn">Close Session</button>
+          </div>
+        </section>
+      </div>
+
+      <div class="right">
+        <section class="panel">
+          <h2>Current Status</h2>
+          <p>The latest API call result and a short human-readable summary are shown here.</p>
+          <div id="statusBox" class="status">Ready to call the API.</div>
+        </section>
+        <section class="panel">
+          <h2>Screenshot Preview</h2>
+          <p>When a screenshot artifact is created, it is shown below using the API download path.</p>
+          <div id="preview" class="preview">No screenshot yet.</div>
+        </section>
+        <section class="panel">
+          <h2>JSON Result</h2>
+          <p>All responses are rendered as pretty JSON so the page is useful for debugging in air-gapped environments.</p>
+          <pre id="resultBox">{}</pre>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const CONFIG = ${JSON.stringify(clientConfig)};
+    const state = { sessionId: '', contextId: '', pageId: '' };
+    const resultBox = document.getElementById('resultBox');
+    const preview = document.getElementById('preview');
+    const statusBox = document.getElementById('statusBox');
+    const scriptKeySelect = document.getElementById('scriptKey');
+    const sessionIdInput = document.getElementById('sessionId');
+    const contextIdInput = document.getElementById('contextId');
+    const pageIdInput = document.getElementById('pageId');
+
+    function setStatus(message, isError) {
+      statusBox.textContent = message;
+      statusBox.className = isError ? 'status error' : 'status';
+    }
+
+    function setResult(payload) {
+      resultBox.textContent = JSON.stringify(payload, null, 2);
+    }
+
+    function syncInputs() {
+      sessionIdInput.value = state.sessionId;
+      contextIdInput.value = state.contextId;
+      pageIdInput.value = state.pageId;
+    }
+
+    function showArtifact(artifact) {
+      if (!artifact || !artifact.downloadPath) {
+        preview.textContent = 'No screenshot yet.';
+        return;
+      }
+      preview.innerHTML = '<img alt="Screenshot artifact preview">';
+      preview.querySelector('img').src = artifact.downloadPath;
+    }
+
+    async function api(method, path, body) {
+      const response = await fetch(path, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined
+      });
+      const contentType = response.headers.get('content-type') || '';
+      const payload = contentType.includes('application/json') ? await response.json() : await response.text();
+      setResult(payload);
+      if (!response.ok) {
+        const message = payload && payload.error && payload.error.message ? payload.error.message : 'Request failed';
+        setStatus(method + ' ' + path + ' failed: ' + message, true);
+        throw new Error(message);
+      }
+      setStatus(method + ' ' + path + ' completed.', false);
+      return payload;
+    }
+
+    async function refreshScripts() {
+      const payload = await api('GET', CONFIG.apiBasePath + '/scripts');
+      const scripts = (payload.data && payload.data.scripts) || [];
+      scriptKeySelect.innerHTML = '';
+      if (!scripts.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No scripts found';
+        scriptKeySelect.append(option);
+        return;
+      }
+      scripts.forEach((script) => {
+        const option = document.createElement('option');
+        option.value = script.key;
+        option.textContent = script.key;
+        scriptKeySelect.append(option);
+      });
+    }
+
+    function requireValue(value, message) {
+      if (!value) {
+        throw new Error(message);
+      }
+    }
+
+    document.getElementById('healthBtn').addEventListener('click', async () => { await api('GET', '/health'); });
+    document.getElementById('syncScriptsBtn').addEventListener('click', async () => {
+      await api('POST', CONFIG.apiBasePath + '/scripts/sync', {});
+      await refreshScripts();
+    });
+    document.getElementById('loadScriptsBtn').addEventListener('click', async () => { await refreshScripts(); });
+    document.getElementById('createRunBtn').addEventListener('click', async () => {
+      const variablesText = document.getElementById('variablesJson').value.trim();
+      const variables = variablesText ? JSON.parse(variablesText) : {};
+      const payload = await api('POST', CONFIG.apiBasePath + '/runs', {
+        scriptKey: scriptKeySelect.value,
+        project: document.getElementById('project').value.trim() || undefined,
+        env: document.getElementById('envName').value.trim() || undefined,
+        baseURL: document.getElementById('baseUrl').value.trim() || undefined,
+        grep: document.getElementById('grep').value.trim() || undefined,
+        storageStateRef: document.getElementById('storageStateRef').value.trim() || undefined,
+        variables
+      });
+      if (payload && payload.data && payload.data.runId) {
+        setStatus('Run created: ' + payload.data.runId, false);
+      }
+    });
+    document.getElementById('listRunsBtn').addEventListener('click', async () => { await api('GET', CONFIG.apiBasePath + '/runs'); });
+    document.getElementById('createSessionBtn').addEventListener('click', async () => {
+      const payload = await api('POST', CONFIG.apiBasePath + '/sessions', { browserType: 'chromium', headless: true });
+      state.sessionId = payload.data.sessionId;
+      state.contextId = '';
+      state.pageId = '';
+      syncInputs();
+    });
+    document.getElementById('createContextBtn').addEventListener('click', async () => {
+      requireValue(state.sessionId, 'Create a session first.');
+      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts', {
+        viewport: { width: 1440, height: 960 }
+      });
+      state.contextId = payload.data.contextId;
+      state.pageId = '';
+      syncInputs();
+    });
+    document.getElementById('createPageBtn').addEventListener('click', async () => {
+      requireValue(state.contextId, 'Create a context first.');
+      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts/' + state.contextId + '/pages', {});
+      state.pageId = payload.data.pageId;
+      syncInputs();
+    });
+    document.getElementById('gotoDemoBtn').addEventListener('click', async () => {
+      requireValue(state.pageId, 'Create a page first.');
+      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/goto', {
+        url: window.location.origin + CONFIG.demoPath,
+        waitUntil: 'domcontentloaded'
+      });
+    });
+    document.getElementById('clickPrimaryBtn').addEventListener('click', async () => {
+      requireValue(state.pageId, 'Create a page first.');
+      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
+        locator: { testId: 'primary-action' }
+      });
+      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/assert/text', {
+        locator: { testId: 'status' },
+        value: 'Primary clicked',
+        match: 'contains'
+      });
+    });
+    document.getElementById('sendMessageBtn').addEventListener('click', async () => {
+      requireValue(state.pageId, 'Create a page first.');
+      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/fill', {
+        locator: { label: 'Message' },
+        value: document.getElementById('messageText').value
+      });
+      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
+        locator: { role: 'button', name: 'Send message' }
+      });
+    });
+    document.getElementById('takeScreenshotBtn').addEventListener('click', async () => {
+      requireValue(state.pageId, 'Create a page first.');
+      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/screenshot', {
+        fullPage: true,
+        type: 'png'
+      });
+      showArtifact(payload && payload.data && payload.data.artifact);
+    });
+    document.getElementById('closeSessionBtn').addEventListener('click', async () => {
+      requireValue(state.sessionId, 'Create a session first.');
+      await api('DELETE', CONFIG.apiBasePath + '/sessions/' + state.sessionId);
+      state.sessionId = '';
+      state.contextId = '';
+      state.pageId = '';
+      syncInputs();
+      preview.textContent = 'No screenshot yet.';
+    });
+
+    syncInputs();
+    refreshScripts().catch((error) => setStatus(error.message, true));
+  </script>
+</body>
+</html>`;
+}
+
+function renderDemoTestPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Playwright Player Demo Page</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --panel: rgba(255,255,255,0.95);
+      --ink: #172033;
+      --muted: #5f6b82;
+      --line: rgba(23,32,51,0.12);
+      --teal: #0f766e;
+      --sand: #b45309;
+      --shadow: 0 20px 48px rgba(23,32,51,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15,118,110,0.17), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(180,83,9,0.12), transparent 34%),
+        linear-gradient(180deg, #f8f4ed 0%, #eee8df 100%);
+      min-height: 100vh;
+    }
+    main { width: min(1120px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 36px; display: grid; gap: 18px; }
+    .hero, .panel { border-radius: 26px; background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .hero { padding: 26px; }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3.4rem); letter-spacing: -0.05em; }
+    .hero p, .muted { margin: 0; line-height: 1.65; color: var(--muted); }
+    .layout { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; }
+    .panel { padding: 20px; }
+    h2 { margin: 0 0 12px; font-size: 1.12rem; }
+    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    label { display: grid; gap: 6px; font-weight: 600; }
+    input, select, button { font: inherit; }
+    input, select {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #fff;
+      background: var(--teal);
+    }
+    .ghost { background: #e5e7eb; color: #111827; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .status, .counter, .feed {
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 14px 16px;
+    }
+    .status strong { display: block; margin-bottom: 6px; }
+    ul.feed {
+      list-style: none;
+      margin: 0;
+      display: grid;
+      gap: 10px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    ul.feed li {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(15,118,110,0.08);
+      border: 1px solid rgba(15,118,110,0.12);
+    }
+    ul.feed li.reply {
+      background: rgba(180,83,9,0.08);
+      border-color: rgba(180,83,9,0.14);
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(23,32,51,0.07);
+      color: var(--muted);
+      font-size: .9rem;
+      margin: 8px 8px 0 0;
+    }
+    @media (max-width: 920px) {
+      .layout, .grid2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>Playwright Player Demo Page</h1>
+      <p>This local page is designed for stable browser automation in offline environments. It exposes role, label, text, and test id based targets for click, fill, assert, and screenshot flows.</p>
+    </section>
+    <section class="layout">
+      <div class="panel">
+        <h2>Interaction Targets</h2>
+        <p class="muted">Use the controls below with the low-level session API.</p>
+        <div>
+          <span class="chip">data-testid="primary-action"</span>
+          <span class="chip">data-testid="status"</span>
+          <span class="chip">label="Message"</span>
+        </div>
+
+        <div class="status" data-testid="status-panel" style="margin-top: 16px;">
+          <strong>Status</strong>
+          <div id="statusText" data-testid="status">Ready</div>
+        </div>
+
+        <div class="row" style="margin-top: 14px;">
+          <button type="button" id="primaryAction" data-testid="primary-action">Primary Action</button>
+          <button type="button" id="secondaryAction" class="ghost">Secondary Action</button>
+        </div>
+
+        <div class="grid2" style="margin-top: 18px;">
+          <label>Name<input id="nameInput" placeholder="Operator name" data-testid="name-input"></label>
+          <label>Role
+            <select id="roleSelect" data-testid="role-select">
+              <option value="observer">observer</option>
+              <option value="operator">operator</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="row" style="margin-top: 14px;">
+          <button type="button" id="saveProfile">Save Profile</button>
+          <div id="profileResult" data-testid="profile-result" class="muted">Profile is not saved yet.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Counter And Chat</h2>
+        <div class="counter" data-testid="counter-card">
+          <strong>Counter</strong>
+          <div id="counterValue" data-testid="counter-value">0</div>
+          <div class="row" style="margin-top: 12px;">
+            <button type="button" id="incrementCounter">Increment Counter</button>
+            <button type="button" id="resetCounter" class="ghost">Reset</button>
+          </div>
+        </div>
+
+        <div style="margin-top: 18px;">
+          <label>Message<input id="messageInput" placeholder="Type a message" aria-label="Message"></label>
+          <div class="row" style="margin-top: 12px;">
+            <button type="button" id="sendMessage">Send message</button>
+            <div id="chatSummary" data-testid="chat-summary" class="muted">No messages sent.</div>
+          </div>
+          <ul id="messageFeed" class="feed" data-testid="message-feed">
+            <li>System: local demo page loaded.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const statusText = document.getElementById('statusText');
+    const profileResult = document.getElementById('profileResult');
+    const counterValue = document.getElementById('counterValue');
+    const messageFeed = document.getElementById('messageFeed');
+    const chatSummary = document.getElementById('chatSummary');
+
+    function appendMessage(text, className) {
+      const item = document.createElement('li');
+      if (className) {
+        item.className = className;
+      }
+      item.textContent = text;
+      messageFeed.append(item);
+      item.scrollIntoView({ block: 'nearest' });
+    }
+
+    document.getElementById('primaryAction').addEventListener('click', () => {
+      statusText.textContent = 'Primary clicked';
+    });
+    document.getElementById('secondaryAction').addEventListener('click', () => {
+      statusText.textContent = 'Secondary clicked';
+    });
+    document.getElementById('saveProfile').addEventListener('click', () => {
+      const name = document.getElementById('nameInput').value.trim() || 'anonymous';
+      const role = document.getElementById('roleSelect').value;
+      profileResult.textContent = 'Saved profile for ' + name + ' as ' + role + '.';
+      statusText.textContent = 'Profile saved';
+    });
+    document.getElementById('incrementCounter').addEventListener('click', () => {
+      const next = Number(counterValue.textContent || '0') + 1;
+      counterValue.textContent = String(next);
+      statusText.textContent = 'Counter updated';
+    });
+    document.getElementById('resetCounter').addEventListener('click', () => {
+      counterValue.textContent = '0';
+      statusText.textContent = 'Counter reset';
+    });
+    document.getElementById('sendMessage').addEventListener('click', () => {
+      const input = document.getElementById('messageInput');
+      const value = input.value.trim();
+      if (!value) {
+        statusText.textContent = 'Message is empty';
+        return;
+      }
+      appendMessage('You: ' + value, '');
+      appendMessage('Bot: Echo -> ' + value, 'reply');
+      chatSummary.textContent = 'Last message: ' + value;
+      statusText.textContent = 'Message sent';
+      input.value = '';
+    });
+  </script>
+</body>
+</html>`;
+}
+
 const scriptRegistry = new ScriptRegistry(config);
 await scriptRegistry.refresh();
 const runManager = new RunManager({
@@ -2038,6 +3285,7 @@ const sessionManager = new SessionManager(config);
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: config.bodyLimit }));
+app.use(documentationPaths.swaggerAssets, express.static(swaggerUiAssetDir));
 
 const mcpSessions = new Map();
 
@@ -2061,6 +3309,26 @@ app.use((req, res, next) => {
 
   return next();
 });
+
+app.get("/", asyncRoute(async (req, res) => {
+  res.type("html").send(renderHomePage(req));
+}));
+
+app.get(documentationPaths.openApi, asyncRoute(async (req, res) => {
+  res.json(buildOpenApiSpec(req));
+}));
+
+app.get(documentationPaths.docs, asyncRoute(async (req, res) => {
+  res.type("html").send(renderSwaggerPage(req));
+}));
+
+app.get(documentationPaths.playground, asyncRoute(async (req, res) => {
+  res.type("html").send(renderPlaygroundPage());
+}));
+
+app.get("/demo/test-page", asyncRoute(async (req, res) => {
+  res.type("html").send(renderDemoTestPage());
+}));
 
 app.get("/health", asyncRoute(async (req, res) => {
   ok(res, {

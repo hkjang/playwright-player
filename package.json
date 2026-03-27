@@ -1,6 +1,6 @@
 {
   "name": "playwright-player",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Stateful Playwright REST API with script runs and Streamable MCP support",
@@ -15,6 +15,7 @@
   "dependencies": {
     "@playwright/test": "1.58.2",
     "express": "^4.21.2",
-    "playwright": "1.58.2"
+    "playwright": "1.58.2",
+    "swagger-ui-dist": "^5.32.1"
   }
 }
