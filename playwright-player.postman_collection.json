@@ -1,0 +1,640 @@
+{
+  "info": {
+    "name": "playwright-player",
+    "_postman_id": "7f738b43-427e-4a7f-8b8f-b9f8a4fb0ac1",
+    "description": "Single-container Playwright REST API and Streamable MCP examples for playwright-player.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:3000"
+    },
+    {
+      "key": "apiBase",
+      "value": "{{baseUrl}}/api"
+    },
+    {
+      "key": "mcpBase",
+      "value": "{{baseUrl}}/mcp"
+    },
+    {
+      "key": "scriptKey",
+      "value": "naver-home"
+    },
+    {
+      "key": "runId",
+      "value": ""
+    },
+    {
+      "key": "sessionId",
+      "value": ""
+    },
+    {
+      "key": "contextId",
+      "value": ""
+    },
+    {
+      "key": "pageId",
+      "value": ""
+    },
+    {
+      "key": "mcpSessionId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Scripts",
+      "item": [
+        {
+          "name": "List Scripts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/scripts",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "scripts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Sync Scripts",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/scripts/sync",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "scripts",
+                "sync"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Script",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/scripts/{{scriptKey}}",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "scripts",
+                "{{scriptKey}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Runs",
+      "item": [
+        {
+          "name": "Create Run",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json && json.data && json.data.runId) {",
+                  "  pm.collectionVariables.set('runId', json.data.runId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scriptKey\": \"{{scriptKey}}\",\n  \"project\": \"chromium\",\n  \"headed\": false,\n  \"trace\": \"retain-on-failure\",\n  \"video\": \"retain-on-failure\",\n  \"screenshot\": \"only-on-failure\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/runs",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Run",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/runs/{{runId}}",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs",
+                "{{runId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Run Artifacts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/runs/{{runId}}/artifacts",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs",
+                "{{runId}}",
+                "artifacts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Run Report",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/runs/{{runId}}/report",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs",
+                "{{runId}}",
+                "report"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Run Logs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/runs/{{runId}}/logs",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs",
+                "{{runId}}",
+                "logs"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Cancel Run",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/runs/{{runId}}/cancel",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "runs",
+                "{{runId}}",
+                "cancel"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sessions",
+      "item": [
+        {
+          "name": "Create Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json && json.data && json.data.sessionId) {",
+                  "  pm.collectionVariables.set('sessionId', json.data.sessionId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"browserType\": \"chromium\",\n  \"headed\": false\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Context",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json && json.data && json.data.contextId) {",
+                  "  pm.collectionVariables.set('contextId', json.data.contextId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"locale\": \"ko-KR\",\n  \"viewport\": {\n    \"width\": 1440,\n    \"height\": 1200\n  }\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/contexts",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "contexts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Page",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json && json.data && json.data.pageId) {",
+                  "  pm.collectionVariables.set('pageId', json.data.pageId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/contexts/{{contextId}}/pages",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "contexts",
+                "{{contextId}}",
+                "pages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Goto Naver",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://www.naver.com\",\n  \"waitUntil\": \"domcontentloaded\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/pages/{{pageId}}/goto",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "pages",
+                "{{pageId}}",
+                "goto"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Assert Search Visible",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"locator\": {\n    \"css\": \"input[name='query']\"\n  },\n  \"timeoutMs\": 10000\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/pages/{{pageId}}/assert/visible",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "pages",
+                "{{pageId}}",
+                "assert",
+                "visible"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Screenshot",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fullPage\": true,\n  \"type\": \"png\"\n}"
+            },
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/pages/{{pageId}}/screenshot",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "pages",
+                "{{pageId}}",
+                "screenshot"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Session Artifacts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}/artifacts",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "artifacts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Session",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{apiBase}}/sessions/{{sessionId}}",
+              "host": [
+                "{{apiBase}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "MCP",
+      "item": [
+        {
+          "name": "Initialize",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const sessionId = pm.response.headers.get('Mcp-Session-Id');",
+                  "if (sessionId) {",
+                  "  pm.collectionVariables.set('mcpSessionId', sessionId);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2025-03-26\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"postman-client\",\n      \"version\": \"1.0.0\"\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{mcpBase}}",
+              "host": [
+                "{{mcpBase}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tools List",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\"\n}"
+            },
+            "url": {
+              "raw": "{{mcpBase}}",
+              "host": [
+                "{{mcpBase}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tool Call - script_list",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"script_list\",\n    \"arguments\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{mcpBase}}",
+              "host": [
+                "{{mcpBase}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Tool Call - run_create",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run_create\",\n    \"arguments\": {\n      \"scriptKey\": \"naver-home\",\n      \"project\": \"chromium\",\n      \"headed\": false\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{mcpBase}}",
+              "host": [
+                "{{mcpBase}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete MCP Session",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{mcpBase}}",
+              "host": [
+                "{{mcpBase}}"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

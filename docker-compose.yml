@@ -1,0 +1,17 @@
+services:
+  playwright-player:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    ipc: host
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DEFAULT_HEADLESS: "true"
+      ENABLE_EVALUATE: "true"
+    volumes:
+      - ./scripts:/app/scripts
+      - ./storage-states:/app/storage-states
+      - ./data:/app/data

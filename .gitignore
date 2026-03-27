@@ -1,0 +1,8 @@
+node_modules/
+.npm-cache/
+data/artifacts/
+data/runs/
+data/site-suite-summary.json
+src/shared/ids.js
+*.log
+.env

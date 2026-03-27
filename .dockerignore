@@ -1,0 +1,7 @@
+node_modules
+npm-debug.log
+data/artifacts
+data/runs
+.git
+.gitignore
+README.local.md
