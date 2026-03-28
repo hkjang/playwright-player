@@ -59,6 +59,18 @@ docker compose up --build
 
 Playwright 공식 권장값에 맞춰 Compose 예시는 `init: true`, `ipc: host` 를 사용합니다.
 
+### 오프라인망 Docker 이미지 실행
+
+릴리즈에 포함된 Docker 이미지 `tar.gz`를 오프라인망으로 반입한 뒤 실행하는 절차는 [docs/OFFLINE_DOCKER_GUIDE_KO.md](docs/OFFLINE_DOCKER_GUIDE_KO.md)에 정리했습니다.
+
+가장 빠른 방법:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
+  -ArchivePath ".\playwright-player-v0.1.3-docker-image.tar.gz" `
+  -ImageRef "playwright-player:v0.1.3"
+```
+
 ## REST API
 
 기본 prefix 는 `/api` 입니다.

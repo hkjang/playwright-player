@@ -3,6 +3,7 @@ node_modules/
 data/artifacts/
 data/runs/
 data/site-suite-summary.json
+offline-runtime/
 data/*.png
 data/*.jpg
 data/*.jpeg
