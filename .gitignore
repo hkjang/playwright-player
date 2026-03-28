@@ -7,6 +7,10 @@ data/*.png
 data/*.jpg
 data/*.jpeg
 data/*.webp
+data/*.html
+data/*.json
+data/*.body
+data/*.headers
 src/shared/ids.js
 *.log
 .env

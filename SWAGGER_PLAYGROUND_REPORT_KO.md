@@ -73,12 +73,12 @@ Verification result:
 
 ## Screenshot Artifact
 
-- Saved file: `D:/project/playwright-player/data/docs-playground-demo-verification.png`
+- Saved file: `data/docs-playground-demo-verification.png`
 
 ## UI Screenshots
 
-- Swagger UI screen: `D:/project/playwright-player/data/swagger-ui-screen.png`
-- Playground screen: `D:/project/playwright-player/data/playground-screen.png`
+- Swagger UI screen: `data/swagger-ui-screen.png`
+- Playground screen: `data/playground-screen.png`
 
 ## Notes
 
