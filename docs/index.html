@@ -1,0 +1,252 @@
+﻿<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="playwright-player: Stateful Playwright REST API and Streamable MCP for offline-ready browser automation."
+    >
+    <title>playwright-player</title>
+    <link rel="stylesheet" href="./assets/site.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="./">
+          <span class="brand-mark">PP</span>
+          <span class="brand-copy">
+            <strong>playwright-player</strong>
+            <span data-i18n="brandTagline">Stateful Playwright automation</span>
+          </span>
+        </a>
+        <nav class="nav">
+          <a href="#features" data-i18n="navFeatures">Features</a>
+          <a href="#workflow" data-i18n="navWorkflow">Workflow</a>
+          <a href="#gallery" data-i18n="navGallery">Gallery</a>
+          <a href="#guides" data-i18n="navGuides">Guides</a>
+        </nav>
+        <div class="lang-switch" aria-label="Language switcher">
+          <button type="button" data-lang-button="ko">KO</button>
+          <button type="button" data-lang-button="en">EN</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow" data-i18n="heroEyebrow">Offline-ready browser control plane</p>
+            <h1 data-i18n="heroTitle">
+              Playwright browser automation as a session-aware REST API and Streamable MCP.
+            </h1>
+            <p class="hero-description" data-i18n="heroDescription">
+              Ship one container, keep browser state alive across calls, and let humans or AI agents
+              drive the same automation surface.
+            </p>
+            <div class="hero-actions">
+              <a
+                class="button button-primary"
+                href="https://github.com/hkjang/playwright-player/releases/latest"
+                target="_blank"
+                rel="noreferrer"
+                data-i18n="heroPrimaryCta"
+              >Latest Release</a>
+              <a
+                class="button button-secondary"
+                href="https://github.com/hkjang/playwright-player"
+                target="_blank"
+                rel="noreferrer"
+                data-i18n="heroSecondaryCta"
+              >GitHub Repository</a>
+            </div>
+            <ul class="hero-points">
+              <li data-i18n="heroPointOne">Single-container deployment for offline networks</li>
+              <li data-i18n="heroPointTwo">Runs API, low-level sessions API, and Streamable MCP in one runtime</li>
+              <li data-i18n="heroPointThree">Built-in Swagger UI, API playground, screenshots, trace, and guide viewer</li>
+            </ul>
+          </div>
+          <div class="hero-panel">
+            <div class="metric-grid">
+              <article class="metric-card">
+                <span class="metric-value">REST</span>
+                <span class="metric-label" data-i18n="metricRest">Stateful control plane</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-value">MCP</span>
+                <span class="metric-label" data-i18n="metricMcp">Streamable HTTP tools</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-value">LLM</span>
+                <span class="metric-label" data-i18n="metricLlm">Planning and scaffold assist</span>
+              </article>
+              <article class="metric-card">
+                <span class="metric-value">Docker</span>
+                <span class="metric-label" data-i18n="metricDocker">Offline-ready packaging</span>
+              </article>
+            </div>
+            <div class="hero-note">
+              <strong data-i18n="heroNoteTitle">Recommended shape</strong>
+              <p data-i18n="heroNoteBody">
+                Browser sessions stay warm, contexts isolate users, and AI agents call the same MCP
+                tools that operators can test from REST.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" id="features">
+          <div class="section-heading">
+            <p class="eyebrow" data-i18n="featuresEyebrow">Why teams use it</p>
+            <h2 data-i18n="featuresTitle">One runtime, three operating modes</h2>
+          </div>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <h3 data-i18n="featureOneTitle">Script registry and runs</h3>
+              <p data-i18n="featureOneBody">
+                Register Playwright specs, trigger runs with runtime variables, and collect report,
+                logs, screenshots, trace, and video artifacts.
+              </p>
+            </article>
+            <article class="feature-card">
+              <h3 data-i18n="featureTwoTitle">Low-level session control</h3>
+              <p data-i18n="featureTwoBody">
+                Keep browser, context, and page resources alive while debugging login flows, chat
+                flows, and flaky UI states step by step.
+              </p>
+            </article>
+            <article class="feature-card">
+              <h3 data-i18n="featureThreeTitle">AI-agent authoring assist</h3>
+              <p data-i18n="featureThreeBody">
+                Turn natural-language test requests into plans, scaffolds, locator hints, and MCP
+                tool calls that an offline LLM can follow.
+              </p>
+            </article>
+            <article class="feature-card">
+              <h3 data-i18n="featureFourTitle">Offline deployment</h3>
+              <p data-i18n="featureFourBody">
+                Publish a Docker image as `tar.gz`, load it inside the air-gapped environment, and
+                run Swagger UI, the playground, and demo pages locally.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="workflow">
+          <div class="section-heading">
+            <p class="eyebrow" data-i18n="workflowEyebrow">Recommended flow</p>
+            <h2 data-i18n="workflowTitle">From natural-language request to verified browser run</h2>
+          </div>
+          <div class="timeline">
+            <article class="timeline-card">
+              <span class="timeline-step">1</span>
+              <h3 data-i18n="workflowOneTitle">Plan</h3>
+              <p data-i18n="workflowOneBody">
+                Use assist APIs or MCP tools to shape the request into actions, variables, and
+                locator strategies.
+              </p>
+            </article>
+            <article class="timeline-card">
+              <span class="timeline-step">2</span>
+              <h3 data-i18n="workflowTwoTitle">Inspect</h3>
+              <p data-i18n="workflowTwoBody">
+                Open a debug session, inspect headings and locator candidates, then refine the
+                script before finalizing it.
+              </p>
+            </article>
+            <article class="timeline-card">
+              <span class="timeline-step">3</span>
+              <h3 data-i18n="workflowThreeTitle">Run</h3>
+              <p data-i18n="workflowThreeBody">
+                Execute the registered spec through `/api/runs` with project, environment, trace,
+                video, and storage state options.
+              </p>
+            </article>
+            <article class="timeline-card">
+              <span class="timeline-step">4</span>
+              <h3 data-i18n="workflowFourTitle">Review</h3>
+              <p data-i18n="workflowFourBody">
+                Review artifacts, logs, and reports from the same API surface or by following the
+                generated guides inside this page.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="gallery">
+          <div class="section-heading">
+            <p class="eyebrow" data-i18n="galleryEyebrow">What it looks like</p>
+            <h2 data-i18n="galleryTitle">Captured UI from the project itself</h2>
+          </div>
+          <div class="gallery-grid">
+            <figure class="gallery-card">
+              <img src="./assets/images/swagger-ui-screen.png" alt="Swagger UI screen">
+              <figcaption>
+                <strong data-i18n="galleryOneTitle">Swagger UI</strong>
+                <span data-i18n="galleryOneBody">Explore REST endpoints and request shapes with zero setup.</span>
+              </figcaption>
+            </figure>
+            <figure class="gallery-card">
+              <img src="./assets/images/playground-screen.png" alt="API playground screen">
+              <figcaption>
+                <strong data-i18n="galleryTwoTitle">API Playground</strong>
+                <span data-i18n="galleryTwoBody">Issue live REST calls from the browser while keeping session IDs visible.</span>
+              </figcaption>
+            </figure>
+            <figure class="gallery-card">
+              <img src="./assets/images/ko-demo-after.png" alt="Localized test page screen">
+              <figcaption>
+                <strong data-i18n="galleryThreeTitle">Localized Demo Page</strong>
+                <span data-i18n="galleryThreeBody">Built-in demo flows switch between Korean and English for stable automation.</span>
+              </figcaption>
+            </figure>
+          </div>
+        </section>
+
+        <section class="section guides-section" id="guides">
+          <div class="section-heading">
+            <p class="eyebrow" data-i18n="guidesEyebrow">Markdown guides</p>
+            <h2 data-i18n="guidesTitle">Read operational docs without leaving the landing page</h2>
+            <p class="section-subtitle" data-i18n="guidesSubtitle">
+              Each guide is stored as Markdown and rendered here in-place. Switch to raw mode if you
+              want the original source.
+            </p>
+          </div>
+
+          <div class="guides-layout">
+            <aside class="guides-list" aria-label="Guide navigation">
+              <div class="guides-list-header">
+                <strong data-i18n="guidesListTitle">Guides</strong>
+                <span id="guide-language-badge">KO</span>
+              </div>
+              <div id="guide-list"></div>
+            </aside>
+
+            <div class="guide-viewer">
+              <div class="guide-toolbar">
+                <div>
+                  <h3 id="guide-title">Guide</h3>
+                  <p id="guide-description"></p>
+                </div>
+                <div class="view-switch">
+                  <button type="button" data-view-mode="rendered" class="is-active" data-i18n="renderedView">Rendered</button>
+                  <button type="button" data-view-mode="raw" data-i18n="rawView">Raw Markdown</button>
+                </div>
+              </div>
+              <div id="guide-status" class="guide-status" aria-live="polite"></div>
+              <article id="guide-rendered" class="markdown-body"></article>
+              <pre id="guide-raw" class="raw-markdown" hidden></pre>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p data-i18n="footerCopy">
+          Built for offline browser automation, human debugging, and AI-agent execution on the same surface.
+        </p>
+      </footer>
+    </div>
+
+    <script type="module" src="./assets/site.js"></script>
+  </body>
+</html>
