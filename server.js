@@ -21,7 +21,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.1.3",
+  serviceVersion: process.env.SERVICE_VERSION || "0.1.4",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -53,6 +53,15 @@ const browsers = {
   firefox,
   webkit,
 };
+
+const isDocker = (() => {
+  try {
+    return fs.existsSync("/.dockerenv")
+      || (fs.existsSync("/proc/1/cgroup") && fs.readFileSync("/proc/1/cgroup", "utf8").includes("docker"));
+  } catch {
+    return false;
+  }
+})();
 
 await ensureDir(config.scriptsDir);
 await ensureDir(config.runsDir);
@@ -1832,13 +1841,21 @@ class SessionManager {
     }
 
     const sessionId = createId("sess");
+    const userArgs = [...this.options.launchArgs, ...(request.launchArgs || [])];
+    if (isDocker && browserType === "chromium") {
+      for (const flag of ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]) {
+        if (!userArgs.includes(flag)) {
+          userArgs.push(flag);
+        }
+      }
+    }
     const browser = await launcher.launch(
       cleanObject({
         headless: request.headless ?? this.options.defaultHeadless,
         slowMo: request.slowMo,
         channel: request.channel,
         proxy: request.proxy,
-        args: [...this.options.launchArgs, ...(request.launchArgs || [])],
+        args: userArgs,
       }),
     );
 
@@ -6132,6 +6149,9 @@ app.use((error, req, res, next) => {
 
 const server = app.listen(config.port, config.host, () => {
   console.log(`${config.serviceName} listening on http://${config.host}:${config.port}`);
+  if (isDocker) {
+    console.log("Docker environment detected — Chromium will launch with --no-sandbox --disable-dev-shm-usage --disable-gpu");
+  }
 });
 
 async function shutdown(signal) {
