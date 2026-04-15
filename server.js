@@ -1842,18 +1842,17 @@ class SessionManager {
 
     const sessionId = createId("sess");
     const userArgs = [...this.options.launchArgs, ...(request.launchArgs || [])];
-    if (isDocker && browserType === "chromium") {
-      for (const flag of ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]) {
-        if (!userArgs.includes(flag)) {
-          userArgs.push(flag);
-        }
-      }
-    }
+    // In Docker, Playwright 1.58+ selects the lightweight "chromium-headless-shell"
+    // binary for headless mode by default. That binary lacks full page functionality
+    // (goto/evaluate/screenshot can fail). Force the full Chromium binary via
+    // channel="chromium" so all page operations work reliably in containers.
+    const effectiveChannel = request.channel
+      || (isDocker && browserType === "chromium" ? "chromium" : undefined);
     const browser = await launcher.launch(
       cleanObject({
         headless: request.headless ?? this.options.defaultHeadless,
         slowMo: request.slowMo,
-        channel: request.channel,
+        channel: effectiveChannel,
         proxy: request.proxy,
         args: userArgs,
       }),
@@ -6150,7 +6149,7 @@ app.use((error, req, res, next) => {
 const server = app.listen(config.port, config.host, () => {
   console.log(`${config.serviceName} listening on http://${config.host}:${config.port}`);
   if (isDocker) {
-    console.log("Docker environment detected — Chromium will launch with --no-sandbox --disable-dev-shm-usage --disable-gpu");
+    console.log("Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell");
   }
 });
 

@@ -82,25 +82,30 @@ Follow these steps to quickly verify that the session API is working:
 
 ## 6. Docker Chromium auto-configuration (v0.1.4+)
 
-In offline Docker environments, running with plain `docker run` could cause the Chromium renderer to fail on page operations.
-Starting from v0.1.4, the server auto-detects the Docker environment and injects the following flags into Chromium:
+In offline Docker environments, sessions could be created but page operations (`goto`, `inspect`, `screenshot`) would fail.
 
-| Flag | Purpose |
-| --- | --- |
-| `--no-sandbox` | Disables Chromium sandbox when running as root inside a container |
-| `--disable-dev-shm-usage` | Bypasses the 64MB `/dev/shm` limit (uses `/tmp` instead) |
-| `--disable-gpu` | Disables GPU acceleration (no GPU driver in Docker) |
+### Root cause: `chromium-headless-shell` binary
+
+Starting from Playwright 1.58, running with `headless: true` (the default) selects the lightweight **`chromium-headless-shell`** binary instead of full Chromium. This binary lacks full page functionality and may fail on `page.goto`, `page.evaluate`, and `page.screenshot` inside Docker containers.
+
+- The browser main process starts successfully, so **session creation succeeds**.
+- However, page operations fail because the **renderer process does not work correctly**.
+
+### Fix: automatic full Chromium selection
+
+Starting from v0.1.4, the server auto-detects the Docker environment and sets `channel=chromium` to force the full Chromium binary. Essential flags like `--no-sandbox` and `--disable-dev-shm-usage` are already added automatically by Playwright.
 
 When the server starts, the following log confirms auto-detection:
 
 ```
-Docker environment detected — Chromium will launch with --no-sandbox --disable-dev-shm-usage --disable-gpu
+Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell
 ```
 
-To manually specify flags, use the environment variable:
+To manually specify the channel, pass it when creating a session:
 
-```powershell
--e PLAYWRIGHT_LAUNCH_ARGS="--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
+```json
+POST /api/sessions
+{ "channel": "chromium" }
 ```
 
 ## 7. Operational notes
@@ -114,9 +119,9 @@ To manually specify flags, use the environment variable:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Session created but goto/inspect/screenshot fail | Chromium renderer sandbox or shared memory limit | Use v0.1.4+, or set `PLAYWRIGHT_LAUNCH_ARGS` manually |
-| `Target closed` or `Browser closed` error | `/dev/shm` exceeded 64MB | Add `--ipc=host` or use `--disable-dev-shm-usage` flag |
-| Screenshot is blank | GPU rendering failure | Verify `--disable-gpu` flag is active |
+| Session created but goto/inspect/screenshot fail | `chromium-headless-shell` binary lacks full page functionality in Docker | Use v0.1.4+ (auto-selects full Chromium), or pass `"channel": "chromium"` when creating a session |
+| `Target closed` or `Browser closed` error | `/dev/shm` exceeded 64MB | Add `--ipc=host` (Playwright already applies `--disable-dev-shm-usage` by default) |
+| Screenshot is blank | headless-shell rendering limitation | Use `"channel": "chromium"` for full Chromium |
 | Container crashes immediately after start | Image architecture mismatch | Check image arch with `docker inspect` (amd64 required) |
 
 > For the full procedure, pair this guide with `docs/OFFLINE_DOCKER_GUIDE_KO.md` and `tools/offline-load-run.ps1` in the repository.

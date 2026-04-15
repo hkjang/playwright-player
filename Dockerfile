@@ -4,7 +4,6 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-ENV PLAYWRIGHT_LAUNCH_ARGS="--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
 
 COPY package.json ./
 RUN npm install --omit=dev --no-fund --no-audit

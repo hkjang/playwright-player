@@ -82,25 +82,30 @@ docker run -d `
 
 ## 6. Docker 환경 Chromium 자동 설정 (v0.1.4+)
 
-오프라인 Docker 환경에서 `docker run`으로 직접 실행할 때 Chromium 렌더러가 동작하지 않는 문제가 있었습니다.
-v0.1.4부터 서버가 Docker 환경을 자동으로 감지하고 아래 플래그를 Chromium 실행 시 자동 주입합니다.
+오프라인 Docker 환경에서 `docker run`으로 실행할 때 세션은 생성되지만 `goto`, `inspect`, `screenshot` 등 페이지 조작이 실패하는 문제가 있었습니다.
 
-| 플래그 | 역할 |
-| --- | --- |
-| `--no-sandbox` | 컨테이너 내부 root 실행 시 Chromium sandbox 비활성화 |
-| `--disable-dev-shm-usage` | `/dev/shm` 64MB 제한 우회 (`/tmp` 사용) |
-| `--disable-gpu` | GPU 가속 비활성화 (Docker 내부 GPU 드라이버 없음) |
+### 원인: `chromium-headless-shell` 바이너리
+
+Playwright 1.58 이상에서 `headless: true`(기본값)로 실행하면 full Chromium 대신 **`chromium-headless-shell`** 경량 바이너리를 사용합니다. 이 바이너리는 일부 페이지 조작 기능(`page.goto`, `page.evaluate`, `page.screenshot`)이 Docker 환경에서 정상 동작하지 않을 수 있습니다.
+
+- 브라우저 프로세스 자체는 시작되므로 **세션 생성은 성공**합니다.
+- 하지만 페이지 렌더링이 필요한 조작은 **renderer 프로세스가 올바르게 동작하지 않아 실패**합니다.
+
+### 수정: full Chromium 바이너리 자동 선택
+
+v0.1.4부터 서버가 Docker 환경을 자동 감지하면 `channel=chromium`을 설정하여 full Chromium 바이너리를 사용합니다. `--no-sandbox`, `--disable-dev-shm-usage` 등 필수 플래그는 Playwright가 자동으로 추가합니다.
 
 서버 시작 로그에 아래 메시지가 출력되면 자동 감지가 동작한 것입니다:
 
 ```
-Docker environment detected — Chromium will launch with --no-sandbox --disable-dev-shm-usage --disable-gpu
+Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell
 ```
 
-수동으로 플래그를 지정하려면 환경변수를 사용합니다:
+수동으로 channel을 지정하려면 세션 생성 시 `channel` 파라미터를 전달합니다:
 
-```powershell
--e PLAYWRIGHT_LAUNCH_ARGS="--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
+```json
+POST /api/sessions
+{ "channel": "chromium" }
 ```
 
 ## 7. 운영 팁
@@ -114,9 +119,9 @@ Docker environment detected — Chromium will launch with --no-sandbox --disable
 
 | 증상 | 원인 | 해결 |
 | --- | --- | --- |
-| 세션은 생성되지만 goto/inspect/screenshot 실패 | Chromium renderer sandbox 또는 공유 메모리 부족 | v0.1.4 이상 사용, 또는 `PLAYWRIGHT_LAUNCH_ARGS` 수동 설정 |
-| `Target closed` 또는 `Browser closed` 오류 | `/dev/shm` 64MB 초과 | `--ipc=host` 추가 또는 `--disable-dev-shm-usage` 플래그 |
-| 스크린샷이 빈 화면 | GPU 렌더링 실패 | `--disable-gpu` 플래그 확인 |
+| 세션은 생성되지만 goto/inspect/screenshot 실패 | `chromium-headless-shell` 바이너리가 Docker에서 페이지 조작 미지원 | v0.1.4 이상 사용 (자동으로 full Chromium 선택), 또는 세션 생성 시 `"channel": "chromium"` 지정 |
+| `Target closed` 또는 `Browser closed` 오류 | `/dev/shm` 64MB 초과 | `--ipc=host` 추가 (Playwright가 `--disable-dev-shm-usage`를 이미 기본 적용) |
+| 스크린샷이 빈 화면 | headless-shell 렌더링 제한 | `"channel": "chromium"` 으로 full Chromium 사용 |
 | 컨테이너 시작 직후 crash | 이미지 아키텍처 불일치 | `docker inspect` 로 이미지 arch 확인 (amd64 필요) |
 
 > 상세 절차는 저장소의 `docs/OFFLINE_DOCKER_GUIDE_KO.md`와 `tools/offline-load-run.ps1`를 함께 참고하면 됩니다.
