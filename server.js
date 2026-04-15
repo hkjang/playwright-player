@@ -1887,6 +1887,7 @@ class SessionManager {
       status: "ok",
       input: request,
     });
+    console.log(`[session] created sessionId=${sessionId} browser=${browserType} channel=${effectiveChannel || "default"}`);
     return this.serializeSession(session);
   }
 
@@ -2389,8 +2390,11 @@ class SessionManager {
 
   async runPageCommandLocked(session, pageId, type, input, executor) {
     const pageRecord = this.getPageRecord(session, pageId);
+    const startedAt = Date.now();
+    console.log(`[session] ${type} start sessionId=${session.sessionId} pageId=${pageId}`);
     try {
       const result = await executor(pageRecord);
+      const elapsed = Date.now() - startedAt;
       pageRecord.updatedAt = toIso();
       this.touch(session);
       this.logAction(session, {
@@ -2401,8 +2405,11 @@ class SessionManager {
         input,
         output: summarize(result),
       });
+      console.log(`[session] ${type} ok ${elapsed}ms`);
       return result;
     } catch (error) {
+      const elapsed = Date.now() - startedAt;
+      console.error(`[session] ${type} error ${elapsed}ms — ${error.message}`);
       const artifacts = await this.captureFailureArtifacts(session, pageRecord, type);
       this.logAction(session, {
         type,
@@ -2668,6 +2675,7 @@ class SessionManager {
       return this.runPageCommandLocked(session, pageId, "page.inspect", request, async (pageRecord) => {
         const maxElements = Math.min(Math.max(Number(request.maxElements) || 40, 1), 200);
         const maxTextLength = Math.min(Math.max(Number(request.maxTextLength) || 140, 20), 400);
+        await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
         const snapshot = await pageRecord.page.evaluate(({ maxElements: limit, maxTextLength: textLimit }) => {
           const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, textLimit);
           const isVisible = (element) => {
@@ -2811,8 +2819,10 @@ class SessionManager {
     return this.withLock(sessionId, async (session) => {
       return this.runPageCommandLocked(session, pageId, "page.screenshot", request, async (pageRecord) => {
         const extension = request.type || "png";
+        await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
         const buffer = await pageRecord.page.screenshot(cleanObject({
-          fullPage: request.fullPage ?? true,
+          fullPage: request.fullPage ?? false,
+          timeout: request.timeoutMs || 30000,
           omitBackground: request.omitBackground,
           quality: request.quality,
           type: extension,
@@ -3672,6 +3682,28 @@ function buildOpenApiSpec(req) {
           responses: { 200: { description: "Updated registry" } },
         },
       },
+      [`${api}/scripts/{scriptKey}`]: {
+        get: {
+          tags: ["Scripts"],
+          summary: "Get script details",
+          parameters: [{ name: "scriptKey", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Script metadata" }, 404: { description: "Not found" } },
+        },
+        put: {
+          tags: ["Scripts"],
+          summary: "Upload or replace a script file",
+          description: "Write script content to the scripts directory. The file is saved with the given key and auto-detected extension. Use this API to register scripts in offline environments where git sync is not available.",
+          parameters: [{ name: "scriptKey", in: "path", required: true, schema: { type: "string", example: "checkout/guest-order" } }],
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["content"], properties: { content: { type: "string", description: "Full script source code" }, fileName: { type: "string", description: "Optional file name with extension (e.g. guest-order.spec.ts). Defaults to .spec.js", example: "guest-order.spec.ts" } } } } } },
+          responses: { 200: { description: "Script saved and registry refreshed" }, 400: { description: "Invalid request" } },
+        },
+        delete: {
+          tags: ["Scripts"],
+          summary: "Delete a script file",
+          parameters: [{ name: "scriptKey", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Script deleted" }, 404: { description: "Not found" } },
+        },
+      },
       [`${api}/scripts/validate`]: {
         post: {
           tags: ["Scripts"],
@@ -3743,17 +3775,6 @@ function buildOpenApiSpec(req) {
             },
           },
           responses: { 200: { description: "Generated script content, optional saved script metadata, and validation result" } },
-        },
-      },
-      [`${api}/scripts/{scriptKey}`]: {
-        get: {
-          tags: ["Scripts"],
-          summary: "Get script details",
-          parameters: [{ name: "scriptKey", in: "path", required: true, schema: { type: "string" } }],
-          responses: {
-            200: { description: "Script metadata" },
-            404: { description: "Script not found", content: { "application/json": { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } },
-          },
         },
       },
       [`${api}/runs`]: {
@@ -5698,6 +5719,34 @@ app.post(`${config.apiBasePath}/scripts/sync`, asyncRoute(async (req, res) => {
   ok(res, await scriptRegistry.sync());
 }));
 
+app.put(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
+  const scriptKey = req.params.scriptKey;
+  if (!scriptKey || scriptKey.includes("..")) {
+    throw new ApiError(400, "INVALID_SCRIPT_KEY", "Invalid script key");
+  }
+  const { content, fileName } = req.body || {};
+  if (!content || typeof content !== "string") {
+    throw new ApiError(400, "INVALID_REQUEST", "content (string) is required");
+  }
+  const ext = fileName && /\.(spec|test|pw)\.[^.]+$/i.test(fileName)
+    ? fileName.replace(/^.*(?=\.(spec|test|pw)\.)/, "")
+    : ".spec.js";
+  const filePath = path.join(config.scriptsDir, `${scriptKey}${ext}`);
+  await ensureDir(path.dirname(filePath));
+  await fsPromises.writeFile(filePath, content, "utf8");
+  await scriptRegistry.refresh();
+  console.log(`[scripts] uploaded scriptKey=${scriptKey} path=${filePath} size=${content.length}`);
+  ok(res, scriptRegistry.get(scriptKey));
+}));
+
+app.delete(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
+  const scriptKey = req.params.scriptKey;
+  const script = scriptRegistry.get(scriptKey);
+  await fsPromises.unlink(script.absolutePath);
+  await scriptRegistry.refresh();
+  ok(res, { deleted: scriptKey });
+}));
+
 app.post(`${config.apiBasePath}/scripts/validate`, asyncRoute(async (req, res) => {
   ok(res, await runManager.validateScript(req.body || {}));
 }));
@@ -5966,6 +6015,22 @@ const mcpTools = [
   })),
   defineTool("script_get", "Get one registered Playwright script.", { type: "object", properties: { scriptKey: { type: "string" } }, required: ["scriptKey"] }, async (args) => scriptRegistry.get(args.scriptKey)),
   defineTool("script_sync", "Rescan the scripts directory and return git metadata when available.", { type: "object", properties: {} }, async () => scriptRegistry.sync()),
+  defineTool("script_upload", "Upload or replace a Playwright script file. Use this in offline environments where git sync is not available.", { type: "object", properties: { scriptKey: { type: "string", description: "Script key path (e.g. checkout/guest-order)" }, content: { type: "string", description: "Full script source code" }, fileName: { type: "string", description: "Optional file name with extension" } }, required: ["scriptKey", "content"] }, async (args) => {
+    const scriptKey = args.scriptKey;
+    if (!scriptKey || scriptKey.includes("..")) throw new ApiError(400, "INVALID_SCRIPT_KEY", "Invalid script key");
+    const ext = args.fileName && /\.(spec|test|pw)\.[^.]+$/i.test(args.fileName) ? args.fileName.replace(/^.*(?=\.(spec|test|pw)\.)/, "") : ".spec.js";
+    const filePath = path.join(config.scriptsDir, `${scriptKey}${ext}`);
+    await ensureDir(path.dirname(filePath));
+    await fsPromises.writeFile(filePath, args.content, "utf8");
+    await scriptRegistry.refresh();
+    return scriptRegistry.get(scriptKey);
+  }),
+  defineTool("script_delete", "Delete a registered script file.", { type: "object", properties: { scriptKey: { type: "string" } }, required: ["scriptKey"] }, async (args) => {
+    const script = scriptRegistry.get(args.scriptKey);
+    await fsPromises.unlink(script.absolutePath);
+    await scriptRegistry.refresh();
+    return { deleted: args.scriptKey };
+  }),
   defineTool("script_validate", "Validate a script before registration or execution.", { type: "object", properties: { scriptKey: { type: "string" }, scriptPath: { type: "string" }, filename: { type: "string" }, content: { type: "string" }, project: { type: "string" }, grep: { type: "string" } } }, async (args) => runManager.validateScript(args)),
   defineTool("assist_capabilities", "Return LLM-friendly authoring capabilities, workflow hints, and supported locator/action vocabularies.", { type: "object", properties: {} }, async () => scriptAssistant.getCapabilities()),
   defineTool("assist_examples", "Return localized prompt examples, reusable step patterns, and locator guidance for LLM-driven script generation.", { type: "object", properties: { language: { type: "string" } } }, async (args) => scriptAssistant.examples(args)),
