@@ -1846,8 +1846,17 @@ class SessionManager {
     // binary for headless mode by default. That binary lacks full page functionality
     // (goto/evaluate/screenshot can fail). Force the full Chromium binary via
     // channel="chromium" so all page operations work reliably in containers.
+    // Also inject --disable-gpu because full Chromium headless needs a GPU compositor
+    // that is unavailable in containers, causing blank screenshots and videos.
     const effectiveChannel = request.channel
       || (isDocker && browserType === "chromium" ? "chromium" : undefined);
+    if (isDocker && browserType === "chromium") {
+      for (const flag of ["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"]) {
+        if (!userArgs.includes(flag)) {
+          userArgs.push(flag);
+        }
+      }
+    }
     const browser = await launcher.launch(
       cleanObject({
         headless: request.headless ?? this.options.defaultHeadless,
@@ -2085,6 +2094,15 @@ class SessionManager {
   async closeContext(sessionId, contextId) {
     return this.withLock(sessionId, async (session) => {
       const contextRecord = this.getContextRecord(session, contextId);
+      // Collect video artifacts from all pages before closing context
+      const videos = [];
+      for (const pageId of contextRecord.pageIds) {
+        const pageRecord = session.pages.get(pageId);
+        if (pageRecord) {
+          const v = await this.collectVideoArtifact(session, pageRecord).catch(() => null);
+          if (v) videos.push(v);
+        }
+      }
       await contextRecord.context.close();
       session.contexts.delete(contextId);
       this.touch(session);
@@ -2096,6 +2114,7 @@ class SessionManager {
       return {
         contextId,
         status: "closed",
+        ...(videos.length ? { videos } : {}),
       };
     });
   }
@@ -2121,13 +2140,41 @@ class SessionManager {
   async closePage(sessionId, pageId) {
     return this.withLock(sessionId, async (session) => {
       const pageRecord = this.getPageRecord(session, pageId);
-      await pageRecord.page.close();
+      const page = pageRecord.page;
+      await page.close();
+      // Collect video artifact if video recording was active
+      const videoArtifact = await this.collectVideoArtifact(session, pageRecord).catch(() => null);
       this.touch(session);
       return {
         pageId,
         status: "closed",
+        ...(videoArtifact ? { video: videoArtifact } : {}),
       };
     });
+  }
+
+  async collectVideoArtifact(session, pageRecord) {
+    try {
+      const video = pageRecord.page.video();
+      if (!video) return null;
+      const videoPath = await video.path();
+      if (!videoPath) return null;
+      const stats = await fsPromises.stat(videoPath).catch(() => null);
+      if (!stats || stats.size === 0) return null;
+      const buffer = await fsPromises.readFile(videoPath);
+      const artifact = await this.saveArtifact(session, {
+        contextId: pageRecord.contextId,
+        pageId: pageRecord.pageId,
+        type: "video",
+        extension: "webm",
+        buffer,
+        metadata: { originalPath: videoPath },
+      });
+      console.log(`[session] video collected pageId=${pageRecord.pageId} size=${stats.size}`);
+      return artifact;
+    } catch {
+      return null;
+    }
   }
 
   async saveArtifact(session, request) {
@@ -2821,7 +2868,7 @@ class SessionManager {
         const extension = request.type || "png";
         await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
         const buffer = await pageRecord.page.screenshot(cleanObject({
-          fullPage: request.fullPage ?? false,
+          fullPage: request.fullPage ?? true,
           timeout: request.timeoutMs || 30000,
           omitBackground: request.omitBackground,
           quality: request.quality,
@@ -4050,6 +4097,25 @@ function buildOpenApiSpec(req) {
           responses: { 200: { description: "Created screenshot artifact" } },
         },
       },
+      [`${api}/sessions/{sessionId}/artifacts`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "List all artifacts in a session",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Array of artifact metadata with downloadPath" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/artifacts/{artifactId}`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "Download an artifact file (screenshot, video, trace, etc.)",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "artifactId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: { 200: { description: "Binary file download" }, 404: { description: "Artifact not found" } },
+        },
+      },
       [config.mcpBasePath]: {
         get: {
           tags: ["MCP"],
@@ -4485,8 +4551,8 @@ function renderPlaygroundPage() {
       }
       scripts.forEach((script) => {
         const option = document.createElement('option');
-        option.value = script.key;
-        option.textContent = script.key;
+        option.value = script.scriptKey;
+        option.textContent = script.scriptKey;
         scriptKeySelect.append(option);
       });
     }
@@ -5185,6 +5251,12 @@ function renderPlaygroundPageV2(req) {
           <div id="preview" class="preview">${escapeHtml(copy.noScreenshot)}</div>
         </section>
         <section class="panel">
+          <h2>Artifacts</h2>
+          <p>List and download artifacts (screenshots, videos, traces) from the current session.</p>
+          <button type="button" id="listArtifactsBtn" class="secondary">List Artifacts</button>
+          <div id="artifactList" style="margin-top:12px;"></div>
+        </section>
+        <section class="panel">
           <h2>${escapeHtml(copy.jsonResultTitle)}</h2>
           <p>${escapeHtml(copy.jsonResultBody)}</p>
           <pre id="resultBox">{}</pre>
@@ -5262,8 +5334,8 @@ function renderPlaygroundPageV2(req) {
       }
       scripts.forEach((script) => {
         const option = document.createElement('option');
-        option.value = script.key;
-        option.textContent = script.key;
+        option.value = script.scriptKey;
+        option.textContent = script.scriptKey;
         scriptKeySelect.append(option);
       });
     }
@@ -5369,6 +5441,24 @@ function renderPlaygroundPageV2(req) {
       state.pageId = '';
       syncInputs();
       preview.textContent = COPY.noScreenshot;
+    });
+
+    document.getElementById('listArtifactsBtn').addEventListener('click', async () => {
+      requireValue(state.sessionId, COPY.createSessionFirst);
+      const payload = await api('GET', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/artifacts');
+      const list = document.getElementById('artifactList');
+      const artifacts = payload && payload.data && payload.data.artifacts;
+      if (!artifacts || !artifacts.length) {
+        list.innerHTML = '<em>No artifacts yet</em>';
+        return;
+      }
+      list.innerHTML = artifacts.map(function(a) {
+        return '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;padding:8px;border-radius:10px;background:rgba(15,118,110,0.06);">'
+          + '<strong>' + (a.type || 'file') + '</strong>'
+          + '<span style="color:#5f6b82;font-size:.9rem;">' + a.fileName + ' (' + Math.round((a.sizeBytes||0)/1024) + ' KB)</span>'
+          + '<a href="' + a.downloadPath + '" target="_blank" download style="margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;">Download</a>'
+          + '</div>';
+      }).join('');
     });
 
     syncInputs();
@@ -6214,7 +6304,7 @@ app.use((error, req, res, next) => {
 const server = app.listen(config.port, config.host, () => {
   console.log(`${config.serviceName} listening on http://${config.host}:${config.port}`);
   if (isDocker) {
-    console.log("Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell");
+    console.log("Docker environment detected — Chromium: channel=chromium, --disable-gpu --no-sandbox --disable-dev-shm-usage");
   }
 });
 
