@@ -34,7 +34,9 @@
 
 예를 들어 `scripts/checkout/guest-order.spec.ts` 는 `checkout/guest-order` 로 등록됩니다.
 
-테스트 런타임에는 아래 환경 변수가 함께 주입됩니다.
+`SCRIPTS_DIR` 와 `RUNS_DIR` 은 프로젝트 바깥(마운트된 볼륨 등)에 두어도 됩니다. 실행 프로세스에는 서버 설치본의 `node_modules` 가 `NODE_PATH` 로 전달되고, 생성된 config 도 서버 설치본을 기준으로 `@playwright/test` 를 해석합니다.
+
+테스트 런타임에는 아래 환경 변수만 주입됩니다. 서버 프로세스의 나머지 환경변수(`API_TOKEN` 포함)는 전달되지 않으며, 추가가 필요하면 `RUN_ENV_PASSTHROUGH` 에 이름을 명시하세요.
 
 - `PW_PLAYER_RUN_ID`
 - `PW_PLAYER_SCRIPT_KEY`
@@ -42,6 +44,13 @@
 - `PW_PLAYER_BASE_URL`
 - `PW_PLAYER_VARIABLES_JSON`
 - `PW_PLAYER_STORAGE_STATE`
+
+`assist/scaffold` 가 생성하는 스크립트는 이 값을 읽어 기본값 위에 덮어씁니다.
+
+```js
+const defaultVariables = { "sku": "ABC-1001" };
+const variables = { ...defaultVariables, ...JSON.parse(process.env.PW_PLAYER_VARIABLES_JSON || "{}") };
+```
 
 ## 실행
 
@@ -61,7 +70,11 @@ node server.js
 npm test
 ```
 
-브라우저가 설치되지 않은 오프라인 체크아웃에서는 브라우저 의존 항목이 실패가 아니라 `SKIP` 으로 표시됩니다.
+브라우저가 설치되지 않은 경우에만 브라우저 의존 항목이 `SKIP` 으로 표시됩니다. 그 밖의 브라우저 실행 실패는 `FAIL` 입니다. 릴리즈 검증처럼 브라우저가 반드시 있어야 하는 환경에서는 미설치도 실패로 처리하도록 `SMOKE_REQUIRE_BROWSER=1` 을 지정하세요.
+
+```bash
+SMOKE_REQUIRE_BROWSER=1 npm test
+```
 
 ### Docker
 
@@ -191,6 +204,13 @@ MCP endpoint 는 `/mcp` 입니다.
 | `ALLOWED_ORIGINS` | 없음 | MCP 를 호출할 수 있는 추가 cross-origin 목록입니다. same-origin 과 loopback 은 항상 허용됩니다. |
 | `URL_ALLOWLIST` | 없음 | `page.goto` 가 접근할 수 있는 host 목록입니다. `*.example.com` 형태를 지원합니다. |
 | `ENABLE_EVALUATE` | `true` | `false` 면 `page.evaluate` 가 `403` 을 반환합니다. |
+| `DEFAULT_DIALOG_ACTION` | `dismiss` | `alert`/`confirm`/`prompt` 기본 처리. `accept`, `dismiss`, `ignore` 중 선택합니다. `ignore` 는 대화상자를 열어둔 채로 두므로 이를 띄운 동작이 타임아웃됩니다. |
+| `DEFAULT_DIALOG_PROMPT_TEXT` | 빈 문자열 | `accept` 시 `prompt()` 에 입력할 값 |
+| `ROUTE_FIXTURES_DIR` | `SCRIPTS_DIR` | `route` 의 `behavior.path` 로 지정할 수 있는 파일의 루트. 이 밖의 경로는 거부됩니다. |
+| `RUN_ENV_PASSTHROUGH` | 없음 | 실행 프로세스에 추가로 전달할 환경변수 이름(CSV). 기본적으로 `PATH`, `HOME`, `PLAYWRIGHT_*` 등 최소 집합만 전달되고 `API_TOKEN` 같은 서버 비밀값은 전달되지 않습니다. |
+| `VALIDATION_TIMEOUT_MS` | `60000` | `scripts/validate` 실행 상한 |
+| `COMMAND_OUTPUT_LIMIT_BYTES` | `262144` | 외부 명령 출력 캡처 상한 |
+| `MAX_RETAINED_ARTIFACTS` | `2000` | 세션과 별개로 보관하는 증적 메타데이터 개수 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
 | `MAX_SESSIONS` | `10` | 동시 브라우저 세션 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED` |
 | `MAX_CONTEXTS_PER_SESSION` | `5` | 세션당 컨텍스트 상한 |
@@ -205,6 +225,27 @@ MCP endpoint 는 `/mcp` 입니다.
 | `DEFAULT_HEADLESS` | `true` | 기본 headless 여부 |
 | `PLAYWRIGHT_LAUNCH_ARGS` | 없음 | 브라우저 launch 인자 (CSV) |
 | `BODY_LIMIT` | `5mb` | 요청 본문 상한 |
+
+## 대화상자 처리
+
+Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으로 닫습니다. 이 서버는 기록을 위해 항상 리스너를 붙이므로, 정책을 명시적으로 정하지 않으면 `alert`/`confirm`/`prompt` 를 띄운 클릭이 타임아웃됩니다. 기본값은 `dismiss` 이고 세 단계로 재정의할 수 있습니다.
+
+1. 서버 기본값: `DEFAULT_DIALOG_ACTION`
+2. 컨텍스트 생성 시: `{"dialogPolicy": {"action": "accept", "promptText": "..."}}`
+3. 페이지 단위: `POST /api/sessions/{id}/pages/{pageId}/dialog-policy`
+
+처리 결과는 페이지 응답의 `lastDialog` 와 `sessions/{id}/actions` 의 이벤트 로그에서 확인할 수 있습니다.
+
+## 스크립트 검사 모드
+
+`POST /api/scripts/validate` 는 두 가지 모드를 제공합니다.
+
+| 모드 | 동작 | 대상 |
+| --- | --- | --- |
+| `syntax` | 파일을 **로드하지 않고** 구문만 검사합니다 (`node --check`). JavaScript 전용. | 신뢰할 수 없는 스크립트의 1차 확인 |
+| `discover` (기본값) | Playwright `--list` 로 테스트를 탐색합니다. 파일을 로드하므로 **모듈 최상위 코드가 실행됩니다.** | 실제 테스트 목록 확인 |
+
+응답의 `executesModuleScope` 로 어느 쪽인지 구분할 수 있습니다.
 
 ## 오류 응답
 
@@ -237,6 +278,8 @@ MCP endpoint 는 `/mcp` 입니다.
 - `proxy` 를 context 수준에서 동적으로 바꾸는 기능은 이번 구현에 포함하지 않았습니다.
 - `storage-state/import` 는 컨텍스트를 새로 만들기 때문에 기존 페이지가 닫힙니다. 응답의 `replacedPages` 에 닫힌 page id 가 담기며, 이후 `pages` 를 다시 생성해야 합니다.
 - `sessions/{id}/execute` 는 배치 전체가 하나의 세션 락 안에서 실행되므로 중간에 다른 요청이 끼어들지 않습니다. `continueOnError: true` 를 주면 실패한 단계 이후도 계속 진행하고 단계별 결과를 모두 반환합니다.
+- `URL_ALLOWLIST` 는 세션 브라우저의 **모든 요청**에 적용됩니다(리다이렉트·iframe·XHR 포함). 다만 `POST /api/runs` 로 실행되는 스크립트는 별도 프로세스이므로 이 정책이 적용되지 않습니다. 실행 격리는 다음 단계 과제입니다.
+- `page.evaluate` 의 `expression` 은 `"() => document.title"` 같은 함수 형태와 `"1 + 2"` 같은 단순 식을 모두 지원하며, 함수인 경우 `arg` 가 인자로 전달됩니다.
 - MCP는 Streamable HTTP 규격의 POST/DELETE 중심으로 구현했고, GET 기반 SSE stream 은 아직 비활성화했습니다.
 - 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션과 런 상태는 초기화됩니다.
 

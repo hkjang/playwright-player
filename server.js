@@ -5,13 +5,19 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
 
 const __filename = fileURLToPath(import.meta.url);
 const rootDir = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 const swaggerUiAssetDir = path.dirname(require.resolve("swagger-ui-dist/package.json"));
+// The generated Playwright config is written into RUNS_DIR, which may sit
+// outside the project (it is configurable). A bare "@playwright/test" there
+// resolves from the config's own directory upward and fails. Anchoring a
+// createRequire to this installation resolves it from the server's tree
+// instead, and works whichever entry point the installed version exposes.
+const serverModuleAnchorUrl = pathToFileURL(path.join(rootDir, "package.json")).href;
 const documentationPaths = {
   openApi: "/openapi.json",
   docs: "/docs",
@@ -21,7 +27,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.2.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.3.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -30,6 +36,7 @@ const config = {
   runsDir: path.resolve(process.env.RUNS_DIR || path.join(rootDir, "data", "runs")),
   artifactsDir: path.resolve(process.env.ARTIFACTS_DIR || path.join(rootDir, "data", "artifacts")),
   storageStateDir: path.resolve(process.env.STORAGE_STATE_DIR || path.join(rootDir, "storage-states")),
+  routeFixturesDir: path.resolve(process.env.ROUTE_FIXTURES_DIR || process.env.SCRIPTS_DIR || path.join(rootDir, "scripts")),
   bodyLimit: process.env.BODY_LIMIT || "5mb",
   defaultBrowserType: process.env.DEFAULT_BROWSER_TYPE || "chromium",
   defaultHeadless: parseBoolean(process.env.DEFAULT_HEADLESS, true),
@@ -45,6 +52,16 @@ const config = {
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
   maxRunLogEntries: parseInteger(process.env.MAX_RUN_LOG_ENTRIES, 3000),
   enableEvaluate: parseBoolean(process.env.ENABLE_EVALUATE, true),
+  // Playwright auto-dismisses dialogs only while no "dialog" listener exists.
+  // This server always attaches one (to log them), so it must decide explicitly
+  // or every alert/confirm/prompt blocks the action that raised it.
+  defaultDialogAction: process.env.DEFAULT_DIALOG_ACTION || "dismiss",
+  defaultDialogPromptText: process.env.DEFAULT_DIALOG_PROMPT_TEXT || "",
+  dialogHandlingTimeoutMs: parseInteger(process.env.DIALOG_HANDLING_TIMEOUT_MS, 5000),
+  validationTimeoutMs: parseInteger(process.env.VALIDATION_TIMEOUT_MS, 60_000),
+  commandOutputLimitBytes: parseInteger(process.env.COMMAND_OUTPUT_LIMIT_BYTES, 256 * 1024),
+  runEnvPassthrough: parseCsv(process.env.RUN_ENV_PASSTHROUGH),
+  maxRetainedArtifacts: parseInteger(process.env.MAX_RETAINED_ARTIFACTS, 2000),
   captureFailureArtifacts: parseBoolean(process.env.CAPTURE_FAILURE_ARTIFACTS, true),
   purgeSessionArtifactsOnClose: parseBoolean(process.env.PURGE_SESSION_ARTIFACTS_ON_CLOSE, false),
   apiToken: process.env.API_TOKEN || "",
@@ -363,13 +380,14 @@ class ScriptRegistry {
 
   async resolveGitInfo() {
     try {
-      const revParse = await runCommand("git", ["rev-parse", "--is-inside-work-tree"], rootDir);
+      const gitOptions = { timeoutMs: 5000, maxOutputBytes: 8 * 1024 };
+      const revParse = await runCommand("git", ["rev-parse", "--is-inside-work-tree"], rootDir, gitOptions);
       if (!revParse.stdout.includes("true")) {
         return { available: false };
       }
 
-      const branch = await runCommand("git", ["rev-parse", "--abbrev-ref", "HEAD"], rootDir);
-      const commit = await runCommand("git", ["rev-parse", "HEAD"], rootDir);
+      const branch = await runCommand("git", ["rev-parse", "--abbrev-ref", "HEAD"], rootDir, gitOptions);
+      const commit = await runCommand("git", ["rev-parse", "HEAD"], rootDir, gitOptions);
       return {
         available: true,
         branch: branch.stdout.trim(),
@@ -381,32 +399,99 @@ class ScriptRegistry {
   }
 }
 
-function runCommand(command, args, cwd) {
+// Every spawn here runs caller-influenced code, so both wall-clock time and
+// captured output are bounded; an unbounded child could hang a request forever
+// or buffer a runaway log into the heap.
+function runCommand(command, args, cwd, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const outputLimit = options.maxOutputBytes ?? 256 * 1024;
+  const env = options.env;
+
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(command, args, cleanObject({
       cwd,
+      env,
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-    });
+    }));
 
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
+    const buffers = { stdout: "", stderr: "" };
+    let truncated = false;
+    let timedOut = false;
+
+    const capture = (stream, chunk) => {
+      const remaining = outputLimit - buffers[stream].length;
+      if (remaining <= 0) {
+        truncated = true;
+        return;
+      }
+      const text = chunk.toString("utf8");
+      buffers[stream] += text.slice(0, remaining);
+      truncated = truncated || text.length > remaining;
+    };
+
+    child.stdout.on("data", (chunk) => capture("stdout", chunk));
+    child.stderr.on("data", (chunk) => capture("stderr", chunk));
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    timer.unref?.();
+
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", reject);
     child.on("close", (code) => {
+      clearTimeout(timer);
+      const { stdout, stderr } = buffers;
+      if (timedOut) {
+        reject(new ApiError(408, "COMMAND_TIMEOUT", `${command} exceeded ${timeoutMs}ms and was killed`));
+        return;
+      }
       if (code === 0) {
-        resolve({ stdout, stderr, code });
+        resolve({ stdout, stderr, code, truncated });
       } else {
         reject(new Error(stderr || stdout || `${command} exited with code ${code}`));
       }
     });
   });
+}
+
+// The spawned Playwright process must not inherit the server's whole
+// environment: API_TOKEN and any other operator secret would be readable from
+// inside every test file the server runs.
+const RUN_ENV_BASE_KEYS = [
+  "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TZ",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "SystemRoot", "SYSTEMROOT", "ComSpec", "COMSPEC", "USERPROFILE",
+  "APPDATA", "LOCALAPPDATA", "PATHEXT", "WINDIR", "NUMBER_OF_PROCESSORS",
+];
+
+function buildRunEnv(extra = {}) {
+  const env = {};
+  for (const key of [...RUN_ENV_BASE_KEYS, ...config.runEnvPassthrough]) {
+    if (process.env[key] !== undefined) {
+      env[key] = process.env[key];
+    }
+  }
+
+  // Playwright needs its own configuration to locate browsers offline.
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith("PLAYWRIGHT_") && value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  // SCRIPTS_DIR is configurable and is usually a mounted volume, so a spec file
+  // sitting outside this project cannot resolve `@playwright/test` from its own
+  // directory. NODE_PATH points the run at the server's installation.
+  const serverModules = path.join(rootDir, "node_modules");
+  env.NODE_PATH = [serverModules, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+
+  return { ...env, ...extra };
 }
 
 async function readJsonFile(filePath) {
@@ -441,7 +526,10 @@ async function collectFilesWithMetadata(baseDir) {
 }
 
 function renderPlaywrightConfig({ scriptsDir, outputDir, htmlReportDir, jsonReportPath }) {
-  return `import { defineConfig, devices } from "@playwright/test";
+  return `import { createRequire } from "node:module";
+
+const require = createRequire(${JSON.stringify(serverModuleAnchorUrl)});
+const { defineConfig, devices } = require("@playwright/test");
 
 const maybe = (value) => {
   if (value === undefined || value === null || value === "") {
@@ -556,12 +644,16 @@ class RunManager {
     for (let index = 0; index < excess && index < finished.length; index += 1) {
       const run = finished[index];
       this.runs.delete(run.runId);
-      await removeDir(run.paths.runDir);
+      if (run.paths.runDir) {
+        await removeDir(run.paths.runDir);
+      }
     }
   }
 
-  async createRun(request) {
-    const script = this.registry.get(request.scriptKey);
+  // The slot has to be taken in the same synchronous turn as the check.
+  // Checking first and registering the run after several awaits let concurrent
+  // requests all pass the check and blow past the limit.
+  reserveRunSlot(runId, request) {
     if (this.countActiveRuns() >= this.options.maxConcurrentRuns) {
       throw new ApiError(
         429,
@@ -569,6 +661,40 @@ class RunManager {
         `Maximum concurrent runs reached (${this.options.maxConcurrentRuns}). Wait for a run to finish or cancel one.`,
       );
     }
+
+    this.runs.set(runId, {
+      runId,
+      scriptKey: request.scriptKey,
+      request,
+      status: "running",
+      createdAt: toIso(),
+      startedAt: null,
+      endedAt: null,
+      exitCode: null,
+      signal: null,
+      pid: null,
+      paths: {},
+      logs: [],
+      artifacts: [],
+      summary: null,
+      process: null,
+      cancelRequested: false,
+    });
+  }
+
+  async createRun(request) {
+    const script = this.registry.get(request.scriptKey);
+    const runId = createId("run");
+    this.reserveRunSlot(runId, request);
+    try {
+      return await this.startReservedRun(runId, request, script);
+    } catch (error) {
+      this.runs.delete(runId);
+      throw error;
+    }
+  }
+
+  async startReservedRun(runId, request, script) {
     if (!(await fileExists(this.options.playwrightCliPath))) {
       throw new ApiError(
         500,
@@ -584,7 +710,6 @@ class RunManager {
       }
     }
 
-    const runId = createId("run");
     const runDir = path.join(this.options.runsDir, runId);
     const outputDir = path.join(runDir, "test-results");
     const htmlReportDir = path.join(runDir, "html-report");
@@ -622,8 +747,7 @@ class RunManager {
       args.push("--shard", request.shard);
     }
 
-    const env = {
-      ...process.env,
+    const env = buildRunEnv({
       PW_PLAYER_RUN_ID: runId,
       PW_PLAYER_SCRIPT_KEY: request.scriptKey,
       PW_PLAYER_TARGET_ENV: request.env || "",
@@ -635,7 +759,7 @@ class RunManager {
       PW_PLAYER_STORAGE_STATE: request.storageStateRef ? this.resolveStorageState(request.storageStateRef) : "",
       PW_PLAYER_VARIABLES_JSON: JSON.stringify(request.variables || {}),
       PW_PLAYER_TIMEOUT_MS: String(request.timeoutMs || 30_000),
-    };
+    });
 
     const child = spawn(process.execPath, args, {
       cwd: rootDir,
@@ -645,32 +769,17 @@ class RunManager {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const run = {
-      runId,
-      scriptKey: request.scriptKey,
-      request,
-      status: "running",
-      createdAt: toIso(),
-      startedAt: toIso(),
-      endedAt: null,
-      exitCode: null,
-      signal: null,
-      pid: child.pid,
-      paths: {
-        runDir,
-        configPath,
-        outputDir,
-        htmlReportDir,
-        jsonReportPath,
-      },
-      logs: [],
-      artifacts: [],
-      summary: null,
-      process: child,
-      cancelRequested: false,
+    const run = this.runs.get(runId);
+    run.startedAt = toIso();
+    run.pid = child.pid;
+    run.paths = {
+      runDir,
+      configPath,
+      outputDir,
+      htmlReportDir,
+      jsonReportPath,
     };
-
-    this.runs.set(runId, run);
+    run.process = child;
 
     child.stdout.on("data", (chunk) => {
       this.appendLog(run, "stdout", chunk);
@@ -712,8 +821,8 @@ class RunManager {
   }
 
   async buildSummary(run) {
-    const report = await readJsonFile(run.paths.jsonReportPath);
-    const artifacts = await collectFilesWithMetadata(run.paths.runDir);
+    const report = run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null;
+    const artifacts = run.paths.runDir ? await collectFilesWithMetadata(run.paths.runDir) : [];
     if (!report) {
       return {
         runId: run.runId,
@@ -762,6 +871,14 @@ class RunManager {
       throw new ApiError(400, "INVALID_REQUEST", "scriptKey, scriptPath, or content is required");
     }
 
+    // `--list` loads the test file, which runs its module scope. That is test
+    // discovery, not a static check, so it is opt-out-able and the cheap,
+    // side-effect-free parse is available as its own mode.
+    const mode = request.mode === "syntax" ? "syntax" : "discover";
+    if (mode === "syntax") {
+      return this.checkSyntax(validationDir, targetPath, validationId);
+    }
+
     const configPath = path.join(validationDir, "playwright.config.mjs");
     const jsonReportPath = path.join(validationDir, "report.json");
     const htmlReportDir = path.join(validationDir, "html-report");
@@ -794,7 +911,11 @@ class RunManager {
     }
 
     try {
-      const result = await runCommand(process.execPath, args, rootDir).catch((error) => ({
+      const result = await runCommand(process.execPath, args, rootDir, {
+        timeoutMs: this.options.validationTimeoutMs,
+        maxOutputBytes: this.options.commandOutputLimitBytes,
+        env: buildRunEnv(),
+      }).catch((error) => ({
         stdout: "",
         stderr: error.message,
         code: 1,
@@ -802,13 +923,53 @@ class RunManager {
 
       return {
         valid: result.code === 0,
+        mode,
+        // Callers need to know this was not a static check.
+        executesModuleScope: true,
+        validationId,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        outputTruncated: Boolean(result.truncated),
+      };
+    } finally {
+      // Validation is throwaway work; leaving the scratch directory behind made
+      // data/runs grow on every assist_scaffold call.
+      await removeDir(validationDir);
+    }
+  }
+
+  // Parse-only check: never loads or executes the file.
+  async checkSyntax(validationDir, targetPath, validationId) {
+    try {
+      const extension = path.extname(targetPath).toLowerCase();
+      if (![".js", ".mjs", ".cjs"].includes(extension)) {
+        return {
+          valid: null,
+          mode: "syntax",
+          executesModuleScope: false,
+          validationId,
+          stdout: "",
+          stderr: `Syntax-only checking is not available for ${extension || "this"} files. Use mode "discover", which loads the file through Playwright.`,
+          supported: false,
+        };
+      }
+
+      const result = await runCommand(process.execPath, ["--check", targetPath], rootDir, {
+        timeoutMs: Math.min(this.options.validationTimeoutMs, 15_000),
+        maxOutputBytes: this.options.commandOutputLimitBytes,
+        env: buildRunEnv(),
+      }).catch((error) => ({ stdout: "", stderr: error.message, code: 1 }));
+
+      return {
+        valid: result.code === 0,
+        mode: "syntax",
+        executesModuleScope: false,
+        supported: true,
         validationId,
         stdout: result.stdout,
         stderr: result.stderr,
       };
     } finally {
-      // Validation is throwaway work; leaving the scratch directory behind made
-      // data/runs grow on every assist_scaffold call.
       await removeDir(validationDir);
     }
   }
@@ -839,14 +1000,14 @@ class RunManager {
 
   async listArtifacts(runId) {
     const run = this.getRun(runId);
-    return collectFilesWithMetadata(run.paths.runDir);
+    return run.paths.runDir ? collectFilesWithMetadata(run.paths.runDir) : [];
   }
 
   async getReport(runId) {
     const run = this.getRun(runId);
     return {
       ...this.serializeRun(run),
-      report: await readJsonFile(run.paths.jsonReportPath),
+      report: run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null,
       summary: run.summary || (await this.buildSummary(run)),
     };
   }
@@ -867,7 +1028,9 @@ class RunManager {
     }
 
     this.runs.delete(runId);
-    await removeDir(run.paths.runDir);
+    if (run.paths.runDir) {
+      await removeDir(run.paths.runDir);
+    }
     return { deleted: runId };
   }
 
@@ -875,6 +1038,9 @@ class RunManager {
   // the run directory so artifacts can actually be downloaded.
   async resolveArtifactPath(runId, relativePath) {
     const run = this.getRun(runId);
+    if (!run.paths.runDir) {
+      throw new ApiError(409, "RUN_NOT_STARTED", `Run ${runId} has not produced any output yet`);
+    }
     const absolutePath = resolveWithin(run.paths.runDir, relativePath, "artifact path");
     const stats = await statOrNull(absolutePath);
     if (!stats || !stats.isFile()) {
@@ -1359,7 +1525,11 @@ class ScriptAssistant {
     }
 
     if ((request.variables && Object.keys(request.variables).length) || needsVariables) {
-      lines.push(`const variables = ${JSON.stringify(request.variables || {}, null, 2)};`);
+      // The run API injects values as PW_PLAYER_VARIABLES_JSON. Inlining them as
+      // constants meant a scaffolded script ignored whatever the caller passed
+      // at run time, so the literal becomes the default and the run wins.
+      lines.push(`const defaultVariables = ${JSON.stringify(request.variables || {}, null, 2)};`);
+      lines.push("const variables = { ...defaultVariables, ...JSON.parse(process.env.PW_PLAYER_VARIABLES_JSON || \"{}\") };");
       lines.push("");
     }
 
@@ -1511,6 +1681,49 @@ function resolveLocator(page, locator) {
 // misbehaved". Only the latter is worth capturing artifacts for.
 const BAD_REQUEST_STATUS_CODES = new Set([400, 401, 403, 404, 409, 413, 429]);
 
+// Playwright evaluates a *string* as a plain expression and does not invoke it,
+// so `"() => document.title"` - the form every example and LLM reaches for -
+// evaluated to a function object and came back as `undefined` with no error.
+// Wrapping it in an IIFE calls the function when there is one, returns the value
+// when there is not, and forwards `arg` either way. It stays a plain expression,
+// so it does not need `unsafe-eval` in the page's CSP.
+function buildEvaluateExpression(expression, arg) {
+  let serializedArg;
+  try {
+    serializedArg = arg === undefined ? "undefined" : JSON.stringify(arg);
+  } catch {
+    throw new ApiError(400, "INVALID_REQUEST", "arg must be JSON-serializable");
+  }
+
+  return `((__pwPlayerArg) => {
+  const __pwPlayerValue = (${expression});
+  return typeof __pwPlayerValue === "function" ? __pwPlayerValue(__pwPlayerArg) : __pwPlayerValue;
+})(${serializedArg})`;
+}
+
+const DIALOG_ACTIONS = new Set(["accept", "dismiss", "ignore"]);
+
+function normalizeDialogPolicy(value, fallback) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+
+  const raw = typeof value === "string" ? { action: value } : value;
+  const action = String(raw.action || "").toLowerCase();
+  if (!DIALOG_ACTIONS.has(action)) {
+    throw new ApiError(
+      400,
+      "INVALID_DIALOG_POLICY",
+      `dialogPolicy.action must be one of accept, dismiss, ignore (got ${raw.action})`,
+    );
+  }
+
+  return {
+    action,
+    promptText: typeof raw.promptText === "string" ? raw.promptText : fallback?.promptText ?? "",
+  };
+}
+
 function countMatches(actual, expected, operator) {
   switch (operator) {
     case "gte":
@@ -1566,8 +1779,19 @@ async function poll(timeoutMs, fn, onTimeoutMessage) {
 
 class SessionManager {
   constructor(options) {
-    this.options = options;
+    this.options = {
+      ...options,
+      defaultDialogPolicy: normalizeDialogPolicy(
+        { action: options.defaultDialogAction, promptText: options.defaultDialogPromptText },
+        { action: "dismiss", promptText: "" },
+      ),
+    };
     this.sessions = new Map();
+    // Artifacts outlive their session: the files stayed on disk but the only
+    // index that could resolve an artifactId was thrown away on close, so
+    // evidence collected during a run became unreachable the moment the
+    // session ended.
+    this.artifactIndex = new Map();
     this.pageLookup = new WeakMap();
     this.cleanupTimer = setInterval(() => {
       this.cleanupExpiredSessions().catch((error) => {
@@ -1612,6 +1836,8 @@ class SessionManager {
       pageIds: [...record.pageIds],
       routeIds: [...record.routes.keys()],
       tracing: record.tracing,
+      dialogPolicy: record.dialogPolicy,
+      blockedRequests: record.blockedRequests || 0,
       options: record.options,
     };
   }
@@ -1631,6 +1857,8 @@ class SessionManager {
       url: record.page.isClosed() ? record.lastUrl : record.page.url(),
       title,
       closed: record.page.isClosed(),
+      dialogPolicy: record.dialogPolicy,
+      lastDialog: record.lastDialog,
     };
   }
 
@@ -1738,21 +1966,27 @@ class SessionManager {
     }
   }
 
-  assertAllowedUrl(url) {
+  isAllowedUrl(url) {
     const allowlist = this.options.urlAllowlist;
     if (!allowlist.length) {
-      return;
+      return true;
     }
 
     let parsed;
     try {
       parsed = new URL(url);
     } catch {
-      throw new ApiError(400, "INVALID_URL", `url must be absolute when URL_ALLOWLIST is set: ${url}`);
+      return false;
     }
 
+    // Loopback is where the built-in demo page lives; blocking it would make the
+    // allowlist unusable with the server's own pages.
     const hostname = parsed.hostname.toLowerCase();
-    const allowed = allowlist.some((entry) => {
+    if (["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname)) {
+      return true;
+    }
+
+    return allowlist.some((entry) => {
       const normalized = entry.toLowerCase();
       if (normalized === "*") {
         return true;
@@ -1763,9 +1997,63 @@ class SessionManager {
       }
       return hostname === normalized;
     });
+  }
 
-    if (!allowed) {
-      throw new ApiError(403, "URL_NOT_ALLOWED", `URL host is not in allowlist: ${hostname}`);
+  assertAllowedUrl(url) {
+    if (!this.options.urlAllowlist.length) {
+      return;
+    }
+
+    try {
+      // eslint-disable-next-line no-new
+      new URL(url);
+    } catch {
+      throw new ApiError(400, "INVALID_URL", `url must be absolute when URL_ALLOWLIST is set: ${url}`);
+    }
+
+    if (!this.isAllowedUrl(url)) {
+      throw new ApiError(403, "URL_NOT_ALLOWED", `URL host is not in allowlist: ${new URL(url).hostname}`);
+    }
+  }
+
+  // Checking only the goto argument let a redirect, an iframe, or any in-page
+  // request reach a host the operator never allowed. This enforces the
+  // allowlist on every request the context makes.
+  //
+  // Playwright matches routes in reverse registration order, so the guard is
+  // re-registered after each user route to stay first, and falls through with
+  // route.fallback() when the request is allowed.
+  async installUrlGuard(contextRecord) {
+    if (!this.options.urlAllowlist.length) {
+      return;
+    }
+
+    const previous = contextRecord.urlGuard;
+    const guard = async (route, request) => {
+      if (this.isAllowedUrl(request.url())) {
+        await route.fallback();
+        return;
+      }
+
+      contextRecord.blockedRequests = (contextRecord.blockedRequests || 0) + 1;
+      await route.abort("blockedbyclient");
+    };
+
+    // Failing to install must not fail open: an unguarded context would let
+    // every request through while the operator believes the allowlist applies.
+    try {
+      await contextRecord.context.route("**/*", guard);
+    } catch (error) {
+      throw new ApiError(
+        500,
+        "URL_GUARD_INSTALL_FAILED",
+        `Could not enforce URL_ALLOWLIST on context ${contextRecord.contextId}: ${error.message}`,
+      );
+    }
+
+    contextRecord.urlGuard = guard;
+    if (previous) {
+      await contextRecord.context.unroute("**/*", previous).catch(() => undefined);
     }
   }
 
@@ -1861,6 +2149,7 @@ class SessionManager {
     session.updatedAt = toIso();
     if (this.options.purgeSessionArtifactsOnClose) {
       await removeDir(path.join(this.options.artifactsDir, sessionId));
+      this.forgetSessionArtifacts(sessionId);
     }
 
     return {
@@ -1921,12 +2210,34 @@ class SessionManager {
         url: response.url(),
       });
     });
+    // Playwright auto-dismisses dialogs only while no listener is attached.
+    // Attaching one to log them made every alert/confirm/prompt block the action
+    // that opened it until it timed out, so the listener has to resolve it.
     page.on("dialog", (dialog) => {
-      this.logEvent(session, {
-        type: "dialog",
-        pageId: pageRecord.pageId,
+      const policy = this.resolveDialogPolicy(session, pageRecord);
+      const record = {
+        ts: toIso(),
         dialogType: dialog.type(),
         message: dialog.message(),
+        defaultValue: dialog.defaultValue(),
+        handledWith: policy.action,
+      };
+      pageRecord.lastDialog = record;
+      this.logEvent(session, { type: "dialog", pageId: pageRecord.pageId, ...record });
+
+      if (policy.action === "ignore") {
+        return;
+      }
+
+      const settle = policy.action === "accept"
+        ? dialog.accept(policy.promptText ?? "")
+        : dialog.dismiss();
+      settle.catch((error) => {
+        this.logEvent(session, {
+          type: "dialog.error",
+          pageId: pageRecord.pageId,
+          message: error.message,
+        });
       });
     });
     page.on("framenavigated", (frame) => {
@@ -1947,6 +2258,27 @@ class SessionManager {
     });
   }
 
+  // Page policy wins over context policy, which wins over the server default.
+  resolveDialogPolicy(session, pageRecord) {
+    const contextRecord = session.contexts.get(pageRecord.contextId);
+    return pageRecord.dialogPolicy
+      || contextRecord?.dialogPolicy
+      || this.options.defaultDialogPolicy;
+  }
+
+  async setDialogPolicy(sessionId, pageId, request = {}) {
+    return this.withLock(sessionId, async (session) => {
+      const pageRecord = this.getPageRecord(session, pageId);
+      pageRecord.dialogPolicy = normalizeDialogPolicy(
+        request.dialogPolicy ?? request,
+        this.options.defaultDialogPolicy,
+      );
+      pageRecord.updatedAt = toIso();
+      this.touch(session);
+      return { pageId, dialogPolicy: pageRecord.dialogPolicy };
+    });
+  }
+
   ensurePageRecord(session, contextRecord, page, source) {
     const existingId = this.pageLookup.get(page);
     if (existingId && session.pages.has(existingId)) {
@@ -1962,6 +2294,8 @@ class SessionManager {
       createdAt: toIso(),
       updatedAt: toIso(),
       lastUrl: page.url(),
+      dialogPolicy: null,
+      lastDialog: null,
     };
     session.pages.set(pageId, pageRecord);
     contextRecord.pageIds.add(pageId);
@@ -2010,6 +2344,7 @@ class SessionManager {
         });
       }
 
+      const dialogPolicy = normalizeDialogPolicy(request.dialogPolicy, null);
       const context = await session.browser.newContext(baseOptions);
       const contextRecord = {
         contextId,
@@ -2020,10 +2355,12 @@ class SessionManager {
         pageIds: new Set(),
         routes: new Map(),
         options: baseOptions,
+        dialogPolicy,
         tracing: false,
       };
 
       this.attachContextListeners(session, contextRecord);
+      await this.installUrlGuard(contextRecord);
       session.contexts.set(contextId, contextRecord);
       this.touch(session);
 
@@ -2158,7 +2495,27 @@ class SessionManager {
       metadata: request.metadata,
     };
     session.artifacts.set(artifactId, artifact);
+    this.indexArtifact(session.sessionId, artifact);
     return this.serializeArtifact(session.sessionId, artifact);
+  }
+
+  indexArtifact(sessionId, artifact) {
+    this.artifactIndex.set(artifact.artifactId, { ...artifact, sessionId });
+    const excess = this.artifactIndex.size - this.options.maxRetainedArtifacts;
+    if (excess > 0) {
+      // Map preserves insertion order, so the oldest keys come first.
+      for (const key of [...this.artifactIndex.keys()].slice(0, excess)) {
+        this.artifactIndex.delete(key);
+      }
+    }
+  }
+
+  forgetSessionArtifacts(sessionId) {
+    for (const [artifactId, artifact] of this.artifactIndex) {
+      if (artifact.sessionId === sessionId) {
+        this.artifactIndex.delete(artifactId);
+      }
+    }
   }
 
   // Capturing a full-page screenshot plus the DOM for every rejected request
@@ -2267,6 +2624,7 @@ class SessionManager {
       contextRecord.options = recreatedOptions;
       contextRecord.updatedAt = toIso();
       contextRecord.tracing = false;
+      await this.installUrlGuard(contextRecord);
       this.attachContextListeners(session, contextRecord);
       this.touch(session);
       this.logAction(session, {
@@ -2289,6 +2647,14 @@ class SessionManager {
         throw new ApiError(400, "INVALID_REQUEST", "url is required");
       }
       const routeId = createId("route");
+      const behaviorPath = request.behavior?.path;
+      const fulfillPath = behaviorPath
+        ? resolveWithin(this.options.routeFixturesDir, behaviorPath, "behavior.path")
+        : undefined;
+      if (fulfillPath && !(await fileExists(fulfillPath))) {
+        throw new ApiError(404, "FIXTURE_NOT_FOUND", `Route fixture not found: ${behaviorPath}`);
+      }
+
       const handler = async (route) => {
         const behavior = request.behavior || { action: "continue" };
         switch (behavior.action) {
@@ -2301,7 +2667,9 @@ class SessionManager {
               contentType: behavior.contentType,
               headers: behavior.headers,
               json: behavior.json,
-              path: behavior.path,
+              // route.fulfill({ path }) reads a file off the server's disk and
+              // serves it into the page, so it is confined to the fixtures root.
+              path: fulfillPath,
               status: behavior.status,
             }));
             break;
@@ -2317,6 +2685,9 @@ class SessionManager {
         }
       };
       await contextRecord.context.route(request.url, handler, { times: request.times });
+      // Keep the allowlist guard as the most recently added route so it still
+      // sees every request first.
+      await this.installUrlGuard(contextRecord);
       contextRecord.routes.set(routeId, {
         url: request.url,
         handler,
@@ -2573,12 +2944,12 @@ class SessionManager {
             if (!this.options.enableEvaluate) {
               throw new ApiError(403, "EVALUATE_DISABLED", "page.evaluate is disabled by configuration");
             }
-            if (!request.expression) {
-              throw new ApiError(400, "INVALID_REQUEST", "expression is required");
+            if (typeof request.expression !== "string" || !request.expression.trim()) {
+              throw new ApiError(400, "INVALID_REQUEST", "expression (string) is required");
             }
             return {
               pageId,
-              result: await page.evaluate(request.expression, request.arg),
+              result: await page.evaluate(buildEvaluateExpression(request.expression, request.arg)),
             };
           case "locatorQuery": {
             const locator = resolveLocator(page, request.locator);
@@ -2963,6 +3334,7 @@ class SessionManager {
         metadata: request,
       };
       session.artifacts.set(traceId, artifact);
+      this.indexArtifact(session.sessionId, artifact);
       return {
         contextId: contextRecord.contextId,
         tracing: false,
@@ -3045,15 +3417,17 @@ class SessionManager {
     });
   }
 
+  // Reads the standalone index, so listing and downloading keep working after
+  // the session that produced the artifacts is gone.
   async listArtifacts(sessionId) {
-    const session = this.getSession(sessionId);
-    return [...session.artifacts.values()].map((artifact) => this.serializeArtifact(sessionId, artifact));
+    return [...this.artifactIndex.values()]
+      .filter((artifact) => artifact.sessionId === sessionId)
+      .map((artifact) => this.serializeArtifact(sessionId, artifact));
   }
 
   getArtifact(sessionId, artifactId) {
-    const session = this.getSession(sessionId);
-    const artifact = session.artifacts.get(artifactId);
-    if (!artifact) {
+    const artifact = this.artifactIndex.get(artifactId);
+    if (!artifact || (sessionId && artifact.sessionId !== sessionId)) {
       throw new ApiError(404, "ARTIFACT_NOT_FOUND", `Artifact not found: ${artifactId}`);
     }
     return artifact;
@@ -4356,6 +4730,7 @@ function buildOpenApiSpec(req) {
       ...pageActionPath("select-option", "Select option(s) in a <select>", { values: { type: "array", items: { type: "string" } }, value: { type: "string" } }),
       ...pageActionPath("assert/visible", "Assert a locator becomes visible"),
       ...pageActionPath("assert/count", "Assert how many elements a locator matches", { expected: { type: "integer", example: 3 }, operator: { type: "string", enum: ["eq", "gt", "gte", "lt", "lte"] } }),
+      ...pageActionPath("dialog-policy", "Choose how this page answers alert/confirm/prompt dialogs", { action: { type: "string", enum: ["accept", "dismiss", "ignore"] }, promptText: { type: "string" } }),
       ...pageActionPath("wait-for", "Wait for a load state, URL, locator, text, or a fixed delay", { loadState: { type: "string", enum: ["load", "domcontentloaded", "networkidle"] }, url: { type: "string" }, text: { type: "string" }, textGone: { type: "string" }, state: { type: "string" }, sleepMs: { type: "integer" } }),
       [`${api}/sessions/{sessionId}/pages/{pageId}/drag`]: {
         post: operation({
@@ -4872,6 +5247,28 @@ function renderPlaygroundPage(req) {
       pageIdInput.value = state.pageId;
     }
 
+    // <img src> and <a href> cannot carry an Authorization header, so with
+    // API_TOKEN set both have to go through fetch and a blob URL.
+    async function fetchArtifactBlob(downloadPath, inline) {
+      const url = downloadPath + (inline ? '?disposition=inline' : '');
+      const response = await fetch(url, { headers: authHeaders() });
+      if (!response.ok) {
+        throw new Error(COPY.requestFailed + ' (' + response.status + ')');
+      }
+      return URL.createObjectURL(await response.blob());
+    }
+
+    async function downloadArtifact(artifact) {
+      const objectUrl = await fetchArtifactBlob(artifact.downloadPath, false);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = artifact.fileName;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 30000);
+    }
+
     function showArtifact(artifact) {
       if (!artifact || !artifact.downloadPath) {
         preview.textContent = COPY.noScreenshot;
@@ -4880,25 +5277,10 @@ function renderPlaygroundPage(req) {
       preview.replaceChildren();
       const image = document.createElement('img');
       image.alt = COPY.screenshotAlt;
-      // The download route defaults to Content-Disposition: attachment.
-      const inlineUrl = artifact.downloadPath + '?disposition=inline';
-      const headers = authHeaders();
-      if (headers.Authorization) {
-        // <img> cannot send a header, so fetch the bytes and preview a blob.
-        fetch(inlineUrl, { headers }).then(function (response) {
-          if (!response.ok) {
-            throw new Error(COPY.requestFailed);
-          }
-          return response.blob();
-        }).then(function (blob) {
-          image.src = URL.createObjectURL(blob);
-        }).catch(function (error) {
-          preview.textContent = error.message;
-        });
-      } else {
-        image.src = inlineUrl;
-      }
       preview.append(image);
+      fetchArtifactBlob(artifact.downloadPath, true)
+        .then(function (objectUrl) { image.src = objectUrl; })
+        .catch(function (error) { preview.textContent = error.message; });
     }
 
     function authHeaders() {
@@ -5091,12 +5473,13 @@ function renderPlaygroundPage(req) {
         const meta = document.createElement('span');
         meta.style.cssText = 'color:#5f6b82;font-size:.9rem;';
         meta.textContent = a.fileName + ' (' + Math.round((a.sizeBytes || 0) / 1024) + ' KB)';
-        const link = document.createElement('a');
-        link.href = a.downloadPath;
-        link.target = '_blank';
-        link.download = '';
+        const link = document.createElement('button');
+        link.type = 'button';
         link.textContent = COPY.downloadLabel;
-        link.style.cssText = 'margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;';
+        link.style.cssText = 'margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;border:0;font-size:.85rem;font-weight:600;cursor:pointer;';
+        link.addEventListener('click', function () {
+          downloadArtifact(a).catch(function (error) { setStatus(error.message, true); });
+        });
         row.append(type, meta, link);
         list.append(row);
       });
@@ -5797,6 +6180,10 @@ app.post(`${config.apiBasePath}/sessions/:sessionId/pages/:pageId/assert/count`,
   ok(res, await sessionManager.pageAssert(req.params.sessionId, req.params.pageId, "count", req.body || {}));
 }));
 
+app.post(`${config.apiBasePath}/sessions/:sessionId/pages/:pageId/dialog-policy`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.setDialogPolicy(req.params.sessionId, req.params.pageId, req.body || {}));
+}));
+
 app.post(`${config.apiBasePath}/sessions/:sessionId/pages/:pageId/wait-for`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.waitFor(req.params.sessionId, req.params.pageId, req.body || {}));
 }));
@@ -5808,6 +6195,91 @@ app.post(`${config.apiBasePath}/sessions/:sessionId/pages/:pageId/screenshot`, a
 app.post(`${config.apiBasePath}/sessions/:sessionId/pages/:pageId/pdf`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.pdf(req.params.sessionId, req.params.pageId, req.body || {}));
 }));
+
+// REST (OpenAPI) and MCP described the same operations with different, and in
+// MCP's case incomplete, schemas - page_action advertised only sessionId,
+// pageId and action, so a model had no way to learn that it must send a
+// locator. Both now build on these shared fragments.
+const LOCATOR_SCHEMA = {
+  type: "object",
+  description: "Structured locator. Provide exactly one primary strategy; role+name and testId are the most stable.",
+  properties: {
+    role: { type: "string", description: "ARIA role, e.g. button, link, textbox" },
+    name: { type: "string", description: "Accessible name, used together with role" },
+    text: { type: "string" },
+    label: { type: "string" },
+    placeholder: { type: "string" },
+    testId: { type: "string", description: "data-testid value" },
+    altText: { type: "string" },
+    title: { type: "string" },
+    css: { type: "string" },
+    xpath: { type: "string" },
+    selector: { type: "string" },
+    exact: { type: "boolean" },
+    hasText: { type: "string", description: "Extra .filter({ hasText }) narrowing" },
+    first: { type: "boolean" },
+    last: { type: "boolean" },
+    nth: { type: "integer", description: "Zero-based index; takes precedence over first/last" },
+  },
+};
+
+const DIALOG_POLICY_SCHEMA = {
+  type: "object",
+  description: "What to do when the page opens an alert/confirm/prompt. Without a policy the action that opened it would block.",
+  properties: {
+    action: { type: "string", enum: ["accept", "dismiss", "ignore"] },
+    promptText: { type: "string", description: "Text typed into a prompt() when action is accept" },
+  },
+  required: ["action"],
+};
+
+const STEP_SCHEMA = {
+  type: "object",
+  description: "One automation step. Field requirements follow the action.",
+  properties: {
+    action: {
+      type: "string",
+      enum: [
+        "goto", "reload", "goBack", "goForward",
+        "click", "fill", "press", "hover", "drag", "selectOption", "evaluate", "locatorQuery",
+        "assertVisible", "assertText", "assertUrl", "assertCount",
+        "waitFor", "screenshot",
+      ],
+    },
+    url: { type: "string", description: "goto / assertUrl / waitFor" },
+    locator: LOCATOR_SCHEMA,
+    source: LOCATOR_SCHEMA,
+    target: LOCATOR_SCHEMA,
+    value: { type: "string", description: "fill value, or the expected value for assertions" },
+    expected: { description: "Expected value for assertions; a number for assertCount" },
+    key: { type: "string", description: "press, e.g. Enter" },
+    values: { type: "array", items: { type: "string" }, description: "selectOption" },
+    match: { type: "string", enum: ["contains", "equals", "startsWith", "endsWith"] },
+    operator: { type: "string", enum: ["eq", "gt", "gte", "lt", "lte"], description: "assertCount" },
+    expression: { type: "string", description: "evaluate" },
+    loadState: { type: "string", enum: ["load", "domcontentloaded", "networkidle"] },
+    text: { type: "string" },
+    textGone: { type: "string" },
+    state: { type: "string", enum: ["attached", "detached", "visible", "hidden"] },
+    sleepMs: { type: "integer" },
+    fullPage: { type: "boolean" },
+    timeoutMs: { type: "integer" },
+  },
+  required: ["action"],
+};
+
+function sessionPageSchema(extra = {}, required = ["sessionId", "pageId"]) {
+  return {
+    type: "object",
+    properties: {
+      sessionId: { type: "string" },
+      pageId: { type: "string" },
+      timeoutMs: { type: "integer", description: "Per-call timeout in milliseconds" },
+      ...extra,
+    },
+    required,
+  };
+}
 
 function defineTool(name, description, inputSchema, handler) {
   return { name, description, inputSchema, handler };
@@ -5859,7 +6331,23 @@ const mcpTools = [
     await scriptRegistry.refresh();
     return { deleted: args.scriptKey };
   }),
-  defineTool("script_validate", "Validate a script before registration or execution.", { type: "object", properties: { scriptKey: { type: "string" }, scriptPath: { type: "string" }, filename: { type: "string" }, content: { type: "string" }, project: { type: "string" }, grep: { type: "string" } } }, async (args) => runManager.validateScript(args)),
+  defineTool(
+    "script_validate",
+    "Check a script. mode=syntax parses it without running anything (JavaScript only). mode=discover (default) lists its tests through Playwright, which loads the file and therefore executes its module scope.",
+    {
+      type: "object",
+      properties: {
+        scriptKey: { type: "string" },
+        scriptPath: { type: "string", description: "Path relative to the scripts directory" },
+        filename: { type: "string", description: "File name used when validating inline content" },
+        content: { type: "string", description: "Inline script source" },
+        mode: { type: "string", enum: ["syntax", "discover"], default: "discover" },
+        project: { type: "string" },
+        grep: { type: "string" },
+      },
+    },
+    async (args) => runManager.validateScript(args),
+  ),
   defineTool("assist_capabilities", "Return LLM-friendly authoring capabilities, workflow hints, and supported locator/action vocabularies.", { type: "object", properties: {} }, async () => scriptAssistant.getCapabilities()),
   defineTool("assist_examples", "Return localized prompt examples, reusable step patterns, and locator guidance for LLM-driven script generation.", { type: "object", properties: { language: { type: "string" } } }, async (args) => scriptAssistant.examples(args)),
   defineTool("assist_plan", "Turn a natural-language test request into a structured scenario plan with suggested steps and MCP workflow.", { type: "object", properties: { goal: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, scriptKey: { type: "string" }, language: { type: "string" }, tags: { type: "array" }, locators: { type: "object" }, expectations: { type: "array" }, variables: { type: "object" }, storageStateRef: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.plan(args)),
@@ -5880,8 +6368,44 @@ const mcpTools = [
   defineTool("session_artifacts", "List artifacts captured in a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => ({ sessionId: args.sessionId, artifacts: await sessionManager.listArtifacts(args.sessionId) })),
   defineTool("session_actions", "List action and event logs for a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.listActions(args.sessionId)),
   defineTool("session_trace", "Start or stop Playwright tracing for a context.", { type: "object", properties: { sessionId: { type: "string" }, action: { type: "string" }, contextId: { type: "string" }, title: { type: "string" } }, required: ["sessionId", "action", "contextId"] }, async (args) => args.action === "start" ? sessionManager.startTrace(args.sessionId, args) : sessionManager.stopTrace(args.sessionId, args)),
-  defineTool("session_execute", "Execute a batch of page actions inside a session. The whole batch holds the session lock, so no other call can interleave.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, steps: { type: "array" }, continueOnError: { type: "boolean", description: "Keep running later steps after one fails." } }, required: ["sessionId", "pageId", "steps"] }, async (args) => sessionManager.execute(args.sessionId, args)),
-  defineTool("context_create", "Create a browser context within a session.", { type: "object", properties: { sessionId: { type: "string" }, baseURL: { type: "string" }, viewport: { type: "object" }, locale: { type: "string" }, storageState: { type: "object" } }, required: ["sessionId"] }, async (args) => sessionManager.createContext(args.sessionId, args)),
+  defineTool(
+    "session_execute",
+    "Execute a batch of page steps. The whole batch holds the session lock, so no other call can interleave between steps.",
+    {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        pageId: { type: "string" },
+        steps: { type: "array", items: STEP_SCHEMA, minItems: 1 },
+        continueOnError: { type: "boolean", default: false, description: "Keep running later steps after one fails." },
+      },
+      required: ["sessionId", "pageId", "steps"],
+    },
+    async (args) => sessionManager.execute(args.sessionId, args),
+  ),
+  defineTool(
+    "context_create",
+    "Create a browser context (an isolated cookie/storage profile) within a session.",
+    {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        baseURL: { type: "string" },
+        viewport: { type: "object", properties: { width: { type: "integer" }, height: { type: "integer" } } },
+        locale: { type: "string", example: "ko-KR" },
+        timezoneId: { type: "string" },
+        userAgent: { type: "string" },
+        ignoreHTTPSErrors: { type: "boolean" },
+        extraHTTPHeaders: { type: "object", additionalProperties: { type: "string" } },
+        storageState: { type: "object" },
+        dialogPolicy: DIALOG_POLICY_SCHEMA,
+        recordVideo: { type: "object", properties: { size: { type: "object" } } },
+        permissions: { type: "array", items: { type: "string" } },
+      },
+      required: ["sessionId"],
+    },
+    async (args) => sessionManager.createContext(args.sessionId, args),
+  ),
   defineTool("context_get", "Get one browser context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.getContext(args.sessionId, args.contextId)),
   defineTool("context_delete", "Close one browser context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.closeContext(args.sessionId, args.contextId)),
   defineTool("context_storage_export", "Export storage state from a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.exportStorageState(args.sessionId, args.contextId)),
@@ -5895,12 +6419,104 @@ const mcpTools = [
   defineTool("page_get", "Get one page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.getPage(args.sessionId, args.pageId)),
   defineTool("page_inspect", "Inspect a live page and extract headings, visible text, and high-confidence locator candidates for script generation.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, maxElements: { type: "number" }, maxTextLength: { type: "number" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.inspectPage(args.sessionId, args.pageId, args)),
   defineTool("page_delete", "Close one page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.closePage(args.sessionId, args.pageId)),
-  defineTool("page_navigate", "Navigate or move the current page history.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, action: { type: "string" }, url: { type: "string" } }, required: ["sessionId", "pageId", "action"] }, async (args) => sessionManager.navigate(args.sessionId, args.pageId, args.action, args)),
-  defineTool("page_action", "Run a low-level page action such as click, fill, hover, drag, evaluate, or locator query.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, action: { type: "string" } }, required: ["sessionId", "pageId", "action"] }, async (args) => sessionManager.pageAction(args.sessionId, args.pageId, args.action, args)),
-  defineTool("page_assert", "Run a low-level page assertion.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, action: { type: "string" } }, required: ["sessionId", "pageId", "action"] }, async (args) => sessionManager.pageAssert(args.sessionId, args.pageId, args.action, args)),
-  defineTool("page_wait_for", "Wait for a page condition.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.waitFor(args.sessionId, args.pageId, args)),
-  defineTool("page_screenshot", "Capture a screenshot artifact.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.screenshot(args.sessionId, args.pageId, args)),
-  defineTool("page_pdf", "Create a PDF artifact for a chromium page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.pdf(args.sessionId, args.pageId, args)),
+  defineTool(
+    "page_navigate",
+    "Navigate the page or move through its history. action=goto requires url.",
+    sessionPageSchema({
+      action: { type: "string", enum: ["goto", "reload", "goBack", "goForward"] },
+      url: { type: "string", description: "Absolute URL; required for goto" },
+      waitUntil: { type: "string", enum: ["load", "domcontentloaded", "networkidle", "commit"] },
+    }, ["sessionId", "pageId", "action"]),
+    async (args) => sessionManager.navigate(args.sessionId, args.pageId, args.action, args),
+  ),
+  defineTool(
+    "page_action",
+    "Run one page action. click/fill/press/hover/selectOption/locatorQuery need `locator`; fill needs `value`; press needs `key`; selectOption needs `values`; drag needs `source` and `target`; evaluate needs `expression`.",
+    sessionPageSchema({
+      action: {
+        type: "string",
+        enum: ["click", "fill", "press", "hover", "drag", "selectOption", "evaluate", "locatorQuery"],
+      },
+      locator: LOCATOR_SCHEMA,
+      source: LOCATOR_SCHEMA,
+      target: LOCATOR_SCHEMA,
+      value: { type: "string", description: "Text to type for fill" },
+      key: { type: "string", description: "Key name for press, e.g. Enter" },
+      values: { type: "array", items: { type: "string" }, description: "Options to select for selectOption" },
+      expression: { type: "string", description: "JavaScript for evaluate, e.g. () => document.title" },
+      arg: { description: "Argument passed to the evaluate expression" },
+      operation: {
+        type: "string",
+        enum: ["count", "allTextContents", "textContent", "innerText", "isVisible"],
+        description: "locatorQuery read to perform",
+      },
+      button: { type: "string", enum: ["left", "right", "middle"] },
+      clickCount: { type: "integer" },
+      force: { type: "boolean" },
+      modifiers: { type: "array", items: { type: "string" } },
+      delay: { type: "integer" },
+    }, ["sessionId", "pageId", "action"]),
+    async (args) => sessionManager.pageAction(args.sessionId, args.pageId, args.action, args),
+  ),
+  defineTool(
+    "page_assert",
+    "Assert page state. visible/count need `locator`; text needs `locator` and `expected`; url needs `expected`; count needs a numeric `expected`. Wrap a value in \"/pattern/flags\" to match it as a regular expression.",
+    sessionPageSchema({
+      action: { type: "string", enum: ["visible", "text", "url", "count"] },
+      locator: LOCATOR_SCHEMA,
+      expected: { description: "Expected text, URL, or count" },
+      match: { type: "string", enum: ["contains", "equals", "startsWith", "endsWith"], default: "contains" },
+      operator: { type: "string", enum: ["eq", "gt", "gte", "lt", "lte"], default: "eq" },
+    }, ["sessionId", "pageId", "action"]),
+    async (args) => sessionManager.pageAssert(args.sessionId, args.pageId, args.action, args),
+  ),
+  defineTool(
+    "page_wait_for",
+    "Wait for a page condition. Exactly one of loadState, url, locator, text, textGone, or sleepMs is required.",
+    sessionPageSchema({
+      loadState: { type: "string", enum: ["load", "domcontentloaded", "networkidle"] },
+      url: { type: "string", description: "URL or \"/pattern/flags\" regular expression" },
+      locator: LOCATOR_SCHEMA,
+      state: { type: "string", enum: ["attached", "detached", "visible", "hidden"], default: "visible" },
+      text: { type: "string", description: "Wait until this text is visible" },
+      textGone: { type: "string", description: "Wait until this text disappears" },
+      sleepMs: { type: "integer", description: "Unconditional delay; prefer a real condition" },
+      exact: { type: "boolean" },
+    }),
+    async (args) => sessionManager.waitFor(args.sessionId, args.pageId, args),
+  ),
+  defineTool(
+    "page_dialog_policy",
+    "Set how this page answers alert/confirm/prompt dialogs. Without a policy the server default (dismiss) applies; action=ignore leaves the dialog open and will block whatever opened it.",
+    sessionPageSchema({
+      action: { type: "string", enum: ["accept", "dismiss", "ignore"] },
+      promptText: { type: "string" },
+    }, ["sessionId", "pageId", "action"]),
+    async (args) => sessionManager.setDialogPolicy(args.sessionId, args.pageId, args),
+  ),
+  defineTool(
+    "page_screenshot",
+    "Capture a screenshot and store it as a downloadable artifact.",
+    sessionPageSchema({
+      fullPage: { type: "boolean", default: true },
+      type: { type: "string", enum: ["png", "jpeg"], default: "png" },
+      quality: { type: "integer", description: "jpeg only, 0-100" },
+      omitBackground: { type: "boolean" },
+    }),
+    async (args) => sessionManager.screenshot(args.sessionId, args.pageId, args),
+  ),
+  defineTool(
+    "page_pdf",
+    "Render the page to PDF and store it as an artifact. Chromium sessions only.",
+    sessionPageSchema({
+      format: { type: "string", example: "A4" },
+      landscape: { type: "boolean" },
+      printBackground: { type: "boolean", default: true },
+      scale: { type: "number" },
+      margin: { type: "object", additionalProperties: { type: "string" } },
+    }),
+    async (args) => sessionManager.pdf(args.sessionId, args.pageId, args),
+  ),
 ];
 
 const mcpToolMap = new Map(mcpTools.map((tool) => [tool.name, tool]));

@@ -79,6 +79,7 @@ Playwright 스크립트 초안을 생성합니다.
 - `overwrite: true` 시 기존 파일 덮어쓰기
 - `language` 는 주석/문구 언어(`ko`/`en`), `scriptLanguage` 는 생성 파일 언어(`js`/`ts`)입니다.
 - assertion 단계는 `value` 와 `expected` 를 모두 인식합니다.
+- 생성된 스크립트의 `variables` 는 실행 시 `PW_PLAYER_VARIABLES_JSON` 값으로 덮어써집니다. 스캐폴드에 넣은 값은 기본값 역할만 합니다.
 
 입력 예시:
 

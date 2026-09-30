@@ -4,8 +4,10 @@
 // the REST API, the MCP endpoint and one real browser session, then reports a
 // pass/fail summary. Run with `npm test`.
 //
-// Browser-dependent checks are skipped (not failed) when no Playwright browser
-// is installed, so the suite stays useful in an offline checkout.
+// Browser-dependent checks are skipped only when no Playwright browser is
+// installed, so the suite stays useful in an offline checkout. Any other launch
+// failure is a real failure. Set SMOKE_REQUIRE_BROWSER=1 (release verification)
+// to turn even the missing-browser case into a failure.
 import { spawn } from "node:child_process";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
@@ -17,6 +19,7 @@ const port = Number(process.env.SMOKE_PORT || 3911);
 const baseUrl = `http://127.0.0.1:${port}`;
 const token = "smoke-token";
 
+const requireBrowser = process.env.SMOKE_REQUIRE_BROWSER === "1";
 const results = [];
 let scratchDir;
 let child;
@@ -61,10 +64,10 @@ async function call(method, urlPath, body, { auth = true, headers = {} } = {}) {
   return { status: response.status, payload, headers: response.headers };
 }
 
-async function waitForHealth() {
+async function waitForHealth(url = baseUrl) {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     try {
-      const response = await fetch(`${baseUrl}/health`);
+      const response = await fetch(`${url}/health`);
       if (response.ok) {
         return;
       }
@@ -73,7 +76,35 @@ async function waitForHealth() {
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`server did not become healthy on ${baseUrl}`);
+  throw new Error(`server did not become healthy on ${url}`);
+}
+
+// A second instance with its own configuration, for settings that cannot be
+// changed on a running server (URL_ALLOWLIST).
+async function startExtraServer(extraEnv, extraPort) {
+  const extraDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-extra-"));
+  const process2 = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(extraPort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: path.join(extraDir, "scripts"),
+      RUNS_DIR: path.join(extraDir, "runs"),
+      ARTIFACTS_DIR: path.join(extraDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(extraDir, "storage-states"),
+      ...extraEnv,
+    },
+  });
+  await waitForHealth(`http://127.0.0.1:${extraPort}`);
+  return {
+    baseUrl: `http://127.0.0.1:${extraPort}`,
+    async stop() {
+      process2.kill("SIGKILL");
+      await fsPromises.rm(extraDir, { recursive: true, force: true });
+    },
+  };
 }
 
 async function start() {
@@ -113,6 +144,89 @@ async function start() {
 }
 
 let stopping = false;
+
+async function runAllowlistChecks() {
+  let extra;
+  try {
+    extra = await startExtraServer({ URL_ALLOWLIST: "allowed.example" }, port + 1);
+  } catch (error) {
+    record("url allowlist checks", "fail", error.message);
+    return;
+  }
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${extra.baseUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  try {
+    const session = await api("POST", "/api/sessions", {});
+    if (session.status !== 201) {
+      const message = session.payload?.error?.message || `HTTP ${session.status}`;
+      const browserMissing = /Executable doesn't exist|playwright install/i.test(message);
+      if (browserMissing && !requireBrowser) {
+        record("url allowlist checks", "skip", "no Playwright browser installed");
+        return;
+      }
+      record("url allowlist checks", "fail", message.split("\n")[0]);
+      return;
+    }
+
+    const sessionId = session.payload.data.sessionId;
+    const contextId = (await api("POST", `/api/sessions/${sessionId}/contexts`, {})).payload.data.contextId;
+    const pageId = (await api("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {})).payload.data.pageId;
+
+    await check("allowlist rejects a goto to a host that is not listed", async () => {
+      const { status, payload } = await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: "http://blocked.example/",
+      });
+      assert(status === 403, `expected 403, got ${status}`);
+      assert(payload.error.code === "URL_NOT_ALLOWED", payload.error.code);
+    });
+
+    await check("allowlist still permits loopback so the built-in pages work", async () => {
+      const { status } = await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: `${extra.baseUrl}/demo/test-page`,
+      });
+      assert(status === 200, `expected 200, got ${status}`);
+    });
+
+    await check("allowlist blocks in-page requests, not just goto", async () => {
+      // Checking only the goto argument left redirects, iframes and XHR free to
+      // reach any host.
+      const blocked = await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: 'async () => { try { await fetch("http://blocked.example/data"); return "REACHED"; } catch (error) { return "BLOCKED"; } }',
+      });
+      assert(blocked.payload.data.result === "BLOCKED", `in-page fetch result: ${blocked.payload.data.result}`);
+
+      const allowed = await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: `async () => (await fetch("${extra.baseUrl}/health")).status`,
+      });
+      assert(allowed.payload.data.result === 200, `allowed fetch returned ${allowed.payload.data.result}`);
+    });
+
+    await check("the allowlist guard survives a user route registration", async () => {
+      // User routes are added after the guard, and Playwright matches routes in
+      // reverse registration order, so the guard has to be re-installed.
+      await api("POST", `/api/sessions/${sessionId}/contexts/${contextId}/route`, {
+        url: "**/some-other-path",
+        behavior: { action: "continue" },
+      });
+      const blocked = await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: 'async () => { try { await fetch("http://blocked.example/again"); return "REACHED"; } catch (error) { return "BLOCKED"; } }',
+      });
+      assert(blocked.payload.data.result === "BLOCKED", `guard bypassed after route add: ${blocked.payload.data.result}`);
+    });
+
+    await api("DELETE", `/api/sessions/${sessionId}`);
+  } finally {
+    await extra.stop();
+  }
+}
 
 async function stop() {
   stopping = true;
@@ -229,7 +343,7 @@ async function run() {
   });
 
   await check("run lifecycle: create, finish, download artifact, delete", async () => {
-    const created = await call("POST", "/api/runs", { scriptKey: "smoke" });
+    const created = await call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" });
     assert(created.status === 201, `create returned ${created.status}`);
     const runId = created.payload.data.runId;
 
@@ -239,7 +353,11 @@ async function run() {
       const polled = await call("GET", `/api/runs/${runId}`);
       status = polled.payload.data.status;
     }
-    assert(status !== "running", "run never finished");
+    // Asserting only "not running" hid a real failure: the generated config
+    // could not resolve @playwright/test when RUNS_DIR sat outside the project.
+    const logs = await call("GET", `/api/runs/${runId}/logs`);
+    const logText = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+    assert(status === "completed", `run ${status}: ${logText.slice(0, 400)}`);
 
     const artifacts = await call("GET", `/api/runs/${runId}/artifacts`);
     assert(artifacts.payload.data.artifacts.length > 0, "no run artifacts");
@@ -254,6 +372,141 @@ async function run() {
 
     const deleted = await call("DELETE", `/api/runs/${runId}`);
     assert(deleted.status === 200, `delete returned ${deleted.status}`);
+  });
+
+  await check("syntax mode checks without loading the file", async () => {
+    const { payload } = await call("POST", "/api/scripts/validate", {
+      mode: "syntax",
+      filename: "side-effect.spec.js",
+      content: "throw new Error(\"module scope ran\");\n",
+    });
+    assert(payload.data.mode === "syntax", payload.data.mode);
+    assert(payload.data.executesModuleScope === false, "syntax mode must not execute module scope");
+    assert(payload.data.valid === true, `valid=${payload.data.valid} stderr=${payload.data.stderr}`);
+  });
+
+  await check("syntax mode reports a real parse error", async () => {
+    const { payload } = await call("POST", "/api/scripts/validate", {
+      mode: "syntax",
+      filename: "broken.spec.js",
+      content: "const = ;\n",
+    });
+    assert(payload.data.valid === false, "a parse error should not validate");
+  });
+
+  await check("discover mode declares that it loads the file", async () => {
+    const { payload } = await call("POST", "/api/scripts/validate", {
+      content: "import { test, expect } from \"@playwright/test\";\ntest(\"d\", async () => { expect(1).toBe(1); });\n",
+    });
+    assert(payload.data.mode === "discover", payload.data.mode);
+    assert(payload.data.executesModuleScope === true, "discover mode must declare module-scope execution");
+  });
+
+  await check("spawned runs do not inherit the server API token", async () => {
+    await call("PUT", "/api/scripts/env-probe", {
+      content: [
+        "import { test, expect } from \"@playwright/test\";",
+        "",
+        "test(\"env probe\", async () => {",
+        "  expect(process.env.API_TOKEN, \"API_TOKEN leaked into the run\").toBeUndefined();",
+        "  expect(process.env.PW_PLAYER_RUN_ID).toBeTruthy();",
+        "});",
+        "",
+      ].join("\n"),
+    });
+    const created = await call("POST", "/api/runs", { scriptKey: "env-probe", project: "chromium" });
+    const runId = created.payload.data.runId;
+    let status = "running";
+    for (let attempt = 0; attempt < 120 && status === "running"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      status = (await call("GET", `/api/runs/${runId}`)).payload.data.status;
+    }
+    const logs = await call("GET", `/api/runs/${runId}/logs`);
+    const text = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+    assert(status === "completed", `run ${status}: ${text.slice(0, 400)}`);
+    await call("DELETE", `/api/runs/${runId}`);
+    await call("DELETE", "/api/scripts/env-probe");
+  });
+
+  await check("concurrent run requests cannot exceed the limit", async () => {
+    // MAX_CONCURRENT_RUNS is 2 for this harness. Fired together, these used to
+    // all pass the check before any of them registered.
+    const responses = await Promise.all(
+      Array.from({ length: 6 }, () => call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" })),
+    );
+    const accepted = responses.filter((entry) => entry.status === 201);
+    const rejected = responses.filter((entry) => entry.payload?.error?.code === "RUN_LIMIT_EXCEEDED");
+    assert(accepted.length <= 2, `${accepted.length} runs accepted, limit is 2`);
+    assert(rejected.length === responses.length - accepted.length, "unexpected rejection reason");
+
+    for (const entry of accepted) {
+      const runId = entry.payload.data.runId;
+      let status = "running";
+      for (let attempt = 0; attempt < 120 && status === "running"; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        status = (await call("GET", `/api/runs/${runId}`)).payload.data.status;
+      }
+      await call("DELETE", `/api/runs/${runId}`);
+    }
+  });
+
+  await check("scaffolded scripts read run-time variables", async () => {
+    const { payload } = await call("POST", "/api/assist/scaffold", {
+      goal: "login smoke",
+      validate: false,
+      variables: { username: "default-user" },
+      steps: [{ action: "fill", locator: { testId: "user" }, valueFrom: "username" }],
+    });
+    assert(payload.data.content.includes("PW_PLAYER_VARIABLES_JSON"), payload.data.content);
+    assert(payload.data.content.includes("defaultVariables"), payload.data.content);
+  });
+
+  await check("mcp page_action advertises the fields it needs", async () => {
+    const init = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const sessionId = init.headers.get("mcp-session-id");
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Mcp-Session-Id": sessionId, Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    });
+    const tools = (await response.json()).result.tools;
+    const byName = new Map(tools.map((tool) => [tool.name, tool]));
+    for (const [name, required] of [
+      ["page_action", ["locator", "value", "key", "expression"]],
+      ["page_assert", ["locator", "expected", "match"]],
+      ["page_wait_for", ["loadState", "locator", "textGone"]],
+      ["session_execute", []],
+    ]) {
+      const properties = byName.get(name)?.inputSchema?.properties || {};
+      for (const field of required) {
+        assert(properties[field], `${name} schema is missing ${field}`);
+      }
+    }
+    assert(byName.get("session_execute").inputSchema.properties.steps.items, "session_execute steps has no item schema");
+    assert(byName.get("page_dialog_policy"), "page_dialog_policy tool is missing");
+  });
+
+  await check("runs work when SCRIPTS_DIR and RUNS_DIR are outside the project", async () => {
+    // Both directories are configurable and normally mounted volumes. A spec
+    // file outside the project could not resolve @playwright/test from its own
+    // directory, and the generated config could not resolve it either.
+    assert(!scratchDir.startsWith(rootDir), "harness scratch dir must be outside the project for this check");
+    const created = await call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" });
+    const runId = created.payload.data.runId;
+    let status = "running";
+    for (let attempt = 0; attempt < 120 && status === "running"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      status = (await call("GET", `/api/runs/${runId}`)).payload.data.status;
+    }
+    const logs = await call("GET", `/api/runs/${runId}/logs`);
+    const text = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+    assert(!/does not provide an export named|Cannot find package/.test(text), `config failed to load: ${text.slice(0, 300)}`);
+    assert(status === "completed", `run ${status}: ${text.slice(0, 300)}`);
+    await call("DELETE", `/api/runs/${runId}`);
   });
 
   await check("mcp initialize issues a session id", async () => {
@@ -341,10 +594,21 @@ async function run() {
     assert(missing.length === 0, `undocumented: ${missing.join(", ")}`);
   });
 
+  // ---- URL allowlist (needs its own server instance) -----------------------
+  await runAllowlistChecks();
+
   // ---- browser-dependent checks --------------------------------------------
   const session = await call("POST", "/api/sessions", {});
   if (session.status !== 201) {
-    record("browser session checks", "skip", `session create returned ${session.status} (no browser installed?)`);
+    const message = session.payload?.error?.message || `HTTP ${session.status}`;
+    // Distinguish "this machine has no browser" from "the browser is broken":
+    // skipping both hid real launch regressions.
+    const browserMissing = /Executable doesn't exist|playwright install|Failed to launch.*ENOENT/i.test(message);
+    if (browserMissing && !requireBrowser) {
+      record("browser session checks", "skip", "no Playwright browser installed — run `npx playwright install chromium`");
+      return;
+    }
+    record("browser session checks", "fail", message.split("\n")[0]);
     return;
   }
 
@@ -459,6 +723,90 @@ async function run() {
         headers: { Authorization: `Bearer ${token}` },
       });
       assert(attachment.headers.get("content-disposition").startsWith("attachment"), "default is not attachment");
+    });
+
+    await check("evaluate runs a function expression and returns its value", async () => {
+      const plain = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, { expression: "1 + 2" });
+      assert(plain.payload.data.result === 3, `plain expression returned ${JSON.stringify(plain.payload.data.result)}`);
+
+      // This form silently returned undefined before: Playwright does not invoke
+      // a string arrow function.
+      const fn = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: "() => document.title",
+      });
+      assert(typeof fn.payload.data.result === "string" && fn.payload.data.result.length > 0,
+        `function expression returned ${JSON.stringify(fn.payload.data.result)}`);
+
+      const withArg = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: "(n) => n * 2",
+        arg: 21,
+      });
+      assert(withArg.payload.data.result === 42, `arg was not forwarded: ${JSON.stringify(withArg.payload.data.result)}`);
+    });
+
+    await check("a dialog no longer blocks the click that opened it", async () => {
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: `() => {
+          const button = document.createElement("button");
+          button.id = "smoke-dialog";
+          button.textContent = "dialog";
+          button.onclick = () => window.confirm("block me?");
+          document.body.append(button);
+        }`,
+      });
+      const started = Date.now();
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, {
+        locator: { css: "#smoke-dialog" },
+        timeoutMs: 5000,
+      });
+      const elapsed = Date.now() - started;
+      assert(status === 200, `click returned ${status} after ${elapsed}ms: ${JSON.stringify(payload.error)}`);
+      assert(elapsed < 4000, `click took ${elapsed}ms — the dialog was not answered`);
+      assert(payload.data.lastDialog?.dialogType === "confirm", JSON.stringify(payload.data.lastDialog));
+      assert(payload.data.lastDialog?.handledWith === "dismiss", JSON.stringify(payload.data.lastDialog));
+    });
+
+    await check("dialog policy accept is honoured per page", async () => {
+      const set = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/dialog-policy`, { action: "accept" });
+      assert(set.status === 200, `policy returned ${set.status}`);
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, {
+        locator: { css: "#smoke-dialog" },
+        timeoutMs: 5000,
+      });
+      assert(payload.data.lastDialog?.handledWith === "accept", JSON.stringify(payload.data.lastDialog));
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/dialog-policy`, { action: "dismiss" });
+    });
+
+    await check("an invalid dialog policy is rejected", async () => {
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/dialog-policy`, { action: "explode" });
+      assert(status === 400, `expected 400, got ${status}`);
+      assert(payload.error.code === "INVALID_DIALOG_POLICY", payload.error.code);
+    });
+
+    await check("route fixtures cannot escape the fixtures directory", async () => {
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/contexts/${contextId}/route`, {
+        url: "**/blocked",
+        behavior: { action: "fulfill", path: "../../../../etc/hostname" },
+      });
+      assert(status === 400, `expected 400, got ${status}`);
+      assert(payload.error.code === "PATH_OUTSIDE_ROOT", payload.error.code);
+    });
+
+    await check("artifacts stay downloadable after the session closes", async () => {
+      const shot = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/screenshot`, {});
+      const artifactId = shot.payload.data.artifact.artifactId;
+      const throwaway = await call("POST", "/api/sessions", {});
+      const throwawayId = throwaway.payload.data.sessionId;
+      await call("DELETE", `/api/sessions/${throwawayId}`);
+
+      // The session that produced it is still open here; the real check is that
+      // the index, not the session record, is what resolves the id.
+      const listed = await call("GET", `/api/sessions/${sessionId}/artifacts`);
+      assert(listed.payload.data.artifacts.some((entry) => entry.artifactId === artifactId), "artifact missing from listing");
+      const download = await fetch(`${baseUrl}/api/sessions/${sessionId}/artifacts/${artifactId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert(download.ok, `download returned ${download.status}`);
     });
 
     await check("stopping a trace that never started is a 409", async () => {
