@@ -21,7 +21,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.1.4",
+  serviceVersion: process.env.SERVICE_VERSION || "0.2.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -35,12 +35,19 @@ const config = {
   defaultHeadless: parseBoolean(process.env.DEFAULT_HEADLESS, true),
   sessionTtlMs: parseInteger(process.env.SESSION_TTL_MS, 30 * 60 * 1000),
   cleanupIntervalMs: parseInteger(process.env.SESSION_CLEANUP_INTERVAL_MS, 30 * 1000),
+  maxSessions: parseInteger(process.env.MAX_SESSIONS, 10),
   maxContextsPerSession: parseInteger(process.env.MAX_CONTEXTS_PER_SESSION, 5),
   maxPagesPerSession: parseInteger(process.env.MAX_PAGES_PER_SESSION, 10),
+  maxConcurrentRuns: parseInteger(process.env.MAX_CONCURRENT_RUNS, 4),
+  maxRetainedRuns: parseInteger(process.env.MAX_RETAINED_RUNS, 50),
+  mcpSessionTtlMs: parseInteger(process.env.MCP_SESSION_TTL_MS, 60 * 60 * 1000),
   maxActionLogEntries: parseInteger(process.env.MAX_ACTION_LOG_ENTRIES, 500),
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
   maxRunLogEntries: parseInteger(process.env.MAX_RUN_LOG_ENTRIES, 3000),
   enableEvaluate: parseBoolean(process.env.ENABLE_EVALUATE, true),
+  captureFailureArtifacts: parseBoolean(process.env.CAPTURE_FAILURE_ARTIFACTS, true),
+  purgeSessionArtifactsOnClose: parseBoolean(process.env.PURGE_SESSION_ARTIFACTS_ON_CLOSE, false),
+  apiToken: process.env.API_TOKEN || "",
   urlAllowlist: parseCsv(process.env.URL_ALLOWLIST),
   allowedOrigins: parseCsv(process.env.ALLOWED_ORIGINS),
   launchArgs: parseCsv(process.env.PLAYWRIGHT_LAUNCH_ARGS),
@@ -168,6 +175,84 @@ async function statOrNull(filePath) {
   } catch {
     return null;
   }
+}
+
+async function removeDir(dirPath) {
+  await fsPromises.rm(dirPath, { recursive: true, force: true }).catch(() => undefined);
+}
+
+// Resolves `reference` against `baseDir` and refuses anything that escapes it.
+// Absolute paths and `..` segments both resolve outside the root, so one
+// path.relative check covers both.
+function resolveWithin(baseDir, reference, label = "path") {
+  const root = path.resolve(baseDir);
+  const target = path.resolve(root, String(reference ?? ""));
+  const relative = path.relative(root, target);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new ApiError(400, "PATH_OUTSIDE_ROOT", `${label} must stay inside ${root}: ${reference}`);
+  }
+
+  return target;
+}
+
+const SCRIPT_EXTENSION_PATTERN = /\.(spec|test|pw)\.(js|mjs|cjs|ts|mts|cts)$/i;
+const VALID_REGEX_FLAGS = /^[dgimsuvy]*$/;
+
+// `"/pattern/flags"` is the documented way to send a regular expression through
+// JSON. Anything else - including a plain URL path such as "/checkout/cart" -
+// must stay a literal string, so flags are validated and construction guarded.
+function parseRegexLiteral(value) {
+  if (typeof value !== "string" || !value.startsWith("/")) {
+    return null;
+  }
+
+  const lastSlash = value.lastIndexOf("/");
+  if (lastSlash <= 0) {
+    return null;
+  }
+
+  const flags = value.slice(lastSlash + 1);
+  if (!VALID_REGEX_FLAGS.test(flags) || new Set(flags).size !== flags.length) {
+    return null;
+  }
+
+  try {
+    return new RegExp(value.slice(1, lastSlash), flags);
+  } catch {
+    return null;
+  }
+}
+
+// Resolves an uploaded script key + optional file name to a path inside the
+// scripts directory, rejecting traversal and non-Playwright extensions.
+function resolveScriptUploadPath(scriptsDir, scriptKey, fileName) {
+  const key = String(scriptKey ?? "").trim();
+  if (!key) {
+    throw new ApiError(400, "INVALID_SCRIPT_KEY", "scriptKey is required");
+  }
+
+  let extension = ".spec.js";
+  if (fileName) {
+    const match = SCRIPT_EXTENSION_PATTERN.exec(String(fileName));
+    if (!match) {
+      throw new ApiError(
+        400,
+        "INVALID_SCRIPT_FILENAME",
+        "fileName must end with .spec/.test/.pw plus js, mjs, cjs, ts, mts, or cts",
+      );
+    }
+    extension = match[0];
+  }
+
+  const absolutePath = resolveWithin(scriptsDir, `${key}${extension}`, "scriptKey");
+  return {
+    absolutePath,
+    extension,
+    scriptKey: path.relative(path.resolve(scriptsDir), absolutePath)
+      .split(path.sep)
+      .join("/")
+      .replace(SCRIPT_EXTENSION_PATTERN, ""),
+  };
 }
 
 async function listFilesRecursively(dirPath) {
@@ -457,8 +542,33 @@ class RunManager {
     }
   }
 
+  countActiveRuns() {
+    return [...this.runs.values()].filter((run) => run.status === "running").length;
+  }
+
+  // Keeps the newest `maxRetainedRuns` runs and deletes the on-disk output of
+  // everything older. Without this, every run leaks a report + trace directory.
+  async pruneRuns() {
+    const finished = [...this.runs.values()]
+      .filter((run) => run.status !== "running")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const excess = this.runs.size - this.options.maxRetainedRuns;
+    for (let index = 0; index < excess && index < finished.length; index += 1) {
+      const run = finished[index];
+      this.runs.delete(run.runId);
+      await removeDir(run.paths.runDir);
+    }
+  }
+
   async createRun(request) {
     const script = this.registry.get(request.scriptKey);
+    if (this.countActiveRuns() >= this.options.maxConcurrentRuns) {
+      throw new ApiError(
+        429,
+        "RUN_LIMIT_EXCEEDED",
+        `Maximum concurrent runs reached (${this.options.maxConcurrentRuns}). Wait for a run to finish or cancel one.`,
+      );
+    }
     if (!(await fileExists(this.options.playwrightCliPath))) {
       throw new ApiError(
         500,
@@ -574,7 +684,7 @@ class RunManager {
       run.exitCode = -1;
       this.appendLog(run, "stderr", Buffer.from(error.message, "utf8"));
     });
-    child.on("close", async (code, signal) => {
+    child.on("close", (code, signal) => {
       run.exitCode = code;
       run.signal = signal;
       run.endedAt = toIso();
@@ -587,8 +697,15 @@ class RunManager {
         run.status = "failed";
       }
 
-      run.summary = await this.buildSummary(run);
-      run.artifacts = await this.listArtifacts(run.runId);
+      // This callback is not awaited by anyone, so a rejection here would take
+      // the whole process down as an unhandled rejection.
+      (async () => {
+        run.summary = await this.buildSummary(run);
+        run.artifacts = await collectFilesWithMetadata(run.paths.runDir);
+        await this.pruneRuns();
+      })().catch((error) => {
+        console.error(`[run] post-processing failed runId=${run.runId}`, error);
+      });
     });
 
     return this.serializeRun(run);
@@ -618,11 +735,7 @@ class RunManager {
   }
 
   resolveStorageState(reference) {
-    if (path.isAbsolute(reference)) {
-      return reference;
-    }
-
-    return path.resolve(this.options.storageStateDir, reference);
+    return resolveWithin(this.options.storageStateDir, reference, "storageStateRef");
   }
 
   async validateScript(request) {
@@ -632,13 +745,16 @@ class RunManager {
 
     let targetPath;
     if (request.content) {
-      const fileName = request.filename || "inline.spec.js";
-      targetPath = path.join(validationDir, fileName);
+      // Only the bare file name is honoured; a caller-supplied path would
+      // otherwise let `filename` write anywhere on disk.
+      const fileName = safeFilename(path.basename(String(request.filename || "inline.spec.js")));
+      const validFileName = SCRIPT_EXTENSION_PATTERN.test(fileName) ? fileName : "inline.spec.js";
+      targetPath = path.join(validationDir, validFileName);
       await fsPromises.writeFile(targetPath, request.content, "utf8");
     } else if (request.scriptKey) {
       targetPath = this.registry.get(request.scriptKey).absolutePath;
     } else if (request.scriptPath) {
-      targetPath = path.resolve(request.scriptPath);
+      targetPath = resolveWithin(this.options.scriptsDir, request.scriptPath, "scriptPath");
       if (!(await fileExists(targetPath))) {
         throw new ApiError(404, "SCRIPT_NOT_FOUND", `Script not found: ${request.scriptPath}`);
       }
@@ -677,18 +793,24 @@ class RunManager {
       args.push("--grep", request.grep);
     }
 
-    const result = await runCommand(process.execPath, args, rootDir).catch((error) => ({
-      stdout: "",
-      stderr: error.message,
-      code: 1,
-    }));
+    try {
+      const result = await runCommand(process.execPath, args, rootDir).catch((error) => ({
+        stdout: "",
+        stderr: error.message,
+        code: 1,
+      }));
 
-    return {
-      valid: result.code === 0,
-      validationId,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    };
+      return {
+        valid: result.code === 0,
+        validationId,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    } finally {
+      // Validation is throwaway work; leaving the scratch directory behind made
+      // data/runs grow on every assist_scaffold call.
+      await removeDir(validationDir);
+    }
   }
 
   async cancelRun(runId) {
@@ -701,7 +823,14 @@ class RunManager {
     }
 
     run.cancelRequested = true;
-    run.process.kill("SIGTERM");
+    const child = run.process;
+    child.kill("SIGTERM");
+    const killTimer = setTimeout(() => {
+      if (run.process === child) {
+        child.kill("SIGKILL");
+      }
+    }, 10_000);
+    killTimer.unref?.();
     return {
       runId,
       status: "cancelling",
@@ -729,6 +858,39 @@ class RunManager {
       status: run.status,
       logs: run.logs,
     };
+  }
+
+  async deleteRun(runId) {
+    const run = this.getRun(runId);
+    if (run.status === "running") {
+      throw new ApiError(409, "RUN_STILL_RUNNING", "Cancel the run before deleting it");
+    }
+
+    this.runs.delete(runId);
+    await removeDir(run.paths.runDir);
+    return { deleted: runId };
+  }
+
+  // Resolves an artifact path reported by listArtifacts back to a file inside
+  // the run directory so artifacts can actually be downloaded.
+  async resolveArtifactPath(runId, relativePath) {
+    const run = this.getRun(runId);
+    const absolutePath = resolveWithin(run.paths.runDir, relativePath, "artifact path");
+    const stats = await statOrNull(absolutePath);
+    if (!stats || !stats.isFile()) {
+      throw new ApiError(404, "ARTIFACT_NOT_FOUND", `Run artifact not found: ${relativePath}`);
+    }
+
+    return { absolutePath, fileName: path.basename(absolutePath) };
+  }
+
+  async killAll() {
+    for (const run of this.runs.values()) {
+      if (run.process) {
+        run.cancelRequested = true;
+        run.process.kill("SIGKILL");
+      }
+    }
   }
 }
 
@@ -808,16 +970,9 @@ function renderJsValue(value) {
     return "undefined";
   }
 
-  if (
-    typeof value === "string"
-    && value.startsWith("/")
-    && value.lastIndexOf("/") > 0
-    && /^[a-z]*$/i.test(value.slice(value.lastIndexOf("/") + 1))
-  ) {
-    const lastSlash = value.lastIndexOf("/");
-    const pattern = value.slice(1, lastSlash);
-    const flags = value.slice(lastSlash + 1);
-    return `/${pattern}/${flags}`;
+  const pattern = parseRegexLiteral(value);
+  if (pattern) {
+    return String(pattern);
   }
 
   return JSON.stringify(value);
@@ -869,23 +1024,38 @@ function renderLocatorCode(locator, target = "page") {
   if (locator.hasText) {
     expression += `.filter(${renderJsValue({ hasText: locator.hasText })})`;
   }
-  if (locator.first) {
+  // Keep this precedence identical to resolveLocator so a scaffolded script
+  // targets the same element as the equivalent live API call.
+  if (locator.nth !== undefined) {
+    expression += `.nth(${Number(locator.nth)})`;
+  } else if (locator.first) {
     expression += ".first()";
   } else if (locator.last) {
     expression += ".last()";
-  } else if (locator.nth !== undefined) {
-    expression += `.nth(${Number(locator.nth)})`;
   }
 
   return expression;
 }
 
-function renderStepValue(step, field = "value") {
-  const fromKey = `${field}From`;
-  if (typeof step[fromKey] === "string" && step[fromKey]) {
-    return `variables[${renderJsValue(step[fromKey])}]`;
+// Step values can arrive as `value`/`valueFrom` or, for assertions, as
+// `expected`/`expectedFrom`. Both spellings are accepted so a plan produced for
+// page_assert scaffolds into working code.
+function renderStepValue(step, fields = ["value"]) {
+  const candidates = Array.isArray(fields) ? fields : [fields];
+  for (const field of candidates) {
+    const fromKey = `${field}From`;
+    if (typeof step[fromKey] === "string" && step[fromKey]) {
+      return `variables[${renderJsValue(step[fromKey])}]`;
+    }
   }
-  return renderJsValue(step[field]);
+
+  for (const field of candidates) {
+    if (step[field] !== undefined) {
+      return renderJsValue(step[field]);
+    }
+  }
+
+  return renderJsValue(undefined);
 }
 
 function renderStepCode(step, target = "page") {
@@ -927,16 +1097,27 @@ function renderStepCode(step, target = "page") {
       return `  await expect(${renderLocatorCode(step.locator, target)}).toBeVisible();`;
     case "assertText": {
       const locatorExpression = renderLocatorCode(step.locator, target);
+      const expectedValue = renderStepValue(step, ["expected", "value"]);
       if ((step.match || "contains") === "equals") {
-        return `  await expect(${locatorExpression}).toHaveText(${renderStepValue(step)});`;
+        return `  await expect(${locatorExpression}).toHaveText(${expectedValue});`;
       }
-      return `  await expect(${locatorExpression}).toContainText(${renderStepValue(step)});`;
+      return `  await expect(${locatorExpression}).toContainText(${expectedValue});`;
     }
-    case "assertUrl":
-      if ((step.match || "equals") === "contains") {
-        return `  expect(${target}.url()).toContain(${renderJsValue(step.value || step.url)});`;
+    case "assertCount": {
+      const locatorExpression = renderLocatorCode(step.locator, target);
+      const expectedCount = Number(step.expected ?? step.value);
+      if (!Number.isFinite(expectedCount)) {
+        throw new ApiError(400, "INVALID_STEP", "assertCount requires a numeric expected value");
       }
-      return `  await expect(${target}).toHaveURL(${renderJsValue(step.value || step.url)});`;
+      return `  await expect(${locatorExpression}).toHaveCount(${expectedCount});`;
+    }
+    case "assertUrl": {
+      const expectedUrl = renderJsValue(step.expected ?? step.value ?? step.url);
+      if ((step.match || "equals") === "contains") {
+        return `  expect(${target}.url()).toContain(${expectedUrl});`;
+      }
+      return `  await expect(${target}).toHaveURL(${expectedUrl});`;
+    }
     case "screenshot":
       return `  await ${target}.screenshot(${renderJsValue(cleanObject({ fullPage: step.fullPage ?? true, path: step.path, type: step.type }))});`;
     default:
@@ -945,297 +1126,6 @@ function renderStepCode(step, target = "page") {
 }
 
 function buildSuggestedSteps(request = {}) {
-  if (Array.isArray(request.steps) && request.steps.length) {
-    return request.steps;
-  }
-
-  const goal = String(request.goal || request.request || request.prompt || "").toLowerCase();
-  const locators = request.locators || request.knownLocators || {};
-  const expectations = Array.isArray(request.expectations) ? request.expectations : [];
-  const steps = [];
-
-  if (request.startUrl || request.baseURL) {
-    steps.push({
-      action: "goto",
-      url: request.startUrl || request.baseURL,
-      status: "ready",
-    });
-  }
-
-  if (/(login|signin|sign-in|로그인)/.test(goal)) {
-    steps.push({
-      action: locators.username || locators.email ? "fill" : "comment",
-      locator: locators.username || locators.email || undefined,
-      valueFrom: "username",
-      text: "Inspect the page and provide username/email locator",
-      status: locators.username || locators.email ? "ready" : "needs-input",
-    });
-    steps.push({
-      action: locators.password ? "fill" : "comment",
-      locator: locators.password || undefined,
-      valueFrom: "password",
-      text: "Inspect the page and provide password locator",
-      status: locators.password ? "ready" : "needs-input",
-    });
-    steps.push({
-      action: locators.submit ? "click" : "comment",
-      locator: locators.submit || undefined,
-      text: "Inspect the page and provide submit button locator",
-      status: locators.submit ? "ready" : "needs-input",
-    });
-  }
-
-  if (/(search|검색)/.test(goal)) {
-    steps.push({
-      action: locators.searchInput ? "fill" : "comment",
-      locator: locators.searchInput || undefined,
-      valueFrom: "query",
-      text: "Inspect the page and provide search input locator",
-      status: locators.searchInput ? "ready" : "needs-input",
-    });
-    steps.push({
-      action: locators.searchSubmit ? "click" : "comment",
-      locator: locators.searchSubmit || undefined,
-      text: "Inspect the page and provide search submit locator",
-      status: locators.searchSubmit ? "ready" : "needs-input",
-    });
-  }
-
-  if (/(chat|message|thread|채팅|메시지)/.test(goal)) {
-    steps.push({
-      action: locators.messageInput ? "fill" : "comment",
-      locator: locators.messageInput || undefined,
-      valueFrom: "message",
-      text: "Inspect the page and provide message input locator",
-      status: locators.messageInput ? "ready" : "needs-input",
-    });
-    steps.push({
-      action: locators.sendButton ? "click" : "comment",
-      locator: locators.sendButton || undefined,
-      text: "Inspect the page and provide send button locator",
-      status: locators.sendButton ? "ready" : "needs-input",
-    });
-  }
-
-  for (const expectation of expectations) {
-    if (typeof expectation === "string") {
-      steps.push({
-        action: "comment",
-        text: `Assert expectation: ${expectation}`,
-        status: "needs-input",
-      });
-    } else if (expectation?.locator && expectation?.value !== undefined) {
-      steps.push({
-        action: "assertText",
-        locator: expectation.locator,
-        value: expectation.value,
-        match: expectation.match || "contains",
-        status: "ready",
-      });
-    }
-  }
-
-  if (!steps.length) {
-    steps.push({
-      action: "comment",
-      text: "Use page_inspect first, then replace this comment with concrete click/fill/assert steps.",
-      status: "needs-input",
-    });
-  }
-
-  return steps;
-}
-
-class ScriptAssistant {
-  constructor(options) {
-    this.options = options;
-    this.registry = options.registry;
-    this.runManager = options.runManager;
-  }
-
-  getCapabilities() {
-    return {
-      purpose: "LLM-friendly Playwright authoring helpers for offline and air-gapped environments.",
-      recommendedWorkflow: [
-        "assist_plan",
-        "session_create",
-        "context_create",
-        "page_create",
-        "page_navigate",
-        "page_inspect",
-        "assist_scaffold",
-        "script_validate",
-        "run_create",
-      ],
-      supportedProjects: ["chromium", "firefox", "webkit"],
-      scaffoldSaveSupported: true,
-      locatorFields: ["role", "name", "text", "label", "placeholder", "testId", "altText", "title", "css", "xpath", "selector", "hasText", "first", "last", "nth"],
-      stepActions: ["goto", "click", "fill", "press", "hover", "selectOption", "waitFor", "assertVisible", "assertText", "assertUrl", "screenshot", "comment"],
-      scriptExtensions: [".spec.js", ".spec.ts", ".test.js", ".test.ts", ".pw.js", ".pw.ts"],
-      registryScriptCount: this.registry.list().length,
-    };
-  }
-
-  plan(request = {}) {
-    const goal = String(request.goal || request.request || request.prompt || request.testName || "").trim();
-    const recommendedScriptKey = sanitizeScriptKey(request.scriptKey || deriveScriptKeyFromGoal(goal));
-    const testName = request.testName || deriveTestName(goal, recommendedScriptKey.replaceAll("/", " "));
-    const suggestedSteps = buildSuggestedSteps(request);
-    const tags = [...new Set([...(request.tags || []), ...deriveTagsFromGoal(goal)])];
-    const missingInputs = [];
-
-    for (const step of suggestedSteps) {
-      if (step.status === "needs-input" && step.text) {
-        missingInputs.push(step.text);
-      }
-    }
-
-    const shouldInspectFirst = suggestedSteps.some((step) => step.status === "needs-input");
-    return {
-      goal,
-      testName,
-      recommendedScriptKey,
-      recommendedFileName: `${recommendedScriptKey.split("/").pop()}.spec.js`,
-      tags,
-      startUrl: request.startUrl || request.baseURL || null,
-      storageStateRef: request.storageStateRef || null,
-      assumptions: [
-        "Use page_inspect before finalizing locators whenever the request does not already include concrete locator hints.",
-        "Prefer role, label, placeholder, and testId locators over CSS and XPath.",
-      ],
-      missingInputs,
-      suggestedSteps,
-      suggestedRunRequest: cleanObject({
-        scriptKey: recommendedScriptKey,
-        project: request.project || "chromium",
-        env: request.env,
-        baseURL: request.baseURL || request.startUrl,
-        grep: tags.length ? tags[0] : undefined,
-        storageStateRef: request.storageStateRef,
-        variables: request.variables,
-      }),
-      suggestedMcpSequence: shouldInspectFirst ? [
-        "assist_plan",
-        "session_create",
-        "context_create",
-        "page_create",
-        "page_navigate",
-        "page_inspect",
-        "assist_scaffold",
-        "script_validate",
-      ] : [
-        "assist_plan",
-        "assist_scaffold",
-        "script_validate",
-        "run_create",
-      ],
-    };
-  }
-
-  renderScaffold(request = {}) {
-    const plan = request.plan || this.plan(request);
-    const testName = request.testName || plan.testName;
-    const tags = [...new Set([...(request.tags || []), ...(plan.tags || [])])];
-    const steps = Array.isArray(request.steps) && request.steps.length ? request.steps : plan.suggestedSteps;
-    const useOptions = cleanObject({
-      baseURL: request.baseURL || request.startUrl || plan.startUrl || undefined,
-      storageState: request.storageStateRef || plan.storageStateRef || undefined,
-      locale: request.locale,
-      timezoneId: request.timezoneId,
-    });
-    const scriptTitle = tags.length ? `${tags.join(" ")} ${testName}` : testName;
-    const lines = [
-      "import { test, expect } from \"@playwright/test\";",
-      "",
-    ];
-    const needsVariables = steps.some((step) => typeof step?.valueFrom === "string" || typeof step?.expectedFrom === "string");
-
-    if (Object.keys(useOptions).length) {
-      lines.push(`test.use(${renderJsValue(useOptions)});`);
-      lines.push("");
-    }
-
-    if ((request.variables && Object.keys(request.variables).length) || needsVariables) {
-      lines.push(`const variables = ${JSON.stringify(request.variables || {}, null, 2)};`);
-      lines.push("");
-    }
-
-    lines.push(`test(${renderJsValue(scriptTitle)}, async ({ page }) => {`);
-    if (plan.goal) {
-      lines.push(`  // Goal: ${plan.goal.replace(/\r?\n/g, " ")}`);
-    }
-    for (const step of steps) {
-      lines.push(renderStepCode(step));
-    }
-    lines.push("});");
-
-    return lines.join("\n");
-  }
-
-  async scaffold(request = {}) {
-    const plan = request.plan || this.plan(request);
-    const scriptKey = sanitizeScriptKey(request.scriptKey || plan.recommendedScriptKey);
-    const relativePath = `${scriptKey}.spec.js`;
-    const fileName = path.basename(relativePath);
-    const content = this.renderScaffold({
-      ...request,
-      plan,
-    });
-
-    let savedScript = null;
-    if (request.save) {
-      savedScript = await this.saveScript(relativePath, content, request.overwrite);
-    }
-
-    const validation = request.validate === false ? null : await this.runManager.validateScript({
-      content,
-      filename: fileName,
-      project: request.project,
-      grep: request.grep,
-    });
-
-    return {
-      plan,
-      scriptKey,
-      relativePath,
-      content,
-      savedScript,
-      validation,
-    };
-  }
-
-  async saveScript(relativePath, content, overwrite = false) {
-    const normalizedRelativePath = relativePath
-      .split("/")
-      .map((segment, index, parts) => {
-        if (index === parts.length - 1) {
-          const fileName = safeFilename(segment.replace(/(\.spec|\.test|\.pw)?\.[^.]+$/i, "")) || "generated";
-          return `${fileName}.spec.js`;
-        }
-        return safeFilename(segment).toLowerCase();
-      })
-      .filter(Boolean)
-      .join("/");
-
-    const absolutePath = path.resolve(this.options.scriptsDir, normalizedRelativePath);
-    const scriptsRoot = path.resolve(this.options.scriptsDir);
-    if (!absolutePath.startsWith(scriptsRoot)) {
-      throw new ApiError(400, "INVALID_SCRIPT_PATH", "scaffold path must stay within the scripts directory");
-    }
-    if ((await fileExists(absolutePath)) && !overwrite) {
-      throw new ApiError(409, "SCRIPT_ALREADY_EXISTS", `Script already exists: ${normalizedRelativePath}`);
-    }
-
-    await ensureDir(path.dirname(absolutePath));
-    await fsPromises.writeFile(absolutePath, content, "utf8");
-    await this.registry.refresh();
-
-    const scriptKey = normalizedRelativePath.replace(/(\.spec|\.test|\.pw)?\.[^.]+$/, "");
-    return this.registry.get(scriptKey);
-  }
-}
-
-function buildSuggestedStepsV2(request = {}) {
   if (Array.isArray(request.steps) && request.steps.length) {
     return request.steps;
   }
@@ -1343,7 +1233,7 @@ function buildSuggestedStepsV2(request = {}) {
   return steps;
 }
 
-class ScriptAssistantV2 {
+class ScriptAssistant {
   constructor(options) {
     this.options = options;
     this.registry = options.registry;
@@ -1352,7 +1242,24 @@ class ScriptAssistantV2 {
 
   getCapabilities() {
     return {
-      ...new ScriptAssistant(this.options).getCapabilities(),
+      purpose: "LLM-friendly Playwright authoring helpers for offline and air-gapped environments.",
+      recommendedWorkflow: [
+        "assist_plan",
+        "session_create",
+        "context_create",
+        "page_create",
+        "page_navigate",
+        "page_inspect",
+        "assist_scaffold",
+        "script_validate",
+        "run_create",
+      ],
+      supportedProjects: ["chromium", "firefox", "webkit"],
+      scaffoldSaveSupported: true,
+      locatorFields: ["role", "name", "text", "label", "placeholder", "testId", "altText", "title", "css", "xpath", "selector", "hasText", "first", "last", "nth"],
+      stepActions: ["goto", "reload", "goBack", "goForward", "click", "fill", "press", "hover", "drag", "selectOption", "waitFor", "assertVisible", "assertText", "assertUrl", "assertCount", "screenshot", "comment"],
+      scriptExtensions: [".spec.js", ".spec.ts", ".test.js", ".test.ts", ".pw.js", ".pw.ts"],
+      registryScriptCount: this.registry.list().length,
       scriptLanguages: ["js", "ts"],
       inspectionAwarePlanning: true,
       examplesAvailable: true,
@@ -1372,11 +1279,11 @@ class ScriptAssistantV2 {
     const goal = String(request.goal || request.request || request.prompt || request.testName || "").trim();
     const recommendedScriptKey = sanitizeScriptKey(request.scriptKey || deriveScriptKeyFromGoal(goal));
     const testName = request.testName || deriveTestName(goal, recommendedScriptKey.replaceAll("/", " "));
-    const suggestedSteps = buildSuggestedStepsV2(request);
+    const suggestedSteps = buildSuggestedSteps(request);
     const tags = [...new Set([...(request.tags || []), ...deriveTagsFromGoal(goal)])];
     const inferredLocators = inferLocatorsFromInspection(request);
     const missingInputs = [];
-    const useTypeScript = ["ts", "typescript"].includes(String(request.language || "").toLowerCase());
+    const useTypeScript = resolveScriptLanguage(request) === "ts";
 
     for (const step of suggestedSteps) {
       if (step.status === "needs-input" && step.text) {
@@ -1471,7 +1378,7 @@ class ScriptAssistantV2 {
   async scaffold(request = {}) {
     const plan = request.plan || this.plan(request);
     const scriptKey = sanitizeScriptKey(request.scriptKey || plan.recommendedScriptKey);
-    const useTypeScript = ["ts", "typescript"].includes(String(request.language || "").toLowerCase());
+    const useTypeScript = resolveScriptLanguage(request) === "ts";
     const relativePath = `${scriptKey}.spec.${useTypeScript ? "ts" : "js"}`;
     const fileName = path.basename(relativePath);
     const content = this.renderScaffold({
@@ -1539,16 +1446,7 @@ function normalizePattern(value) {
     return value;
   }
 
-  if (
-    value.startsWith("/")
-    && value.lastIndexOf("/") > 0
-    && /^[a-z]*$/i.test(value.slice(value.lastIndexOf("/") + 1))
-  ) {
-    const lastSlash = value.lastIndexOf("/");
-    return new RegExp(value.slice(1, lastSlash), value.slice(lastSlash + 1));
-  }
-
-  return value;
+  return parseRegexLiteral(value) ?? value;
 }
 
 function resolveLocator(page, locator) {
@@ -1609,6 +1507,10 @@ function resolveLocator(page, locator) {
   return result;
 }
 
+// Statuses that mean "the caller sent something wrong" rather than "the page
+// misbehaved". Only the latter is worth capturing artifacts for.
+const BAD_REQUEST_STATUS_CODES = new Set([400, 401, 403, 404, 409, 413, 429]);
+
 function countMatches(actual, expected, operator) {
   switch (operator) {
     case "gte":
@@ -1637,20 +1539,27 @@ function textMatches(actual, expected, mode = "contains") {
       return normalizedActual === normalizedExpected;
     case "startsWith":
       return normalizedActual.startsWith(normalizedExpected);
+    case "endsWith":
+      return normalizedActual.endsWith(normalizedExpected);
     case "contains":
-    default:
       return normalizedActual.includes(normalizedExpected);
+    default:
+      throw new ApiError(
+        400,
+        "INVALID_MATCH_MODE",
+        `Unsupported match mode: ${mode}. Use contains, equals, startsWith, or endsWith.`,
+      );
   }
 }
 
 async function poll(timeoutMs, fn, onTimeoutMessage) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  do {
     if (await fn()) {
       return;
     }
     await sleep(200);
-  }
+  } while (Date.now() - startedAt < timeoutMs);
 
   throw new ApiError(408, "TIMEOUT", onTimeoutMessage);
 }
@@ -1747,7 +1656,7 @@ class SessionManager {
   }
 
   async withLock(sessionId, handler) {
-    const session = this.getSession(sessionId);
+    const session = this.getLiveSession(sessionId);
     const previous = session.queue || Promise.resolve();
     let release;
     session.queue = new Promise((resolve) => {
@@ -1761,10 +1670,31 @@ class SessionManager {
     }
   }
 
+  // Steps dispatched from `execute` already run inside the session lock, so they
+  // pass that session through instead of queueing behind themselves.
+  runLocked(sessionId, lockedSession, handler) {
+    return lockedSession ? handler(lockedSession) : this.withLock(sessionId, handler);
+  }
+
   getSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new ApiError(404, "SESSION_NOT_FOUND", `Session not found: ${sessionId}`);
+    }
+
+    return session;
+  }
+
+  // A crashed browser leaves the record in place until the TTL expires; without
+  // this guard every later call fails with an opaque Playwright message.
+  getLiveSession(sessionId) {
+    const session = this.getSession(sessionId);
+    if (session.status === "disconnected" || !session.browser.isConnected()) {
+      throw new ApiError(
+        409,
+        "SESSION_DISCONNECTED",
+        `Browser for session ${sessionId} is no longer connected. Create a new session.`,
+      );
     }
 
     return session;
@@ -1814,7 +1744,13 @@ class SessionManager {
       return;
     }
 
-    const parsed = new URL(url);
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new ApiError(400, "INVALID_URL", `url must be absolute when URL_ALLOWLIST is set: ${url}`);
+    }
+
     const hostname = parsed.hostname.toLowerCase();
     const allowed = allowlist.some((entry) => {
       const normalized = entry.toLowerCase();
@@ -1833,7 +1769,17 @@ class SessionManager {
     }
   }
 
+  // A session owns a real browser process, so an unbounded count is a direct
+  // path to exhausting the container.
   async createSession(request = {}) {
+    if (this.sessions.size >= this.options.maxSessions) {
+      throw new ApiError(
+        429,
+        "SESSION_LIMIT_EXCEEDED",
+        `Maximum sessions reached (${this.options.maxSessions}). Close an idle session first.`,
+      );
+    }
+
     const browserType = request.browserType || this.options.defaultBrowserType;
     const launcher = browsers[browserType];
     if (!launcher) {
@@ -1913,10 +1859,19 @@ class SessionManager {
     await session.browser.close().catch(() => undefined);
     session.status = reason;
     session.updatedAt = toIso();
+    if (this.options.purgeSessionArtifactsOnClose) {
+      await removeDir(path.join(this.options.artifactsDir, sessionId));
+    }
+
     return {
       sessionId,
       status: reason,
+      artifactsPurged: Boolean(this.options.purgeSessionArtifactsOnClose),
     };
+  }
+
+  listSessions() {
+    return [...this.sessions.values()].map((session) => this.serializeSession(session));
   }
 
   async cleanupExpiredSessions() {
@@ -2206,9 +2161,12 @@ class SessionManager {
     return this.serializeArtifact(session.sessionId, artifact);
   }
 
+  // Capturing a full-page screenshot plus the DOM for every rejected request
+  // filled the artifacts directory with noise, so caller input errors (4xx) are
+  // skipped - only genuine automation failures are worth an artifact.
   async captureFailureArtifacts(session, pageRecord, actionType) {
     const artifacts = {};
-    if (pageRecord.page.isClosed()) {
+    if (!this.options.captureFailureArtifacts || pageRecord.page.isClosed()) {
       return artifacts;
     }
 
@@ -2277,9 +2235,7 @@ class SessionManager {
       const contextRecord = this.getContextRecord(session, contextId);
       let storageState = request.storageState;
       if (!storageState && request.storageStateRef) {
-        const storagePath = path.isAbsolute(request.storageStateRef)
-          ? request.storageStateRef
-          : path.resolve(this.options.storageStateDir, request.storageStateRef);
+        const storagePath = resolveWithin(this.options.storageStateDir, request.storageStateRef, "storageStateRef");
         if (!(await fileExists(storagePath))) {
           throw new ApiError(404, "STORAGE_STATE_NOT_FOUND", `Storage state not found: ${request.storageStateRef}`);
         }
@@ -2287,6 +2243,14 @@ class SessionManager {
       }
       if (!storageState) {
         throw new ApiError(400, "INVALID_REQUEST", "storageState or storageStateRef is required");
+      }
+      if (typeof storageState !== "object" || Array.isArray(storageState)
+        || (!Array.isArray(storageState.cookies) && !Array.isArray(storageState.origins))) {
+        throw new ApiError(
+          400,
+          "INVALID_STORAGE_STATE",
+          "storageState must be a Playwright storage state object with a cookies and/or origins array",
+        );
       }
 
       const oldContext = contextRecord.context;
@@ -2457,7 +2421,11 @@ class SessionManager {
     } catch (error) {
       const elapsed = Date.now() - startedAt;
       console.error(`[session] ${type} error ${elapsed}ms — ${error.message}`);
-      const artifacts = await this.captureFailureArtifacts(session, pageRecord, type);
+      // A rejected request body says nothing about the page, so no artifact.
+      // Timeouts and genuine automation failures are exactly when a screenshot
+      // and DOM dump are worth keeping.
+      const isBadRequest = error instanceof ApiError && BAD_REQUEST_STATUS_CODES.has(error.statusCode);
+      const artifacts = isBadRequest ? {} : await this.captureFailureArtifacts(session, pageRecord, type);
       this.logAction(session, {
         type,
         status: "error",
@@ -2466,9 +2434,11 @@ class SessionManager {
         input,
         error: error.message,
       });
+      // A Playwright timeout is a failed expectation, not a server fault.
+      const isTimeout = error?.name === "TimeoutError" || /Timeout \d+ms exceeded/.test(error?.message || "");
       throw toApiError(error, {
-        statusCode: error instanceof ApiError ? error.statusCode : 500,
-        code: error instanceof ApiError ? error.code : "PLAYWRIGHT_ACTION_ERROR",
+        statusCode: error instanceof ApiError ? error.statusCode : (isTimeout ? 408 : 500),
+        code: error instanceof ApiError ? error.code : (isTimeout ? "TIMEOUT" : "PLAYWRIGHT_ACTION_ERROR"),
         details: {
           sessionId: session.sessionId,
           pageId,
@@ -2480,8 +2450,8 @@ class SessionManager {
     }
   }
 
-  async navigate(sessionId, pageId, action, request = {}) {
-    return this.withLock(sessionId, async (session) => {
+  async navigate(sessionId, pageId, action, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, `page.${action}`, request, async (pageRecord) => {
         switch (action) {
           case "goto": {
@@ -2539,8 +2509,8 @@ class SessionManager {
     });
   }
 
-  async pageAction(sessionId, pageId, action, request = {}) {
-    return this.withLock(sessionId, async (session) => {
+  async pageAction(sessionId, pageId, action, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, `page.${action}`, request, async (pageRecord) => {
         const page = pageRecord.page;
         switch (action) {
@@ -2562,14 +2532,21 @@ class SessionManager {
             });
             return this.serializePage(pageRecord);
           case "press":
+            if (typeof request.key !== "string" || !request.key) {
+              throw new ApiError(400, "INVALID_REQUEST", "key is required for press (for example \"Enter\")");
+            }
             await resolveLocator(page, request.locator).press(request.key, {
               delay: request.delay,
               timeout: request.timeoutMs,
             });
             return this.serializePage(pageRecord);
           case "selectOption": {
+            const optionTarget = request.values ?? request.value ?? request.options;
+            if (optionTarget === undefined || optionTarget === null) {
+              throw new ApiError(400, "INVALID_REQUEST", "values, value, or options is required for selectOption");
+            }
             const selected = await resolveLocator(page, request.locator).selectOption(
-              request.values || request.value || request.options,
+              optionTarget,
               { timeout: request.timeoutMs },
             );
             return {
@@ -2584,6 +2561,9 @@ class SessionManager {
             });
             return this.serializePage(pageRecord);
           case "drag":
+            if (!request.source || !request.target) {
+              throw new ApiError(400, "INVALID_REQUEST", "source and target locators are required for drag");
+            }
             await resolveLocator(page, request.source).dragTo(resolveLocator(page, request.target), {
               force: request.force,
               timeout: request.timeoutMs,
@@ -2624,8 +2604,8 @@ class SessionManager {
     });
   }
 
-  async pageAssert(sessionId, pageId, action, request = {}) {
-    return this.withLock(sessionId, async (session) => {
+  async pageAssert(sessionId, pageId, action, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, `assert.${action}`, request, async (pageRecord) => {
         const page = pageRecord.page;
         const timeoutMs = request.timeoutMs || 5000;
@@ -2638,6 +2618,9 @@ class SessionManager {
             return { pageId, success: true };
           case "text": {
             const expected = normalizePattern(request.expected ?? request.value);
+            if (expected === undefined || expected === null) {
+              throw new ApiError(400, "INVALID_REQUEST", "expected (or value) is required for the text assertion");
+            }
             await poll(
               timeoutMs,
               async () => {
@@ -2650,6 +2633,9 @@ class SessionManager {
           }
           case "url": {
             const expected = normalizePattern(request.expected ?? request.value ?? request.url);
+            if (expected === undefined || expected === null) {
+              throw new ApiError(400, "INVALID_REQUEST", "expected (or value/url) is required for the url assertion");
+            }
             if (expected instanceof RegExp) {
               await page.waitForURL(expected, { timeout: timeoutMs });
             } else {
@@ -2663,6 +2649,9 @@ class SessionManager {
           }
           case "count": {
             const expected = Number(request.expected ?? request.value);
+            if (!Number.isFinite(expected)) {
+              throw new ApiError(400, "INVALID_REQUEST", "expected (or value) must be a number for the count assertion");
+            }
             await poll(
               timeoutMs,
               async () => {
@@ -2680,8 +2669,8 @@ class SessionManager {
     });
   }
 
-  async waitFor(sessionId, pageId, request = {}) {
-    return this.withLock(sessionId, async (session) => {
+  async waitFor(sessionId, pageId, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, "page.waitFor", request, async (pageRecord) => {
         const page = pageRecord.page;
         const timeoutMs = request.timeoutMs || 5000;
@@ -2705,8 +2694,15 @@ class SessionManager {
             async () => !(await page.content()).includes(request.textGone),
             "Text did not disappear in time",
           );
+        } else if (Number.isFinite(Number(request.sleepMs))) {
+          await sleep(Math.max(0, Number(request.sleepMs)));
         } else {
-          await sleep(timeoutMs);
+          // Silently sleeping for the timeout hid typos in the request body.
+          throw new ApiError(
+            400,
+            "INVALID_REQUEST",
+            "one of loadState, url, locator, text, textGone, or sleepMs is required",
+          );
         }
         return {
           pageId,
@@ -2862,8 +2858,8 @@ class SessionManager {
     });
   }
 
-  async screenshot(sessionId, pageId, request = {}) {
-    return this.withLock(sessionId, async (session) => {
+  async screenshot(sessionId, pageId, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, "page.screenshot", request, async (pageRecord) => {
         const extension = request.type || "png";
         await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
@@ -2922,6 +2918,9 @@ class SessionManager {
   async startTrace(sessionId, request = {}) {
     return this.withLock(sessionId, async (session) => {
       const contextRecord = this.getContextRecord(session, request.contextId);
+      if (contextRecord.tracing) {
+        throw new ApiError(409, "TRACE_ALREADY_STARTED", `Tracing is already active for context ${contextRecord.contextId}`);
+      }
       await contextRecord.context.tracing.start({
         name: request.name,
         screenshots: request.screenshots ?? true,
@@ -2942,6 +2941,9 @@ class SessionManager {
   async stopTrace(sessionId, request = {}) {
     return this.withLock(sessionId, async (session) => {
       const contextRecord = this.getContextRecord(session, request.contextId);
+      if (!contextRecord.tracing) {
+        throw new ApiError(409, "TRACE_NOT_STARTED", `Tracing was never started for context ${contextRecord.contextId}`);
+      }
       const traceId = createId("trace");
       const tracePath = path.join(this.options.artifactsDir, session.sessionId, `${traceId}.zip`);
       await contextRecord.context.tracing.stop({ path: tracePath });
@@ -2969,57 +2971,78 @@ class SessionManager {
     });
   }
 
+  async runStepLocked(session, pageId, step) {
+    switch (step.action) {
+      case "goto":
+      case "reload":
+      case "goBack":
+      case "goForward":
+        return this.navigate(session.sessionId, pageId, step.action, step, session);
+      case "click":
+      case "fill":
+      case "press":
+      case "selectOption":
+      case "hover":
+      case "drag":
+      case "evaluate":
+      case "locatorQuery":
+        return this.pageAction(session.sessionId, pageId, step.action, step, session);
+      case "assertVisible":
+        return this.pageAssert(session.sessionId, pageId, "visible", step, session);
+      case "assertText":
+        return this.pageAssert(session.sessionId, pageId, "text", step, session);
+      case "assertUrl":
+        return this.pageAssert(session.sessionId, pageId, "url", step, session);
+      case "assertCount":
+        return this.pageAssert(session.sessionId, pageId, "count", step, session);
+      case "waitFor":
+        return this.waitFor(session.sessionId, pageId, step, session);
+      case "screenshot":
+        return this.screenshot(session.sessionId, pageId, step, session);
+      default:
+        throw new ApiError(400, "INVALID_STEP", `Unsupported execute step: ${step.action}`);
+    }
+  }
+
+  // The whole batch runs under a single session lock so a concurrent request
+  // cannot navigate the page out from under step N+1.
   async execute(sessionId, request = {}) {
     if (!Array.isArray(request.steps) || !request.steps.length) {
       throw new ApiError(400, "INVALID_REQUEST", "steps must be a non-empty array");
     }
-
-    const results = [];
-    for (const step of request.steps) {
-      switch (step.action) {
-        case "goto":
-        case "reload":
-        case "goBack":
-        case "goForward":
-          results.push(await this.navigate(sessionId, request.pageId, step.action, step));
-          break;
-        case "click":
-        case "fill":
-        case "press":
-        case "selectOption":
-        case "hover":
-        case "drag":
-        case "evaluate":
-        case "locatorQuery":
-          results.push(await this.pageAction(sessionId, request.pageId, step.action, step));
-          break;
-        case "assertVisible":
-          results.push(await this.pageAssert(sessionId, request.pageId, "visible", step));
-          break;
-        case "assertText":
-          results.push(await this.pageAssert(sessionId, request.pageId, "text", step));
-          break;
-        case "assertUrl":
-          results.push(await this.pageAssert(sessionId, request.pageId, "url", step));
-          break;
-        case "assertCount":
-          results.push(await this.pageAssert(sessionId, request.pageId, "count", step));
-          break;
-        case "waitFor":
-          results.push(await this.waitFor(sessionId, request.pageId, step));
-          break;
-        case "screenshot":
-          results.push(await this.screenshot(sessionId, request.pageId, step));
-          break;
-        default:
-          throw new ApiError(400, "INVALID_STEP", `Unsupported execute step: ${step.action}`);
-      }
+    if (!request.pageId) {
+      throw new ApiError(400, "INVALID_REQUEST", "pageId is required");
     }
 
-    return {
-      pageId: request.pageId,
-      results,
-    };
+    return this.withLock(sessionId, async (session) => {
+      this.getPageRecord(session, request.pageId);
+      const results = [];
+      for (const [index, step] of request.steps.entries()) {
+        try {
+          results.push({ index, action: step.action, status: "ok", result: await this.runStepLocked(session, request.pageId, step) });
+        } catch (error) {
+          const apiError = toApiError(error);
+          results.push({
+            index,
+            action: step.action,
+            status: "error",
+            error: { code: apiError.code, message: apiError.message },
+            artifacts: apiError.artifacts,
+          });
+          if (!request.continueOnError) {
+            apiError.details = { ...(apiError.details || {}), failedStepIndex: index, results };
+            throw apiError;
+          }
+        }
+      }
+
+      return {
+        pageId: request.pageId,
+        stepCount: request.steps.length,
+        failedCount: results.filter((entry) => entry.status === "error").length,
+        results,
+      };
+    });
   }
 
   async listArtifacts(sessionId) {
@@ -3059,6 +3082,31 @@ function asyncRoute(handler) {
   };
 }
 
+const INLINE_ARTIFACT_TYPES = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".pdf": "application/pdf",
+  ".html": "text/html; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".webm": "video/webm",
+};
+
+// `res.download` always forces a download, which broke the playground's inline
+// screenshot preview. `?disposition=inline` serves the same file for viewing.
+function sendArtifact(req, res, absolutePath, fileName) {
+  const inline = String(req.query.disposition || "").toLowerCase() === "inline";
+  const contentType = INLINE_ARTIFACT_TYPES[path.extname(fileName).toLowerCase()];
+  if (inline && contentType) {
+    res.type(contentType);
+    res.setHeader("Content-Disposition", `inline; filename="${safeFilename(fileName)}"`);
+    return res.sendFile(absolutePath);
+  }
+
+  return res.download(absolutePath, fileName);
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -3066,6 +3114,17 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+// JSON embedded in an inline <script> has to survive HTML parsing: `</script>`
+// and the line separators that are newlines in HTML but not in JS.
+function toInlineJson(value) {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
 }
 
 function getBaseUrl(req) {
@@ -3093,8 +3152,22 @@ function containsKoreanText(value) {
   return /[\u3131-\u318e\uac00-\ud7a3]/.test(String(value || ""));
 }
 
+// `language` doubles as the ko/en authoring locale, so "ts" there would silently
+// switch the prose language. `scriptLanguage` is the explicit field; passing
+// "ts" in `language` still works for callers written against 0.1.4.
+function resolveScriptLanguage(request = {}) {
+  const raw = String(request.scriptLanguage || request.fileLanguage || request.language || "").toLowerCase();
+  return ["ts", "typescript"].includes(raw) ? "ts" : "js";
+}
+
 function resolveAuthoringLanguage(request = {}) {
-  return normalizeLanguageTag(request.language || request.locale || (containsKoreanText(request.goal || request.prompt || request.request || "") ? "ko" : "en"));
+  const requested = String(request.language || "").toLowerCase();
+  const localeHint = ["ts", "typescript", "js", "javascript"].includes(requested) ? "" : request.language;
+  return normalizeLanguageTag(
+    localeHint
+    || request.locale
+    || (containsKoreanText(request.goal || request.prompt || request.request || "") ? "ko" : "en"),
+  );
 }
 
 function getAuthoringCopy(language) {
@@ -3339,6 +3412,12 @@ function getPageCopy(language) {
       messageLabel: "채팅 메시지",
       ready: "API 호출 준비 완료",
       noScreenshot: "아직 스크린샷이 없습니다.",
+      noArtifacts: "아직 아티팩트가 없습니다.",
+      downloadLabel: "다운로드",
+      apiTokenLabel: "API 토큰",
+      apiTokenPlaceholder: "API_TOKEN 을 설정한 경우에만 입력",
+      authRequiredNotice: "이 서버는 API 토큰을 요구합니다. 위 API 토큰 칸을 먼저 채우세요.",
+      invalidVariablesJson: "variables JSON 형식이 올바르지 않습니다:",
       noScripts: "등록된 스크립트가 없습니다",
       runCreated: "Run 생성 완료:",
       createSessionFirst: "먼저 세션을 생성하세요.",
@@ -3461,6 +3540,12 @@ function getPageCopy(language) {
       messageLabel: "Chat Message",
       ready: "Ready to call the API.",
       noScreenshot: "No screenshot yet.",
+      noArtifacts: "No artifacts yet.",
+      downloadLabel: "Download",
+      apiTokenLabel: "API token",
+      apiTokenPlaceholder: "Only needed when API_TOKEN is set",
+      authRequiredNotice: "This server requires an API token. Fill in the API token field above first.",
+      invalidVariablesJson: "variables is not valid JSON:",
       noScripts: "No scripts found",
       runCreated: "Run created:",
       createSessionFirst: "Create a session first.",
@@ -3527,6 +3612,38 @@ function getPageCopy(language) {
 function buildOpenApiSpec(req) {
   const baseUrl = getBaseUrl(req);
   const api = config.apiBasePath;
+  const pathParam = (name) => ({ name, in: "path", required: true, schema: { type: "string" } });
+  const sessionParams = [pathParam("sessionId")];
+  const contextParams = [pathParam("sessionId"), pathParam("contextId")];
+  const pageParams = [pathParam("sessionId"), pathParam("pageId")];
+
+  // Every REST route is listed here; an endpoint missing from Swagger UI is an
+  // endpoint nobody discovers.
+  const operation = ({ tag, summary, parameters = [], body, responses }) => cleanObject({
+    tags: [tag],
+    summary,
+    parameters: parameters.length ? parameters : undefined,
+    requestBody: body ? { required: false, content: { "application/json": { schema: body } } } : undefined,
+    responses: responses || { 200: { description: "Success envelope" } },
+  });
+  const freeFormBody = { type: "object", additionalProperties: true };
+  const pageActionPath = (action, summary, extra = {}) => ({
+    [`${api}/sessions/{sessionId}/pages/{pageId}/${action}`]: {
+      post: operation({
+        tag: "Sessions",
+        summary,
+        parameters: pageParams,
+        body: {
+          type: "object",
+          properties: {
+            locator: { $ref: "#/components/schemas/Locator" },
+            timeoutMs: { type: "integer", example: 5000 },
+            ...extra,
+          },
+        },
+      }),
+    },
+  });
 
   return {
     openapi: "3.1.0",
@@ -3845,6 +3962,12 @@ function buildOpenApiSpec(req) {
         },
       },
       [`${api}/runs/{runId}`]: {
+        delete: operation({
+          tag: "Runs",
+          summary: "Delete a finished run and its artifacts",
+          parameters: [pathParam("runId")],
+          responses: { 200: { description: "Deleted" }, 409: { description: "Run is still executing" } },
+        }),
         get: {
           tags: ["Runs"],
           summary: "Get run status",
@@ -3885,6 +4008,7 @@ function buildOpenApiSpec(req) {
         },
       },
       [`${api}/sessions`]: {
+        get: operation({ tag: "Sessions", summary: "List active browser sessions" }),
         post: {
           tags: ["Sessions"],
           summary: "Create a browser session",
@@ -4116,6 +4240,165 @@ function buildOpenApiSpec(req) {
           responses: { 200: { description: "Binary file download" }, 404: { description: "Artifact not found" } },
         },
       },
+      [`${api}/runs/{runId}/artifacts/{artifactPath}`]: {
+        get: operation({
+          tag: "Runs",
+          summary: "Download one file produced by a run",
+          parameters: [pathParam("runId"), { name: "artifactPath", in: "path", required: true, schema: { type: "string" }, description: "relativePath from the artifacts listing" }],
+          responses: { 200: { description: "Binary file" }, 404: { description: "Artifact not found" } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/close`]: {
+        post: operation({ tag: "Sessions", summary: "Close a session (alias of DELETE)", parameters: sessionParams }),
+      },
+      [`${api}/sessions/{sessionId}/keepalive`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Extend the session TTL",
+          parameters: sessionParams,
+          body: { type: "object", properties: { ttlMs: { type: "integer", example: 1800000 } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/actions`]: {
+        get: operation({ tag: "Sessions", summary: "List action and browser event logs", parameters: sessionParams }),
+      },
+      [`${api}/sessions/{sessionId}/trace/start`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Start Playwright tracing for a context",
+          parameters: sessionParams,
+          body: { type: "object", required: ["contextId"], properties: { contextId: { type: "string" }, title: { type: "string" }, screenshots: { type: "boolean" }, snapshots: { type: "boolean" }, sources: { type: "boolean" } } },
+          responses: { 200: { description: "Tracing started" }, 409: { description: "Tracing already active" } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/trace/stop`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Stop tracing and store the trace zip as an artifact",
+          parameters: sessionParams,
+          body: { type: "object", required: ["contextId"], properties: { contextId: { type: "string" } } },
+          responses: { 200: { description: "Trace artifact" }, 409: { description: "Tracing was never started" } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}`]: {
+        get: operation({ tag: "Sessions", summary: "Get one context", parameters: contextParams }),
+        delete: operation({ tag: "Sessions", summary: "Close one context and collect its videos", parameters: contextParams }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/storage-state/export`]: {
+        post: operation({ tag: "Sessions", summary: "Export cookies and origins as a storage state artifact", parameters: contextParams }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/storage-state/import`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Recreate the context with an imported storage state",
+          parameters: contextParams,
+          body: { type: "object", properties: { storageState: freeFormBody, storageStateRef: { type: "string", example: "auth/admin.json", description: "Path relative to STORAGE_STATE_DIR" } } },
+          responses: { 200: { description: "Context recreated; existing pages are closed" }, 400: { description: "Invalid storage state or path outside STORAGE_STATE_DIR" } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/route`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Register a network route handler",
+          parameters: contextParams,
+          body: { type: "object", required: ["url"], properties: { url: { type: "string", example: "**/api/**" }, times: { type: "integer" }, behavior: { type: "object", properties: { action: { type: "string", enum: ["continue", "abort", "fulfill"] }, status: { type: "integer" }, body: { type: "string" }, json: freeFormBody, contentType: { type: "string" }, headers: { type: "object", additionalProperties: { type: "string" } }, errorCode: { type: "string" } } } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/route/{routeId}`]: {
+        delete: operation({ tag: "Sessions", summary: "Remove a route handler", parameters: [...contextParams, pathParam("routeId")] }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/cookies`]: {
+        get: operation({
+          tag: "Sessions",
+          summary: "List cookies",
+          parameters: [...contextParams, { name: "urls", in: "query", required: false, schema: { type: "string" }, description: "Comma separated URL filter" }],
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/cookies/set`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Add cookies to the context",
+          parameters: contextParams,
+          body: { type: "object", properties: { cookies: { type: "array", items: freeFormBody }, urls: { type: "array", items: { type: "string" } } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/permissions`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Grant browser permissions",
+          parameters: contextParams,
+          body: { type: "object", properties: { permissions: { type: "array", items: { type: "string" }, example: ["geolocation"] }, origin: { type: "string" } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/headers`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Replace the context default extra HTTP headers",
+          parameters: contextParams,
+          body: { type: "object", properties: { headers: { type: "object", additionalProperties: { type: "string" } } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}`]: {
+        get: operation({ tag: "Sessions", summary: "Get one page", parameters: pageParams }),
+        delete: operation({ tag: "Sessions", summary: "Close one page and collect its video", parameters: pageParams }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/reload`]: {
+        post: operation({ tag: "Sessions", summary: "Reload the page", parameters: pageParams, body: { type: "object", properties: { waitUntil: { type: "string" }, timeoutMs: { type: "integer" } } } }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/go-back`]: {
+        post: operation({ tag: "Sessions", summary: "Go back in history", parameters: pageParams }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/go-forward`]: {
+        post: operation({ tag: "Sessions", summary: "Go forward in history", parameters: pageParams }),
+      },
+      ...pageActionPath("press", "Press a key on a locator", { key: { type: "string", example: "Enter" }, delay: { type: "integer" } }),
+      ...pageActionPath("hover", "Hover a locator", { force: { type: "boolean" } }),
+      ...pageActionPath("select-option", "Select option(s) in a <select>", { values: { type: "array", items: { type: "string" } }, value: { type: "string" } }),
+      ...pageActionPath("assert/visible", "Assert a locator becomes visible"),
+      ...pageActionPath("assert/count", "Assert how many elements a locator matches", { expected: { type: "integer", example: 3 }, operator: { type: "string", enum: ["eq", "gt", "gte", "lt", "lte"] } }),
+      ...pageActionPath("wait-for", "Wait for a load state, URL, locator, text, or a fixed delay", { loadState: { type: "string", enum: ["load", "domcontentloaded", "networkidle"] }, url: { type: "string" }, text: { type: "string" }, textGone: { type: "string" }, state: { type: "string" }, sleepMs: { type: "integer" } }),
+      [`${api}/sessions/{sessionId}/pages/{pageId}/drag`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Drag one locator onto another",
+          parameters: pageParams,
+          body: { type: "object", required: ["source", "target"], properties: { source: { $ref: "#/components/schemas/Locator" }, target: { $ref: "#/components/schemas/Locator" }, timeoutMs: { type: "integer" } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/evaluate`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Evaluate JavaScript in the page (disable with ENABLE_EVALUATE=false)",
+          parameters: pageParams,
+          body: { type: "object", required: ["expression"], properties: { expression: { type: "string", example: "() => document.title" }, arg: {} } },
+          responses: { 200: { description: "Evaluation result" }, 403: { description: "Evaluate is disabled by configuration" } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/locator/query`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Read count or text from a locator without asserting",
+          parameters: pageParams,
+          body: { type: "object", properties: { locator: { $ref: "#/components/schemas/Locator" }, operation: { type: "string", enum: ["count", "allTextContents", "textContent", "innerText", "isVisible"] } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/assert/url`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Assert the page URL",
+          parameters: pageParams,
+          body: { type: "object", properties: { expected: { type: "string", example: "/dashboard", description: "Use \"/pattern/flags\" for a regular expression" }, match: { type: "string", enum: ["equals", "contains", "startsWith", "endsWith"] }, timeoutMs: { type: "integer" } } },
+        }),
+      },
+      [`${api}/sessions/{sessionId}/pages/{pageId}/pdf`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Render the page to PDF (chromium only)",
+          parameters: pageParams,
+          body: { type: "object", properties: { format: { type: "string", example: "A4" }, landscape: { type: "boolean" }, printBackground: { type: "boolean" }, scale: { type: "number" } } },
+          responses: { 200: { description: "PDF artifact" }, 400: { description: "Not a chromium session" } },
+        }),
+      },
       [config.mcpBasePath]: {
         get: {
           tags: ["MCP"],
@@ -4136,128 +4419,6 @@ function buildOpenApiSpec(req) {
       },
     },
   };
-}
-
-function renderHomePage(req) {
-  const baseUrl = getBaseUrl(req);
-  const entries = [
-    { href: documentationPaths.docs, label: "Swagger UI", description: "Browse the REST and MCP API in an offline-friendly UI." },
-    { href: documentationPaths.playground, label: "API Playground", description: "Call the service interactively, create sessions, and capture screenshots." },
-    { href: "/demo/test-page", label: "Demo Test Page", description: "Simple local page for stable Playwright automation checks." },
-    { href: documentationPaths.openApi, label: "OpenAPI JSON", description: "Raw OpenAPI document for client generation or import." },
-    { href: "/health", label: "Health", description: "Quick service status and counters." },
-  ];
-
-  const cards = entries.map((entry) => `
-    <a class="card" href="${escapeHtml(entry.href)}">
-      <strong>${escapeHtml(entry.label)}</strong>
-      <span>${escapeHtml(entry.description)}</span>
-      <code>${escapeHtml(baseUrl + entry.href)}</code>
-    </a>
-  `).join("");
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(config.serviceName)} Home</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4efe7;
-      --panel: rgba(255,255,255,0.9);
-      --ink: #1d2433;
-      --muted: #5b6476;
-      --line: rgba(29,36,51,0.12);
-      --accent: #0f766e;
-      --accent-2: #ef4444;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.18), transparent 34%),
-        radial-gradient(circle at bottom right, rgba(239,68,68,0.14), transparent 36%),
-        linear-gradient(180deg, #f6f1e7 0%, #ece9e4 100%);
-      min-height: 100vh;
-    }
-    main {
-      width: min(1040px, calc(100vw - 32px));
-      margin: 0 auto;
-      padding: 40px 0 56px;
-    }
-    .hero {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      padding: 28px;
-      box-shadow: 0 18px 50px rgba(29,36,51,0.08);
-      backdrop-filter: blur(12px);
-    }
-    .hero h1 {
-      margin: 0 0 10px;
-      font-size: clamp(2rem, 4vw, 3.5rem);
-      letter-spacing: -0.04em;
-    }
-    .hero p {
-      margin: 0;
-      color: var(--muted);
-      max-width: 720px;
-      line-height: 1.65;
-      font-size: 1.05rem;
-    }
-    .grid {
-      margin-top: 24px;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      display: grid;
-      gap: 8px;
-      padding: 18px;
-      text-decoration: none;
-      color: inherit;
-      background: rgba(255,255,255,0.86);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: 0 12px 34px rgba(29,36,51,0.06);
-      transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-    }
-    .card:hover {
-      transform: translateY(-2px);
-      border-color: rgba(15,118,110,0.35);
-      box-shadow: 0 20px 40px rgba(29,36,51,0.12);
-    }
-    .card strong { font-size: 1.05rem; }
-    .card span {
-      color: var(--muted);
-      line-height: 1.55;
-      min-height: 3.1em;
-    }
-    .card code {
-      color: var(--accent);
-      word-break: break-all;
-      font-size: .9rem;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <h1>${escapeHtml(config.serviceName)}</h1>
-      <p>
-        This container serves the stateful Playwright REST API, Streamable MCP endpoint, Swagger UI, and a local demo page for offline browser automation.
-        Use the links below to inspect the API surface quickly or drive the built-in test page with screenshot capture.
-      </p>
-    </section>
-    <section class="grid">${cards}</section>
-  </main>
-</body>
-</html>`;
 }
 
 function renderSwaggerPage(req) {
@@ -4284,7 +4445,7 @@ function renderSwaggerPage(req) {
   <script src="${documentationPaths.swaggerAssets}/swagger-ui-standalone-preset.js"></script>
   <script>
     window.ui = SwaggerUIBundle({
-      url: ${JSON.stringify(openApiUrl)},
+      url: ${toInlineJson(openApiUrl)},
       dom_id: '#swagger-ui',
       deepLinking: true,
       presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
@@ -4293,591 +4454,6 @@ function renderSwaggerPage(req) {
       defaultModelsExpandDepth: 2,
       defaultModelExpandDepth: 2,
       tryItOutEnabled: true
-    });
-  </script>
-</body>
-</html>`;
-}
-
-function renderPlaygroundPage() {
-  const clientConfig = {
-    apiBasePath: config.apiBasePath,
-    docsPath: documentationPaths.docs,
-    openApiPath: documentationPaths.openApi,
-    demoPath: "/demo/test-page",
-  };
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(config.serviceName)} Playground</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --panel: rgba(255,255,255,0.94);
-      --ink: #1f2937;
-      --muted: #667085;
-      --line: rgba(17,24,39,0.12);
-      --primary: #0f766e;
-      --accent: #c2410c;
-      --shadow: 0 18px 48px rgba(17,24,39,0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.15), transparent 28%),
-        radial-gradient(circle at top right, rgba(194,65,12,0.12), transparent 28%),
-        linear-gradient(180deg, #f5f2ec 0%, #ece6df 100%);
-      min-height: 100vh;
-    }
-    main { width: min(1180px, calc(100vw - 24px)); margin: 0 auto; padding: 20px 0 28px; display: grid; gap: 18px; }
-    .hero, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); }
-    .hero { padding: 24px; }
-    .hero h1 { margin: 0 0 10px; font-size: clamp(1.9rem, 4vw, 3.2rem); letter-spacing: -0.05em; }
-    .hero p, .panel p { margin: 0 0 14px; color: var(--muted); line-height: 1.6; }
-    .hero nav, .row { display: flex; flex-wrap: wrap; gap: 10px; }
-    .layout { display: grid; grid-template-columns: 1.15fr .85fr; gap: 18px; }
-    .left, .right, .stack, .grid2 { display: grid; gap: 12px; }
-    .panel { padding: 18px; }
-    .grid2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    a, button {
-      appearance: none;
-      border: 0;
-      border-radius: 999px;
-      background: var(--primary);
-      color: #fff;
-      padding: 10px 14px;
-      cursor: pointer;
-      font-weight: 600;
-      text-decoration: none;
-    }
-    button.secondary, a.secondary { background: #e5e7eb; color: #111827; }
-    button.warn { background: var(--accent); }
-    label { display: grid; gap: 6px; font-size: .94rem; font-weight: 600; }
-    input, select, textarea, pre {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      padding: 11px 12px;
-      font: inherit;
-    }
-    textarea { min-height: 110px; resize: vertical; }
-    .status {
-      border-radius: 14px;
-      padding: 12px 14px;
-      background: rgba(15,118,110,0.08);
-      color: #0f766e;
-      font-weight: 600;
-    }
-    .status.error { background: rgba(194,65,12,0.1); color: #9a3412; }
-    pre { margin: 0; min-height: 280px; overflow: auto; background: #0f172a; color: #dbeafe; line-height: 1.5; }
-    .preview {
-      border-radius: 18px;
-      overflow: hidden;
-      border: 1px solid var(--line);
-      min-height: 180px;
-      background: linear-gradient(135deg, rgba(15,118,110,0.1), rgba(194,65,12,0.08));
-      display: grid;
-      place-items: center;
-      color: var(--muted);
-    }
-    .preview img { display: block; max-width: 100%; height: auto; }
-    @media (max-width: 980px) {
-      .layout, .grid2 { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <h1>API Playground</h1>
-      <p>Use this page to call the built-in REST API against the current container, create a live browser session, navigate to the local demo page, and preview screenshot artifacts without leaving the browser.</p>
-      <nav>
-        <a href="${documentationPaths.docs}">Open Swagger UI</a>
-        <a class="secondary" href="/demo/test-page" target="_blank" rel="noreferrer">Open Demo Test Page</a>
-        <a class="secondary" href="${documentationPaths.openApi}" target="_blank" rel="noreferrer">OpenAPI JSON</a>
-      </nav>
-    </section>
-
-    <section class="layout">
-      <div class="left">
-        <section class="panel">
-          <h2>Quick Calls</h2>
-          <p>Basic endpoints for connectivity and script registry checks.</p>
-          <div class="row">
-            <button type="button" id="healthBtn">GET /health</button>
-            <button type="button" id="syncScriptsBtn" class="secondary">POST /api/scripts/sync</button>
-            <button type="button" id="loadScriptsBtn" class="secondary">GET /api/scripts</button>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Create Run</h2>
-          <p>Submit a script execution request using the registered script list from this container.</p>
-          <div class="grid2">
-            <label>Script<select id="scriptKey"></select></label>
-            <label>Project<input id="project" value="chromium"></label>
-            <label>Environment<input id="envName" value="local"></label>
-            <label>Base URL<input id="baseUrl" value=""></label>
-            <label>Grep<input id="grep" placeholder="@smoke"></label>
-            <label>Storage State Ref<input id="storageStateRef" placeholder="auth/customer.json"></label>
-          </div>
-          <label>Variables JSON
-            <textarea id="variablesJson">{
-  "locale": "ko-KR",
-  "source": "playground"
-}</textarea>
-          </label>
-          <div class="row">
-            <button type="button" id="createRunBtn">POST /api/runs</button>
-            <button type="button" id="listRunsBtn" class="secondary">GET /api/runs</button>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Session Flow</h2>
-          <p>Create a low-level session, open the local demo page, click and type, then capture a screenshot artifact.</p>
-          <div class="grid2">
-            <label>Session ID<input id="sessionId" readonly placeholder="Created session id"></label>
-            <label>Context ID<input id="contextId" readonly placeholder="Created context id"></label>
-            <label>Page ID<input id="pageId" readonly placeholder="Created page id"></label>
-            <label>Chat Message<input id="messageText" value="hello from playground"></label>
-          </div>
-          <div class="row">
-            <button type="button" id="createSessionBtn">Create Session</button>
-            <button type="button" id="createContextBtn" class="secondary">Create Context</button>
-            <button type="button" id="createPageBtn" class="secondary">Create Page</button>
-          </div>
-          <div class="row">
-            <button type="button" id="gotoDemoBtn">Goto Demo</button>
-            <button type="button" id="clickPrimaryBtn" class="secondary">Click Primary</button>
-            <button type="button" id="sendMessageBtn" class="secondary">Send Message</button>
-            <button type="button" id="takeScreenshotBtn">Take Screenshot</button>
-            <button type="button" id="closeSessionBtn" class="warn">Close Session</button>
-          </div>
-        </section>
-      </div>
-
-      <div class="right">
-        <section class="panel">
-          <h2>Current Status</h2>
-          <p>The latest API call result and a short human-readable summary are shown here.</p>
-          <div id="statusBox" class="status">Ready to call the API.</div>
-        </section>
-        <section class="panel">
-          <h2>Screenshot Preview</h2>
-          <p>When a screenshot artifact is created, it is shown below using the API download path.</p>
-          <div id="preview" class="preview">No screenshot yet.</div>
-        </section>
-        <section class="panel">
-          <h2>JSON Result</h2>
-          <p>All responses are rendered as pretty JSON so the page is useful for debugging in air-gapped environments.</p>
-          <pre id="resultBox">{}</pre>
-        </section>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const CONFIG = ${JSON.stringify(clientConfig)};
-    const state = { sessionId: '', contextId: '', pageId: '' };
-    const resultBox = document.getElementById('resultBox');
-    const preview = document.getElementById('preview');
-    const statusBox = document.getElementById('statusBox');
-    const scriptKeySelect = document.getElementById('scriptKey');
-    const sessionIdInput = document.getElementById('sessionId');
-    const contextIdInput = document.getElementById('contextId');
-    const pageIdInput = document.getElementById('pageId');
-
-    function setStatus(message, isError) {
-      statusBox.textContent = message;
-      statusBox.className = isError ? 'status error' : 'status';
-    }
-
-    function setResult(payload) {
-      resultBox.textContent = JSON.stringify(payload, null, 2);
-    }
-
-    function syncInputs() {
-      sessionIdInput.value = state.sessionId;
-      contextIdInput.value = state.contextId;
-      pageIdInput.value = state.pageId;
-    }
-
-    function showArtifact(artifact) {
-      if (!artifact || !artifact.downloadPath) {
-        preview.textContent = 'No screenshot yet.';
-        return;
-      }
-      preview.innerHTML = '<img alt="Screenshot artifact preview">';
-      preview.querySelector('img').src = artifact.downloadPath;
-    }
-
-    async function api(method, path, body) {
-      const response = await fetch(path, {
-        method,
-        headers: body ? { 'Content-Type': 'application/json' } : {},
-        body: body ? JSON.stringify(body) : undefined
-      });
-      const contentType = response.headers.get('content-type') || '';
-      const payload = contentType.includes('application/json') ? await response.json() : await response.text();
-      setResult(payload);
-      if (!response.ok) {
-        const message = payload && payload.error && payload.error.message ? payload.error.message : 'Request failed';
-        setStatus(method + ' ' + path + ' failed: ' + message, true);
-        throw new Error(message);
-      }
-      setStatus(method + ' ' + path + ' completed.', false);
-      return payload;
-    }
-
-    async function refreshScripts() {
-      const payload = await api('GET', CONFIG.apiBasePath + '/scripts');
-      const scripts = (payload.data && payload.data.scripts) || [];
-      scriptKeySelect.innerHTML = '';
-      if (!scripts.length) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = 'No scripts found';
-        scriptKeySelect.append(option);
-        return;
-      }
-      scripts.forEach((script) => {
-        const option = document.createElement('option');
-        option.value = script.scriptKey;
-        option.textContent = script.scriptKey;
-        scriptKeySelect.append(option);
-      });
-    }
-
-    function requireValue(value, message) {
-      if (!value) {
-        throw new Error(message);
-      }
-    }
-
-    document.getElementById('healthBtn').addEventListener('click', async () => { await api('GET', '/health'); });
-    document.getElementById('syncScriptsBtn').addEventListener('click', async () => {
-      await api('POST', CONFIG.apiBasePath + '/scripts/sync', {});
-      await refreshScripts();
-    });
-    document.getElementById('loadScriptsBtn').addEventListener('click', async () => { await refreshScripts(); });
-    document.getElementById('createRunBtn').addEventListener('click', async () => {
-      const variablesText = document.getElementById('variablesJson').value.trim();
-      const variables = variablesText ? JSON.parse(variablesText) : {};
-      const payload = await api('POST', CONFIG.apiBasePath + '/runs', {
-        scriptKey: scriptKeySelect.value,
-        project: document.getElementById('project').value.trim() || undefined,
-        env: document.getElementById('envName').value.trim() || undefined,
-        baseURL: document.getElementById('baseUrl').value.trim() || undefined,
-        grep: document.getElementById('grep').value.trim() || undefined,
-        storageStateRef: document.getElementById('storageStateRef').value.trim() || undefined,
-        variables
-      });
-      if (payload && payload.data && payload.data.runId) {
-        setStatus('Run created: ' + payload.data.runId, false);
-      }
-    });
-    document.getElementById('listRunsBtn').addEventListener('click', async () => { await api('GET', CONFIG.apiBasePath + '/runs'); });
-    document.getElementById('createSessionBtn').addEventListener('click', async () => {
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions', { browserType: 'chromium', headless: true });
-      state.sessionId = payload.data.sessionId;
-      state.contextId = '';
-      state.pageId = '';
-      syncInputs();
-    });
-    document.getElementById('createContextBtn').addEventListener('click', async () => {
-      requireValue(state.sessionId, 'Create a session first.');
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts', {
-        viewport: { width: 1440, height: 960 }
-      });
-      state.contextId = payload.data.contextId;
-      state.pageId = '';
-      syncInputs();
-    });
-    document.getElementById('createPageBtn').addEventListener('click', async () => {
-      requireValue(state.contextId, 'Create a context first.');
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts/' + state.contextId + '/pages', {});
-      state.pageId = payload.data.pageId;
-      syncInputs();
-    });
-    document.getElementById('gotoDemoBtn').addEventListener('click', async () => {
-      requireValue(state.pageId, 'Create a page first.');
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/goto', {
-        url: window.location.origin + CONFIG.demoPath,
-        waitUntil: 'domcontentloaded'
-      });
-    });
-    document.getElementById('clickPrimaryBtn').addEventListener('click', async () => {
-      requireValue(state.pageId, 'Create a page first.');
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
-        locator: { testId: 'primary-action' }
-      });
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/assert/text', {
-        locator: { testId: 'status' },
-        value: 'Primary clicked',
-        match: 'contains'
-      });
-    });
-    document.getElementById('sendMessageBtn').addEventListener('click', async () => {
-      requireValue(state.pageId, 'Create a page first.');
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/fill', {
-        locator: { label: 'Message' },
-        value: document.getElementById('messageText').value
-      });
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
-        locator: { role: 'button', name: 'Send message' }
-      });
-    });
-    document.getElementById('takeScreenshotBtn').addEventListener('click', async () => {
-      requireValue(state.pageId, 'Create a page first.');
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/screenshot', {
-        fullPage: true,
-        type: 'png'
-      });
-      showArtifact(payload && payload.data && payload.data.artifact);
-    });
-    document.getElementById('closeSessionBtn').addEventListener('click', async () => {
-      requireValue(state.sessionId, 'Create a session first.');
-      await api('DELETE', CONFIG.apiBasePath + '/sessions/' + state.sessionId);
-      state.sessionId = '';
-      state.contextId = '';
-      state.pageId = '';
-      syncInputs();
-      preview.textContent = 'No screenshot yet.';
-    });
-
-    syncInputs();
-    refreshScripts().catch((error) => setStatus(error.message, true));
-  </script>
-</body>
-</html>`;
-}
-
-function renderDemoTestPage() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Playwright Player Demo Page</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --panel: rgba(255,255,255,0.95);
-      --ink: #172033;
-      --muted: #5f6b82;
-      --line: rgba(23,32,51,0.12);
-      --teal: #0f766e;
-      --sand: #b45309;
-      --shadow: 0 20px 48px rgba(23,32,51,0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.17), transparent 30%),
-        radial-gradient(circle at bottom right, rgba(180,83,9,0.12), transparent 34%),
-        linear-gradient(180deg, #f8f4ed 0%, #eee8df 100%);
-      min-height: 100vh;
-    }
-    main { width: min(1120px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 36px; display: grid; gap: 18px; }
-    .hero, .panel { border-radius: 26px; background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
-    .hero { padding: 26px; }
-    .hero h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3.4rem); letter-spacing: -0.05em; }
-    .hero p, .muted { margin: 0; line-height: 1.65; color: var(--muted); }
-    .layout { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; }
-    .panel { padding: 20px; }
-    h2 { margin: 0 0 12px; font-size: 1.12rem; }
-    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    label { display: grid; gap: 6px; font-weight: 600; }
-    input, select, button { font: inherit; }
-    input, select {
-      width: 100%;
-      padding: 11px 12px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 10px 14px;
-      font-weight: 700;
-      cursor: pointer;
-      color: #fff;
-      background: var(--teal);
-    }
-    .ghost { background: #e5e7eb; color: #111827; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .status, .counter, .feed {
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: #fff;
-      padding: 14px 16px;
-    }
-    .status strong { display: block; margin-bottom: 6px; }
-    ul.feed {
-      list-style: none;
-      margin: 0;
-      display: grid;
-      gap: 10px;
-      max-height: 320px;
-      overflow: auto;
-    }
-    ul.feed li {
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(15,118,110,0.08);
-      border: 1px solid rgba(15,118,110,0.12);
-    }
-    ul.feed li.reply {
-      background: rgba(180,83,9,0.08);
-      border-color: rgba(180,83,9,0.14);
-    }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: rgba(23,32,51,0.07);
-      color: var(--muted);
-      font-size: .9rem;
-      margin: 8px 8px 0 0;
-    }
-    @media (max-width: 920px) {
-      .layout, .grid2 { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <h1>Playwright Player Demo Page</h1>
-      <p>This local page is designed for stable browser automation in offline environments. It exposes role, label, text, and test id based targets for click, fill, assert, and screenshot flows.</p>
-    </section>
-    <section class="layout">
-      <div class="panel">
-        <h2>Interaction Targets</h2>
-        <p class="muted">Use the controls below with the low-level session API.</p>
-        <div>
-          <span class="chip">data-testid="primary-action"</span>
-          <span class="chip">data-testid="status"</span>
-          <span class="chip">label="Message"</span>
-        </div>
-
-        <div class="status" data-testid="status-panel" style="margin-top: 16px;">
-          <strong>Status</strong>
-          <div id="statusText" data-testid="status">Ready</div>
-        </div>
-
-        <div class="row" style="margin-top: 14px;">
-          <button type="button" id="primaryAction" data-testid="primary-action">Primary Action</button>
-          <button type="button" id="secondaryAction" class="ghost">Secondary Action</button>
-        </div>
-
-        <div class="grid2" style="margin-top: 18px;">
-          <label>Name<input id="nameInput" placeholder="Operator name" data-testid="name-input"></label>
-          <label>Role
-            <select id="roleSelect" data-testid="role-select">
-              <option value="observer">observer</option>
-              <option value="operator">operator</option>
-              <option value="admin">admin</option>
-            </select>
-          </label>
-        </div>
-
-        <div class="row" style="margin-top: 14px;">
-          <button type="button" id="saveProfile">Save Profile</button>
-          <div id="profileResult" data-testid="profile-result" class="muted">Profile is not saved yet.</div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>Counter And Chat</h2>
-        <div class="counter" data-testid="counter-card">
-          <strong>Counter</strong>
-          <div id="counterValue" data-testid="counter-value">0</div>
-          <div class="row" style="margin-top: 12px;">
-            <button type="button" id="incrementCounter">Increment Counter</button>
-            <button type="button" id="resetCounter" class="ghost">Reset</button>
-          </div>
-        </div>
-
-        <div style="margin-top: 18px;">
-          <label>Message<input id="messageInput" placeholder="Type a message" aria-label="Message"></label>
-          <div class="row" style="margin-top: 12px;">
-            <button type="button" id="sendMessage">Send message</button>
-            <div id="chatSummary" data-testid="chat-summary" class="muted">No messages sent.</div>
-          </div>
-          <ul id="messageFeed" class="feed" data-testid="message-feed">
-            <li>System: local demo page loaded.</li>
-          </ul>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const statusText = document.getElementById('statusText');
-    const profileResult = document.getElementById('profileResult');
-    const counterValue = document.getElementById('counterValue');
-    const messageFeed = document.getElementById('messageFeed');
-    const chatSummary = document.getElementById('chatSummary');
-
-    function appendMessage(text, className) {
-      const item = document.createElement('li');
-      if (className) {
-        item.className = className;
-      }
-      item.textContent = text;
-      messageFeed.append(item);
-      item.scrollIntoView({ block: 'nearest' });
-    }
-
-    document.getElementById('primaryAction').addEventListener('click', () => {
-      statusText.textContent = 'Primary clicked';
-    });
-    document.getElementById('secondaryAction').addEventListener('click', () => {
-      statusText.textContent = 'Secondary clicked';
-    });
-    document.getElementById('saveProfile').addEventListener('click', () => {
-      const name = document.getElementById('nameInput').value.trim() || 'anonymous';
-      const role = document.getElementById('roleSelect').value;
-      profileResult.textContent = 'Saved profile for ' + name + ' as ' + role + '.';
-      statusText.textContent = 'Profile saved';
-    });
-    document.getElementById('incrementCounter').addEventListener('click', () => {
-      const next = Number(counterValue.textContent || '0') + 1;
-      counterValue.textContent = String(next);
-      statusText.textContent = 'Counter updated';
-    });
-    document.getElementById('resetCounter').addEventListener('click', () => {
-      counterValue.textContent = '0';
-      statusText.textContent = 'Counter reset';
-    });
-    document.getElementById('sendMessage').addEventListener('click', () => {
-      const input = document.getElementById('messageInput');
-      const value = input.value.trim();
-      if (!value) {
-        statusText.textContent = 'Message is empty';
-        return;
-      }
-      appendMessage('You: ' + value, '');
-      appendMessage('Bot: Echo -> ' + value, 'reply');
-      chatSummary.textContent = 'Last message: ' + value;
-      statusText.textContent = 'Message sent';
-      input.value = '';
     });
   </script>
 </body>
@@ -4901,7 +4477,7 @@ function renderLanguageSwitcher(currentPath, language) {
   `;
 }
 
-function renderHomePageV2(req) {
+function renderHomePage(req) {
   const baseUrl = getBaseUrl(req);
   const language = resolveRequestLanguage(req);
   const copy = getPageCopy(language).home;
@@ -5046,7 +4622,7 @@ function renderHomePageV2(req) {
 </html>`;
 }
 
-function renderPlaygroundPageV2(req) {
+function renderPlaygroundPage(req) {
   const language = resolveRequestLanguage(req);
   const copy = getPageCopy(language).playground;
   const defaultVariables = JSON.stringify(copy.defaultVariables, null, 2);
@@ -5056,6 +4632,7 @@ function renderPlaygroundPageV2(req) {
     openApiPath: documentationPaths.openApi,
     demoPath: appendLanguageParam("/demo/test-page", language),
     language,
+    authRequired: Boolean(config.apiToken),
     copy,
   };
 
@@ -5188,6 +4765,9 @@ function renderPlaygroundPageV2(req) {
         <section class="panel">
           <h2>${escapeHtml(copy.quickCallsTitle)}</h2>
           <p>${escapeHtml(copy.quickCallsBody)}</p>
+          <label>${escapeHtml(copy.apiTokenLabel)}
+            <input id="apiToken" type="password" autocomplete="off" placeholder="${escapeHtml(copy.apiTokenPlaceholder)}">
+          </label>
           <div class="row">
             <button type="button" id="healthBtn">${escapeHtml(copy.healthButton)}</button>
             <button type="button" id="syncScriptsBtn" class="secondary">${escapeHtml(copy.syncScriptsButton)}</button>
@@ -5266,7 +4846,7 @@ function renderPlaygroundPageV2(req) {
   </main>
 
   <script>
-    const CONFIG = ${JSON.stringify(clientConfig)};
+    const CONFIG = ${toInlineJson(clientConfig)};
     const COPY = CONFIG.copy;
     const state = { sessionId: '', contextId: '', pageId: '' };
     const resultBox = document.getElementById('resultBox');
@@ -5297,16 +4877,39 @@ function renderPlaygroundPageV2(req) {
         preview.textContent = COPY.noScreenshot;
         return;
       }
-      preview.innerHTML = '<img alt="">';
-      const image = preview.querySelector('img');
+      preview.replaceChildren();
+      const image = document.createElement('img');
       image.alt = COPY.screenshotAlt;
-      image.src = artifact.downloadPath;
+      // The download route defaults to Content-Disposition: attachment.
+      const inlineUrl = artifact.downloadPath + '?disposition=inline';
+      const headers = authHeaders();
+      if (headers.Authorization) {
+        // <img> cannot send a header, so fetch the bytes and preview a blob.
+        fetch(inlineUrl, { headers }).then(function (response) {
+          if (!response.ok) {
+            throw new Error(COPY.requestFailed);
+          }
+          return response.blob();
+        }).then(function (blob) {
+          image.src = URL.createObjectURL(blob);
+        }).catch(function (error) {
+          preview.textContent = error.message;
+        });
+      } else {
+        image.src = inlineUrl;
+      }
+      preview.append(image);
+    }
+
+    function authHeaders() {
+      const token = (document.getElementById('apiToken').value || '').trim();
+      return token ? { Authorization: 'Bearer ' + token } : {};
     }
 
     async function api(method, path, body) {
       const response = await fetch(path, {
         method,
-        headers: body ? { 'Content-Type': 'application/json' } : {},
+        headers: Object.assign({}, body ? { 'Content-Type': 'application/json' } : {}, authHeaders()),
         body: body ? JSON.stringify(body) : undefined
       });
       const contentType = response.headers.get('content-type') || '';
@@ -5346,15 +4949,39 @@ function renderPlaygroundPageV2(req) {
       }
     }
 
-    document.getElementById('healthBtn').addEventListener('click', async () => { await api('GET', '/health'); });
-    document.getElementById('syncScriptsBtn').addEventListener('click', async () => {
+    // Without this, an early throw (missing session id, invalid JSON) left the
+    // page looking like the click did nothing at all.
+    function onClick(id, handler) {
+      const element = document.getElementById(id);
+      if (!element) {
+        return;
+      }
+      element.addEventListener('click', async () => {
+        element.disabled = true;
+        try {
+          await handler();
+        } catch (error) {
+          setStatus(error.message || String(error), true);
+        } finally {
+          element.disabled = false;
+        }
+      });
+    }
+
+    onClick('healthBtn', async () => { await api('GET', '/health'); });
+    onClick('syncScriptsBtn', async () => {
       await api('POST', CONFIG.apiBasePath + '/scripts/sync', {});
       await refreshScripts();
     });
-    document.getElementById('loadScriptsBtn').addEventListener('click', async () => { await refreshScripts(); });
-    document.getElementById('createRunBtn').addEventListener('click', async () => {
+    onClick('loadScriptsBtn', async () => { await refreshScripts(); });
+    onClick('createRunBtn', async () => {
       const variablesText = document.getElementById('variablesJson').value.trim();
-      const variables = variablesText ? JSON.parse(variablesText) : {};
+      let variables = {};
+      try {
+        variables = variablesText ? JSON.parse(variablesText) : {};
+      } catch (error) {
+        throw new Error(COPY.invalidVariablesJson + ' ' + error.message);
+      }
       const payload = await api('POST', CONFIG.apiBasePath + '/runs', {
         scriptKey: scriptKeySelect.value,
         project: document.getElementById('project').value.trim() || undefined,
@@ -5368,15 +4995,15 @@ function renderPlaygroundPageV2(req) {
         setStatus(COPY.runCreated + ' ' + payload.data.runId, false);
       }
     });
-    document.getElementById('listRunsBtn').addEventListener('click', async () => { await api('GET', CONFIG.apiBasePath + '/runs'); });
-    document.getElementById('createSessionBtn').addEventListener('click', async () => {
+    onClick('listRunsBtn', async () => { await api('GET', CONFIG.apiBasePath + '/runs'); });
+    onClick('createSessionBtn', async () => {
       const payload = await api('POST', CONFIG.apiBasePath + '/sessions', { browserType: 'chromium', headless: true });
       state.sessionId = payload.data.sessionId;
       state.contextId = '';
       state.pageId = '';
       syncInputs();
     });
-    document.getElementById('createContextBtn').addEventListener('click', async () => {
+    onClick('createContextBtn', async () => {
       requireValue(state.sessionId, COPY.createSessionFirst);
       const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts', {
         viewport: { width: 1440, height: 960 },
@@ -5386,20 +5013,20 @@ function renderPlaygroundPageV2(req) {
       state.pageId = '';
       syncInputs();
     });
-    document.getElementById('createPageBtn').addEventListener('click', async () => {
+    onClick('createPageBtn', async () => {
       requireValue(state.contextId, COPY.createContextFirst);
       const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts/' + state.contextId + '/pages', {});
       state.pageId = payload.data.pageId;
       syncInputs();
     });
-    document.getElementById('gotoDemoBtn').addEventListener('click', async () => {
+    onClick('gotoDemoBtn', async () => {
       requireValue(state.pageId, COPY.createPageFirst);
       await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/goto', {
         url: window.location.origin + CONFIG.demoPath,
         waitUntil: 'domcontentloaded'
       });
     });
-    document.getElementById('clickPrimaryBtn').addEventListener('click', async () => {
+    onClick('clickPrimaryBtn', async () => {
       requireValue(state.pageId, COPY.createPageFirst);
       await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
         locator: { testId: 'primary-action' }
@@ -5410,7 +5037,7 @@ function renderPlaygroundPageV2(req) {
         match: 'contains'
       });
     });
-    document.getElementById('sendMessageBtn').addEventListener('click', async () => {
+    onClick('sendMessageBtn', async () => {
       requireValue(state.pageId, COPY.createPageFirst);
       await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/fill', {
         locator: { testId: 'message-input' },
@@ -5425,7 +5052,7 @@ function renderPlaygroundPageV2(req) {
         match: 'contains'
       });
     });
-    document.getElementById('takeScreenshotBtn').addEventListener('click', async () => {
+    onClick('takeScreenshotBtn', async () => {
       requireValue(state.pageId, COPY.createPageFirst);
       const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/screenshot', {
         fullPage: true,
@@ -5433,7 +5060,7 @@ function renderPlaygroundPageV2(req) {
       });
       showArtifact(payload && payload.data && payload.data.artifact);
     });
-    document.getElementById('closeSessionBtn').addEventListener('click', async () => {
+    onClick('closeSessionBtn', async () => {
       requireValue(state.sessionId, COPY.createSessionFirst);
       await api('DELETE', CONFIG.apiBasePath + '/sessions/' + state.sessionId);
       state.sessionId = '';
@@ -5443,32 +5070,49 @@ function renderPlaygroundPageV2(req) {
       preview.textContent = COPY.noScreenshot;
     });
 
-    document.getElementById('listArtifactsBtn').addEventListener('click', async () => {
+    onClick('listArtifactsBtn', async () => {
       requireValue(state.sessionId, COPY.createSessionFirst);
       const payload = await api('GET', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/artifacts');
       const list = document.getElementById('artifactList');
       const artifacts = payload && payload.data && payload.data.artifacts;
       if (!artifacts || !artifacts.length) {
-        list.innerHTML = '<em>No artifacts yet</em>';
+        list.replaceChildren();
+        const empty = document.createElement('em');
+        empty.textContent = COPY.noArtifacts;
+        list.append(empty);
         return;
       }
-      list.innerHTML = artifacts.map(function(a) {
-        return '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;padding:8px;border-radius:10px;background:rgba(15,118,110,0.06);">'
-          + '<strong>' + (a.type || 'file') + '</strong>'
-          + '<span style="color:#5f6b82;font-size:.9rem;">' + a.fileName + ' (' + Math.round((a.sizeBytes||0)/1024) + ' KB)</span>'
-          + '<a href="' + a.downloadPath + '" target="_blank" download style="margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;">Download</a>'
-          + '</div>';
-      }).join('');
+      list.replaceChildren();
+      artifacts.forEach(function(a) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;padding:8px;border-radius:10px;background:rgba(15,118,110,0.06);';
+        const type = document.createElement('strong');
+        type.textContent = a.type || 'file';
+        const meta = document.createElement('span');
+        meta.style.cssText = 'color:#5f6b82;font-size:.9rem;';
+        meta.textContent = a.fileName + ' (' + Math.round((a.sizeBytes || 0) / 1024) + ' KB)';
+        const link = document.createElement('a');
+        link.href = a.downloadPath;
+        link.target = '_blank';
+        link.download = '';
+        link.textContent = COPY.downloadLabel;
+        link.style.cssText = 'margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;';
+        row.append(type, meta, link);
+        list.append(row);
+      });
     });
 
     syncInputs();
+    if (CONFIG.authRequired) {
+      setStatus(COPY.authRequiredNotice, false);
+    }
     refreshScripts().catch((error) => setStatus(error.message, true));
   </script>
 </body>
 </html>`;
 }
 
-function renderDemoTestPageV2(req) {
+function renderDemoTestPage(req) {
   const language = resolveRequestLanguage(req);
   const copy = getPageCopy(language).demo;
   const roleOptions = Array.isArray(copy.roleOptions) && copy.roleOptions.length
@@ -5670,7 +5314,7 @@ function renderDemoTestPageV2(req) {
   </main>
 
   <script>
-    const COPY = ${JSON.stringify(copy)};
+    const COPY = ${toInlineJson(copy)};
     const statusText = document.getElementById('statusText');
     const profileResult = document.getElementById('profileResult');
     const counterValue = document.getElementById('counterValue');
@@ -5734,7 +5378,7 @@ const runManager = new RunManager({
   registry: scriptRegistry,
 });
 const sessionManager = new SessionManager(config);
-const scriptAssistant = new ScriptAssistantV2({
+const scriptAssistant = new ScriptAssistant({
   ...config,
   registry: scriptRegistry,
   runManager,
@@ -5742,34 +5386,101 @@ const scriptAssistant = new ScriptAssistantV2({
 
 const app = express();
 app.disable("x-powered-by");
+
+app.use((req, res, next) => {
+  req.requestId = createId("req");
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
+
 app.use(express.json({ limit: config.bodyLimit }));
+
+// body-parser rejects malformed JSON and oversized bodies with its own error
+// shape; without this they surfaced as 500 INTERNAL_ERROR.
+app.use((error, req, res, next) => {
+  if (error && (error.type === "entity.parse.failed" || error instanceof SyntaxError)) {
+    return next(new ApiError(400, "INVALID_JSON", `Request body is not valid JSON: ${error.message}`));
+  }
+
+  if (error && error.type === "entity.too.large") {
+    return next(new ApiError(413, "BODY_TOO_LARGE", `Request body exceeds the ${config.bodyLimit} limit`));
+  }
+
+  return next(error);
+});
+
 app.use(documentationPaths.swaggerAssets, express.static(swaggerUiAssetDir));
 
 const mcpSessions = new Map();
 
-app.use((req, res, next) => {
-  if (!req.path.startsWith(config.mcpBasePath)) {
-    return next();
+// Same-origin requests from the built-in playground and loopback callers are
+// always safe; ALLOWED_ORIGINS only needs to list extra cross-origin clients.
+function isAllowedOrigin(req, origin) {
+  if (config.allowedOrigins.includes("*") || config.allowedOrigins.includes(origin)) {
+    return true;
   }
 
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  if (parsed.host === (req.headers["x-forwarded-host"] || req.get("host"))) {
+    return true;
+  }
+
+  return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+}
+
+app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!origin) {
     return next();
   }
 
-  if (!config.allowedOrigins.length) {
-    return next(new ApiError(403, "MCP_ORIGIN_DENIED", "Origin header is not allowed for MCP requests"));
+  if (!isAllowedOrigin(req, origin)) {
+    if (req.path.startsWith(config.mcpBasePath)) {
+      return next(new ApiError(403, "MCP_ORIGIN_DENIED", `Origin not allowed: ${origin}`));
+    }
+    return next();
   }
 
-  if (!config.allowedOrigins.includes(origin)) {
-    return next(new ApiError(403, "MCP_ORIGIN_DENIED", `Origin not allowed: ${origin}`));
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  // Streamable MCP clients read the session id off the initialize response, so
+  // it has to be exposed explicitly to cross-origin readers.
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, X-Request-Id");
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  return next();
+});
+
+// Optional shared-secret gate. The API can launch browsers and read files from
+// the configured directories, so any non-loopback deployment should set it.
+const publicPaths = new Set(["/health", "/", documentationPaths.docs, documentationPaths.openApi, documentationPaths.playground, "/demo/test-page"]);
+app.use((req, res, next) => {
+  if (!config.apiToken || publicPaths.has(req.path) || req.path.startsWith(documentationPaths.swaggerAssets)) {
+    return next();
+  }
+
+  const header = req.headers.authorization || "";
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const token = bearer || req.headers["x-api-token"] || "";
+  if (token !== config.apiToken) {
+    return next(new ApiError(401, "UNAUTHORIZED", "A valid API token is required"));
   }
 
   return next();
 });
 
 app.get("/", asyncRoute(async (req, res) => {
-  res.type("html").send(renderHomePageV2(req));
+  res.type("html").send(renderHomePage(req));
 }));
 
 app.get(documentationPaths.openApi, asyncRoute(async (req, res) => {
@@ -5781,11 +5492,11 @@ app.get(documentationPaths.docs, asyncRoute(async (req, res) => {
 }));
 
 app.get(documentationPaths.playground, asyncRoute(async (req, res) => {
-  res.type("html").send(renderPlaygroundPageV2(req));
+  res.type("html").send(renderPlaygroundPage(req));
 }));
 
 app.get("/demo/test-page", asyncRoute(async (req, res) => {
-  res.type("html").send(renderDemoTestPageV2(req));
+  res.type("html").send(renderDemoTestPage(req));
 }));
 
 app.get("/health", asyncRoute(async (req, res) => {
@@ -5793,9 +5504,25 @@ app.get("/health", asyncRoute(async (req, res) => {
     service: config.serviceName,
     version: config.serviceVersion,
     uptimeSec: Math.round(process.uptime()),
+    docker: isDocker,
     scriptCount: scriptRegistry.list().length,
     runCount: runManager.listRuns().length,
+    activeRunCount: runManager.countActiveRuns(),
     sessionCount: sessionManager.sessions.size,
+    mcpSessionCount: mcpSessions.size,
+    limits: {
+      maxSessions: config.maxSessions,
+      maxContextsPerSession: config.maxContextsPerSession,
+      maxPagesPerSession: config.maxPagesPerSession,
+      maxConcurrentRuns: config.maxConcurrentRuns,
+      maxRetainedRuns: config.maxRetainedRuns,
+    },
+    features: {
+      evaluate: config.enableEvaluate,
+      authRequired: Boolean(config.apiToken),
+      failureArtifacts: config.captureFailureArtifacts,
+      urlAllowlist: config.urlAllowlist,
+    },
   });
 }));
 
@@ -5809,24 +5536,25 @@ app.post(`${config.apiBasePath}/scripts/sync`, asyncRoute(async (req, res) => {
   ok(res, await scriptRegistry.sync());
 }));
 
-app.put(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
-  const scriptKey = req.params.scriptKey;
-  if (!scriptKey || scriptKey.includes("..")) {
-    throw new ApiError(400, "INVALID_SCRIPT_KEY", "Invalid script key");
-  }
-  const { content, fileName } = req.body || {};
+async function uploadScript({ scriptKey, content, fileName }) {
   if (!content || typeof content !== "string") {
     throw new ApiError(400, "INVALID_REQUEST", "content (string) is required");
   }
-  const ext = fileName && /\.(spec|test|pw)\.[^.]+$/i.test(fileName)
-    ? fileName.replace(/^.*(?=\.(spec|test|pw)\.)/, "")
-    : ".spec.js";
-  const filePath = path.join(config.scriptsDir, `${scriptKey}${ext}`);
-  await ensureDir(path.dirname(filePath));
-  await fsPromises.writeFile(filePath, content, "utf8");
+
+  const target = resolveScriptUploadPath(config.scriptsDir, scriptKey, fileName);
+  await ensureDir(path.dirname(target.absolutePath));
+  await fsPromises.writeFile(target.absolutePath, content, "utf8");
   await scriptRegistry.refresh();
-  console.log(`[scripts] uploaded scriptKey=${scriptKey} path=${filePath} size=${content.length}`);
-  ok(res, scriptRegistry.get(scriptKey));
+  console.log(`[scripts] uploaded scriptKey=${target.scriptKey} path=${target.absolutePath} size=${content.length}`);
+  return scriptRegistry.get(target.scriptKey);
+}
+
+app.put(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
+  ok(res, await uploadScript({
+    scriptKey: req.params.scriptKey,
+    content: req.body?.content,
+    fileName: req.body?.fileName,
+  }));
 }));
 
 app.delete(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
@@ -5896,6 +5624,21 @@ app.get(`${config.apiBasePath}/runs/:runId/logs`, asyncRoute(async (req, res) =>
   ok(res, runManager.getLogs(req.params.runId));
 }));
 
+app.get(`${config.apiBasePath}/runs/:runId/artifacts/:artifactPath(*)`, asyncRoute(async (req, res) => {
+  const artifact = await runManager.resolveArtifactPath(req.params.runId, req.params.artifactPath);
+  sendArtifact(req, res, artifact.absolutePath, artifact.fileName);
+}));
+
+app.delete(`${config.apiBasePath}/runs/:runId`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.deleteRun(req.params.runId));
+}));
+
+app.get(`${config.apiBasePath}/sessions`, asyncRoute(async (req, res) => {
+  ok(res, {
+    sessions: sessionManager.listSessions(),
+  });
+}));
+
 app.post(`${config.apiBasePath}/sessions`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.createSession(req.body || {}), 201);
 }));
@@ -5929,7 +5672,7 @@ app.get(`${config.apiBasePath}/sessions/:sessionId/artifacts`, asyncRoute(async 
 
 app.get(`${config.apiBasePath}/sessions/:sessionId/artifacts/:artifactId`, asyncRoute(async (req, res) => {
   const artifact = sessionManager.getArtifact(req.params.sessionId, req.params.artifactId);
-  res.download(artifact.absolutePath, artifact.fileName);
+  sendArtifact(req, res, artifact.absolutePath, artifact.fileName);
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/trace/start`, asyncRoute(async (req, res) => {
@@ -5977,7 +5720,11 @@ app.post(`${config.apiBasePath}/sessions/:sessionId/contexts/:contextId/cookies/
 }));
 
 app.get(`${config.apiBasePath}/sessions/:sessionId/contexts/:contextId/cookies`, asyncRoute(async (req, res) => {
-  ok(res, await sessionManager.getCookies(req.params.sessionId, req.params.contextId, req.body || {}));
+  // A GET body is not reliably delivered, so `urls` is read from the query string.
+  const urls = parseCsv(req.query.urls);
+  ok(res, await sessionManager.getCookies(req.params.sessionId, req.params.contextId, {
+    urls: urls.length ? urls : undefined,
+  }));
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/contexts/:contextId/permissions`, asyncRoute(async (req, res) => {
@@ -6105,16 +5852,7 @@ const mcpTools = [
   })),
   defineTool("script_get", "Get one registered Playwright script.", { type: "object", properties: { scriptKey: { type: "string" } }, required: ["scriptKey"] }, async (args) => scriptRegistry.get(args.scriptKey)),
   defineTool("script_sync", "Rescan the scripts directory and return git metadata when available.", { type: "object", properties: {} }, async () => scriptRegistry.sync()),
-  defineTool("script_upload", "Upload or replace a Playwright script file. Use this in offline environments where git sync is not available.", { type: "object", properties: { scriptKey: { type: "string", description: "Script key path (e.g. checkout/guest-order)" }, content: { type: "string", description: "Full script source code" }, fileName: { type: "string", description: "Optional file name with extension" } }, required: ["scriptKey", "content"] }, async (args) => {
-    const scriptKey = args.scriptKey;
-    if (!scriptKey || scriptKey.includes("..")) throw new ApiError(400, "INVALID_SCRIPT_KEY", "Invalid script key");
-    const ext = args.fileName && /\.(spec|test|pw)\.[^.]+$/i.test(args.fileName) ? args.fileName.replace(/^.*(?=\.(spec|test|pw)\.)/, "") : ".spec.js";
-    const filePath = path.join(config.scriptsDir, `${scriptKey}${ext}`);
-    await ensureDir(path.dirname(filePath));
-    await fsPromises.writeFile(filePath, args.content, "utf8");
-    await scriptRegistry.refresh();
-    return scriptRegistry.get(scriptKey);
-  }),
+  defineTool("script_upload", "Upload or replace a Playwright script file. Use this in offline environments where git sync is not available.", { type: "object", properties: { scriptKey: { type: "string", description: "Script key path (e.g. checkout/guest-order)" }, content: { type: "string", description: "Full script source code" }, fileName: { type: "string", description: "Optional file name with a .spec/.test/.pw extension" } }, required: ["scriptKey", "content"] }, async (args) => uploadScript(args)),
   defineTool("script_delete", "Delete a registered script file.", { type: "object", properties: { scriptKey: { type: "string" } }, required: ["scriptKey"] }, async (args) => {
     const script = scriptRegistry.get(args.scriptKey);
     await fsPromises.unlink(script.absolutePath);
@@ -6125,13 +5863,16 @@ const mcpTools = [
   defineTool("assist_capabilities", "Return LLM-friendly authoring capabilities, workflow hints, and supported locator/action vocabularies.", { type: "object", properties: {} }, async () => scriptAssistant.getCapabilities()),
   defineTool("assist_examples", "Return localized prompt examples, reusable step patterns, and locator guidance for LLM-driven script generation.", { type: "object", properties: { language: { type: "string" } } }, async (args) => scriptAssistant.examples(args)),
   defineTool("assist_plan", "Turn a natural-language test request into a structured scenario plan with suggested steps and MCP workflow.", { type: "object", properties: { goal: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, scriptKey: { type: "string" }, language: { type: "string" }, tags: { type: "array" }, locators: { type: "object" }, expectations: { type: "array" }, variables: { type: "object" }, storageStateRef: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.plan(args)),
-  defineTool("assist_scaffold", "Generate a Playwright script scaffold from a user goal or structured steps, optionally saving and validating it.", { type: "object", properties: { goal: { type: "string" }, testName: { type: "string" }, scriptKey: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, language: { type: "string" }, steps: { type: "array" }, variables: { type: "object" }, save: { type: "boolean" }, overwrite: { type: "boolean" }, validate: { type: "boolean" }, project: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.scaffold(args)),
+  defineTool("assist_scaffold", "Generate a Playwright script scaffold from a user goal or structured steps, optionally saving and validating it.", { type: "object", properties: { goal: { type: "string" }, testName: { type: "string" }, scriptKey: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, language: { type: "string", description: "Authoring locale for comments: ko or en." }, scriptLanguage: { type: "string", enum: ["js", "ts"], description: "Generated file language." }, steps: { type: "array" }, variables: { type: "object" }, save: { type: "boolean" }, overwrite: { type: "boolean" }, validate: { type: "boolean" }, project: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.scaffold(args)),
   defineTool("run_create", "Create a Playwright test run.", { type: "object", properties: { scriptKey: { type: "string" }, project: { type: "string" }, env: { type: "string" }, baseURL: { type: "string" }, grep: { type: "string" }, headed: { type: "boolean" }, trace: { type: "string" }, video: { type: "string" }, storageStateRef: { type: "string" }, shard: { type: "string" }, variables: { type: "object" } }, required: ["scriptKey"] }, async (args) => runManager.createRun(args)),
   defineTool("run_get", "Get one Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.serializeRun(runManager.getRun(args.runId))),
   defineTool("run_cancel", "Cancel a running Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.cancelRun(args.runId)),
   defineTool("run_artifacts", "List files produced by a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => ({ runId: args.runId, artifacts: await runManager.listArtifacts(args.runId) })),
   defineTool("run_report", "Get the JSON summary report for a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.getReport(args.runId)),
   defineTool("run_logs", "Get captured stdout and stderr for a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.getLogs(args.runId)),
+  defineTool("run_list", "List known runs, newest first.", { type: "object", properties: {} }, async () => ({ runs: runManager.listRuns() })),
+  defineTool("run_delete", "Delete a finished run and reclaim its artifacts from disk.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.deleteRun(args.runId)),
+  defineTool("session_list", "List active browser sessions.", { type: "object", properties: {} }, async () => ({ sessions: sessionManager.listSessions() })),
   defineTool("session_create", "Create a low-level browser session for debugging.", { type: "object", properties: { browserType: { type: "string" }, headless: { type: "boolean" }, ttlMs: { type: "number" } } }, async (args) => sessionManager.createSession(args)),
   defineTool("session_get", "Get one browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.serializeSession(sessionManager.getSession(args.sessionId))),
   defineTool("session_delete", "Close a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.closeSession(args.sessionId, "closed")),
@@ -6139,7 +5880,7 @@ const mcpTools = [
   defineTool("session_artifacts", "List artifacts captured in a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => ({ sessionId: args.sessionId, artifacts: await sessionManager.listArtifacts(args.sessionId) })),
   defineTool("session_actions", "List action and event logs for a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.listActions(args.sessionId)),
   defineTool("session_trace", "Start or stop Playwright tracing for a context.", { type: "object", properties: { sessionId: { type: "string" }, action: { type: "string" }, contextId: { type: "string" }, title: { type: "string" } }, required: ["sessionId", "action", "contextId"] }, async (args) => args.action === "start" ? sessionManager.startTrace(args.sessionId, args) : sessionManager.stopTrace(args.sessionId, args)),
-  defineTool("session_execute", "Execute a batch of page actions inside a session.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, steps: { type: "array" } }, required: ["sessionId", "pageId", "steps"] }, async (args) => sessionManager.execute(args.sessionId, args)),
+  defineTool("session_execute", "Execute a batch of page actions inside a session. The whole batch holds the session lock, so no other call can interleave.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, steps: { type: "array" }, continueOnError: { type: "boolean", description: "Keep running later steps after one fails." } }, required: ["sessionId", "pageId", "steps"] }, async (args) => sessionManager.execute(args.sessionId, args)),
   defineTool("context_create", "Create a browser context within a session.", { type: "object", properties: { sessionId: { type: "string" }, baseURL: { type: "string" }, viewport: { type: "object" }, locale: { type: "string" }, storageState: { type: "object" } }, required: ["sessionId"] }, async (args) => sessionManager.createContext(args.sessionId, args)),
   defineTool("context_get", "Get one browser context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.getContext(args.sessionId, args.contextId)),
   defineTool("context_delete", "Close one browser context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.closeContext(args.sessionId, args.contextId)),
@@ -6174,6 +5915,18 @@ function createMcpSession() {
   return sessionId;
 }
 
+// MCP sessions are just bookkeeping, but clients rarely send DELETE /mcp, so
+// they have to age out or the map grows for the lifetime of the process.
+const mcpCleanupTimer = setInterval(() => {
+  const cutoff = Date.now() - config.mcpSessionTtlMs;
+  for (const [sessionId, session] of mcpSessions) {
+    if (Date.parse(session.updatedAt) <= cutoff) {
+      mcpSessions.delete(sessionId);
+    }
+  }
+}, Math.min(config.mcpSessionTtlMs, 5 * 60 * 1000));
+mcpCleanupTimer.unref?.();
+
 function requireMcpSession(req, requestMessage) {
   const sessionId = req.header("Mcp-Session-Id");
   if (requestMessage?.method === "initialize") {
@@ -6199,6 +5952,10 @@ async function handleMcpRequest(req, message) {
     return undefined;
   }
 
+  // JSON-RPC notifications carry no id and must never receive a response, not
+  // even an error one.
+  const isNotification = message.id === undefined || message.id === null;
+
   if (message.method === "initialize") {
     return jsonRpcResult(message.id ?? null, {
       protocolVersion: config.protocolVersion,
@@ -6218,6 +5975,9 @@ async function handleMcpRequest(req, message) {
 
   switch (message.method) {
     case "notifications/initialized":
+    case "notifications/cancelled":
+    case "notifications/progress":
+    case "notifications/roots/list_changed":
       return undefined;
     case "ping":
       return jsonRpcResult(message.id ?? null, {});
@@ -6250,13 +6010,17 @@ async function handleMcpRequest(req, message) {
       }
     }
     default:
-      return jsonRpcError(message.id ?? null, -32601, `Method not found: ${message.method}`);
+      if (isNotification) {
+        return undefined;
+      }
+      return jsonRpcError(message.id, -32601, `Method not found: ${message.method}`);
   }
 }
 
 app.get(config.mcpBasePath, asyncRoute(async (req, res) => {
+  res.setHeader("Allow", "POST, DELETE");
   res.status(405).json({
-    error: "SSE stream is not enabled on this MCP endpoint.",
+    error: "SSE stream is not enabled on this MCP endpoint. Use POST for requests and DELETE to end the session.",
   });
 }));
 
@@ -6288,14 +6052,29 @@ app.post(config.mcpBasePath, asyncRoute(async (req, res) => {
   return res.status(200).json(Array.isArray(payload) ? responses : responses[0]);
 }));
 
+// Unknown routes must stay on the JSON contract; Express' default handler
+// returns an HTML error page.
+app.use((req, res, next) => {
+  next(new ApiError(404, "NOT_FOUND", `No route for ${req.method} ${req.path}`));
+});
+
 app.use((error, req, res, next) => {
   const apiError = toApiError(error);
-  res.status(apiError.statusCode).json({
+  if (apiError.statusCode >= 500) {
+    console.error(`[error] ${req.method} ${req.path} requestId=${req.requestId} ${apiError.code}`, error);
+  }
+
+  if (res.headersSent) {
+    return res.end();
+  }
+
+  return res.status(apiError.statusCode).json({
     success: false,
     error: {
       code: apiError.code,
       message: apiError.message,
       details: apiError.details,
+      requestId: req.requestId,
     },
     artifacts: apiError.artifacts,
   });
@@ -6303,28 +6082,56 @@ app.use((error, req, res, next) => {
 
 const server = app.listen(config.port, config.host, () => {
   console.log(`${config.serviceName} listening on http://${config.host}:${config.port}`);
+  if (config.apiToken) {
+    console.log("API_TOKEN is set — /api and /mcp require a bearer token");
+  }
   if (isDocker) {
-    console.log("Docker environment detected — Chromium: channel=chromium, --disable-gpu --no-sandbox --disable-dev-shm-usage");
+    console.log("Docker environment detected - Chromium: channel=chromium, --disable-gpu --no-sandbox --disable-dev-shm-usage");
   }
 });
 
+// Without this, a busy port surfaced as an unhandled 'error' event and a raw
+// stack trace instead of an actionable message.
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(`port ${config.port} is already in use — set PORT to a free port`);
+  } else {
+    console.error("server failed to start", error);
+  }
+  process.exit(1);
+});
+
+let shuttingDown = false;
+
 async function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
   console.log(`received ${signal}, shutting down`);
-  server.close();
+  await new Promise((resolve) => {
+    server.close(resolve);
+    setTimeout(resolve, 5000).unref?.();
+  });
+  // Spawned Playwright runs are children of this process; leaving them behind
+  // orphaned browsers on every container restart.
+  await runManager.killAll();
   await sessionManager.shutdown();
   process.exit(0);
 }
 
-process.on("SIGINT", () => {
-  shutdown("SIGINT").catch((error) => {
-    console.error("graceful shutdown failed", error);
-    process.exit(1);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    shutdown(signal).catch((error) => {
+      console.error("graceful shutdown failed", error);
+      process.exit(1);
+    });
   });
-});
+}
 
-process.on("SIGTERM", () => {
-  shutdown("SIGTERM").catch((error) => {
-    console.error("graceful shutdown failed", error);
-    process.exit(1);
-  });
+// A rejected promise in a detached listener (a page event, a run's close
+// handler) must not be allowed to take the whole server down.
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandled rejection", reason);
 });

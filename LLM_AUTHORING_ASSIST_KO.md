@@ -74,9 +74,11 @@ Playwright 스크립트 초안을 생성합니다.
 지원 기능:
 
 - `goal` 또는 `steps` 기반 스캐폴드 생성
-- `validate: true` 시 생성 직후 검증
+- `validate: true` 시 생성 직후 검증 (임시 검증 디렉터리는 즉시 정리됩니다)
 - `save: true` 시 `scripts/` 아래에 파일 저장
 - `overwrite: true` 시 기존 파일 덮어쓰기
+- `language` 는 주석/문구 언어(`ko`/`en`), `scriptLanguage` 는 생성 파일 언어(`js`/`ts`)입니다.
+- assertion 단계는 `value` 와 `expected` 를 모두 인식합니다.
 
 입력 예시:
 

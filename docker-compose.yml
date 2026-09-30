@@ -11,6 +11,10 @@ services:
       PORT: "3000"
       DEFAULT_HEADLESS: "true"
       ENABLE_EVALUATE: "true"
+      # Set API_TOKEN for any deployment reachable beyond localhost.
+      # API_TOKEN: "change-me"
+      # Restrict which hosts sessions may navigate to:
+      # URL_ALLOWLIST: "example.com,*.internal.example.com"
     volumes:
       - ./scripts:/app/scripts
       - ./storage-states:/app/storage-states

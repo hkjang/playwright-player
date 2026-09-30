@@ -1,13 +1,14 @@
 {
   "name": "playwright-player",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Stateful Playwright REST API with script runs and Streamable MCP support",
+  "description": "Stateful Playwright REST API with script runs, Streamable MCP support, and an offline-friendly playground",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "test": "node tools/smoke-test.mjs"
   },
   "engines": {
     "node": ">=22"

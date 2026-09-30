@@ -19,10 +19,11 @@
 - 페이지 구조 분석용 `page_inspect`
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
+- `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
 
 ## 스크립트 규칙
 
-`/app/scripts` 아래의 다음 패턴을 자동 등록합니다.
+`/app/scripts` 아래의 다음 패턴을 자동 등록합니다. 업로드 경로는 항상 `SCRIPTS_DIR` 안으로 제한되고, 위 확장자가 아니면 거부됩니다.
 
 - `*.spec.js`
 - `*.spec.ts`
@@ -48,8 +49,19 @@
 
 ```bash
 npm install
+npx playwright install chromium
 node server.js
 ```
+
+### 스모크 테스트
+
+서버를 임시 포트와 임시 데이터 디렉터리로 띄워 REST, MCP, 실제 브라우저 세션까지 한 번에 검증합니다.
+
+```bash
+npm test
+```
+
+브라우저가 설치되지 않은 오프라인 체크아웃에서는 브라우저 의존 항목이 실패가 아니라 `SKIP` 으로 표시됩니다.
 
 ### Docker
 
@@ -79,15 +91,20 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 
 - `GET /api/scripts`
 - `GET /api/scripts/{scriptKey}`
+- `PUT /api/scripts/{scriptKey}`
+- `DELETE /api/scripts/{scriptKey}`
 - `POST /api/scripts/sync`
 - `POST /api/scripts/validate`
 
 ### Runs
 
 - `POST /api/runs`
+- `GET /api/runs`
 - `GET /api/runs/{runId}`
+- `DELETE /api/runs/{runId}`
 - `POST /api/runs/{runId}/cancel`
 - `GET /api/runs/{runId}/artifacts`
+- `GET /api/runs/{runId}/artifacts/{relativePath}`
 - `GET /api/runs/{runId}/report`
 - `GET /api/runs/{runId}/logs`
 
@@ -120,6 +137,9 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 
 ### Sessions
 
+전체 목록은 Swagger UI(`/docs`)에 모두 문서화되어 있습니다.
+
+- `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/{sessionId}`
 - `DELETE /api/sessions/{sessionId}`
@@ -143,14 +163,14 @@ MCP endpoint 는 `/mcp` 입니다.
   현재 SSE stream 은 열지 않고 `405` 를 반환합니다.
 - `DELETE /mcp`
 
-초기화 응답 헤더의 `Mcp-Session-Id` 값을 이후 요청에 계속 넣으면 됩니다.
+초기화 응답 헤더의 `Mcp-Session-Id` 값을 이후 요청에 계속 넣으면 됩니다. 같은 origin 과 loopback 에서 오는 호출은 항상 허용되고, 그 밖의 origin 은 `ALLOWED_ORIGINS` 에 등록해야 합니다. JSON-RPC notification 은 규격대로 본문 없는 `202` 로 응답합니다.
 
 제공 도구:
 
-- `script_list`, `script_get`, `script_sync`, `script_validate`
+- `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
-- `run_create`, `run_get`, `run_cancel`, `run_artifacts`, `run_report`, `run_logs`
-- `session_create`, `session_get`, `session_delete`, `session_keepalive`
+- `run_create`, `run_list`, `run_get`, `run_cancel`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
+- `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`
 - `context_create`, `context_get`, `context_delete`
 - `context_storage_export`, `context_storage_import`
 - `context_route_add`, `context_route_remove`
@@ -160,9 +180,63 @@ MCP endpoint 는 `/mcp` 입니다.
 - `page_screenshot`, `page_pdf`
 - `session_trace`, `session_execute`, `session_artifacts`, `session_actions`
 
+## 환경 변수
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `PORT` | `3000` | 수신 포트 |
+| `API_BASE_PATH` | `/api` | REST prefix |
+| `MCP_BASE_PATH` | `/mcp` | MCP endpoint |
+| `API_TOKEN` | 없음 | 설정하면 `/api` 와 `/mcp` 가 `Authorization: Bearer <token>` 을 요구합니다. `/health`, 내장 페이지, Swagger 정적 파일은 계속 공개됩니다. localhost 밖으로 노출되는 배포에서는 반드시 설정하세요. |
+| `ALLOWED_ORIGINS` | 없음 | MCP 를 호출할 수 있는 추가 cross-origin 목록입니다. same-origin 과 loopback 은 항상 허용됩니다. |
+| `URL_ALLOWLIST` | 없음 | `page.goto` 가 접근할 수 있는 host 목록입니다. `*.example.com` 형태를 지원합니다. |
+| `ENABLE_EVALUATE` | `true` | `false` 면 `page.evaluate` 가 `403` 을 반환합니다. |
+| `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
+| `MAX_SESSIONS` | `10` | 동시 브라우저 세션 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED` |
+| `MAX_CONTEXTS_PER_SESSION` | `5` | 세션당 컨텍스트 상한 |
+| `MAX_PAGES_PER_SESSION` | `10` | 세션당 페이지 상한 |
+| `MAX_CONCURRENT_RUNS` | `4` | 동시 run 상한. 초과 시 `429 RUN_LIMIT_EXCEEDED` |
+| `MAX_RETAINED_RUNS` | `50` | 이 개수를 넘으면 오래된 run 기록과 디스크 산출물을 정리합니다. |
+| `SESSION_TTL_MS` | `1800000` | 세션 만료 시간 |
+| `MCP_SESSION_TTL_MS` | `3600000` | MCP 세션 기록 만료 시간 |
+| `CAPTURE_FAILURE_ARTIFACTS` | `true` | 실패 시 스크린샷/DOM 저장 여부. 요청 본문이 잘못된 `4xx` 는 저장하지 않고, 타임아웃과 실제 자동화 실패만 저장합니다. |
+| `PURGE_SESSION_ARTIFACTS_ON_CLOSE` | `false` | `true` 면 세션 종료 시 아티팩트 디렉터리를 삭제합니다. |
+| `DEFAULT_BROWSER_TYPE` | `chromium` | 기본 브라우저 |
+| `DEFAULT_HEADLESS` | `true` | 기본 headless 여부 |
+| `PLAYWRIGHT_LAUNCH_ARGS` | 없음 | 브라우저 launch 인자 (CSV) |
+| `BODY_LIMIT` | `5mb` | 요청 본문 상한 |
+
+## 오류 응답
+
+모든 오류는 동일한 형태로 반환됩니다. 알 수 없는 경로와 잘못된 JSON 도 HTML 대신 이 형태를 따릅니다.
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "key is required for press (for example \"Enter\")",
+    "details": { "sessionId": "sess_...", "pageId": "page_..." },
+    "requestId": "req_..."
+  }
+}
+```
+
+주요 코드:
+
+- `400 INVALID_REQUEST`, `400 INVALID_JSON`, `400 INVALID_LOCATOR`, `400 PATH_OUTSIDE_ROOT`
+- `401 UNAUTHORIZED`
+- `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`
+- `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
+- `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
+- `409 SESSION_DISCONNECTED`, `409 TRACE_NOT_STARTED`, `409 SCRIPT_ALREADY_EXISTS`
+- `429 SESSION_LIMIT_EXCEEDED`, `429 RUN_LIMIT_EXCEEDED`
+
 ## 주의 사항
 
 - `proxy` 를 context 수준에서 동적으로 바꾸는 기능은 이번 구현에 포함하지 않았습니다.
+- `storage-state/import` 는 컨텍스트를 새로 만들기 때문에 기존 페이지가 닫힙니다. 응답의 `replacedPages` 에 닫힌 page id 가 담기며, 이후 `pages` 를 다시 생성해야 합니다.
+- `sessions/{id}/execute` 는 배치 전체가 하나의 세션 락 안에서 실행되므로 중간에 다른 요청이 끼어들지 않습니다. `continueOnError: true` 를 주면 실패한 단계 이후도 계속 진행하고 단계별 결과를 모두 반환합니다.
 - MCP는 Streamable HTTP 규격의 POST/DELETE 중심으로 구현했고, GET 기반 SSE stream 은 아직 비활성화했습니다.
 - 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션과 런 상태는 초기화됩니다.
 
