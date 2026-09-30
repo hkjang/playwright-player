@@ -10,7 +10,7 @@
 ## 포함된 기능
 
 - `scripts` 레지스트리 스캔, 상세 조회, sync, validate
-- `runs` 생성, 상태 조회, 취소, 로그, 리포트, 아티팩트 목록
+- `runs` 대기열 기반 실행, 디스크 영속 이력, 재시작 복구, 스크립트 버전 고정, 취소·재시도, 로그·리포트·아티팩트
 - `sessions / contexts / pages` 기반의 상태 유지형 브라우저 제어
 - locator 기반 `click / fill / press / hover / drag / evaluate / query`
 - `assert/visible`, `assert/text`, `assert/url`, `assert/count`
@@ -116,6 +116,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 - `GET /api/runs/{runId}`
 - `DELETE /api/runs/{runId}`
 - `POST /api/runs/{runId}/cancel`
+- `GET /api/queue`
+- `POST /api/runs/{runId}/retry`
 - `GET /api/runs/{runId}/artifacts`
 - `GET /api/runs/{runId}/artifacts/{relativePath}`
 - `GET /api/runs/{runId}/report`
@@ -182,7 +184,7 @@ MCP endpoint 는 `/mcp` 입니다.
 
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
-- `run_create`, `run_list`, `run_get`, `run_cancel`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
+- `run_create`, `run_list`, `run_queue`, `run_get`, `run_cancel`, `run_retry`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
 - `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`
 - `context_create`, `context_get`, `context_delete`
 - `context_storage_export`, `context_storage_import`
@@ -215,7 +217,9 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_SESSIONS` | `10` | 동시 브라우저 세션 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED` |
 | `MAX_CONTEXTS_PER_SESSION` | `5` | 세션당 컨텍스트 상한 |
 | `MAX_PAGES_PER_SESSION` | `10` | 세션당 페이지 상한 |
-| `MAX_CONCURRENT_RUNS` | `4` | 동시 run 상한. 초과 시 `429 RUN_LIMIT_EXCEEDED` |
+| `MAX_CONCURRENT_RUNS` | `4` | 동시 실행 상한. 초과분은 대기열로 들어갑니다 |
+| `MAX_QUEUED_RUNS` | `100` | 대기열 상한. 초과 시 `429 RUN_QUEUE_FULL` |
+| `REQUEUE_INTERRUPTED_RUNS` | `false` | 재시작 시 중단된 실행을 다시 대기열에 넣을지. 재실행이 안전한 시나리오에서만 켜세요 |
 | `MAX_RETAINED_RUNS` | `50` | 이 개수를 넘으면 오래된 run 기록과 디스크 산출물을 정리합니다. |
 | `SESSION_TTL_MS` | `1800000` | 세션 만료 시간 |
 | `MCP_SESSION_TTL_MS` | `3600000` | MCP 세션 기록 만료 시간 |
@@ -235,6 +239,66 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 3. 페이지 단위: `POST /api/sessions/{id}/pages/{pageId}/dialog-policy`
 
 처리 결과는 페이지 응답의 `lastDialog` 와 `sessions/{id}/actions` 의 이벤트 로그에서 확인할 수 있습니다.
+
+## 실행 이력과 대기열
+
+실행 기록은 디스크에 남습니다. 컨테이너를 재시작해도 이전 실행 결과와 증적을 조회할 수 있습니다. 외부 DB 없이 `RUNS_DIR/<runId>/` 아래에 다음을 둡니다.
+
+| 파일 | 내용 |
+| --- | --- |
+| `run.json` | 요청, 상태 전이, 종료 코드, 요약, 테스트별 결과. 임시 파일에 쓰고 rename 하므로 중간에 죽어도 잘린 레코드가 남지 않습니다 |
+| `logs.jsonl` | stdout/stderr 전체(append). 메모리에는 최신 `MAX_RUN_LOG_ENTRIES` 줄만 유지합니다 |
+| `script/<파일명>` | 큐에 넣은 시점의 스크립트 스냅샷 |
+| `report.json`, `html-report/`, `test-results/` | 기존 Playwright 산출물 |
+
+`run.json` 과 `logs.jsonl` 은 전용 엔드포인트가 있으므로 아티팩트 목록에는 포함되지 않습니다.
+
+### 대기열
+
+`MAX_CONCURRENT_RUNS` 를 넘는 요청은 거부되지 않고 대기열에 들어갑니다. 대기열이 `MAX_QUEUED_RUNS` 까지 차면 `429 RUN_QUEUE_FULL` 입니다.
+
+```
+POST /api/runs               → status: "running" (빈 슬롯이 있으면) 또는 "queued"
+GET  /api/queue              → 대기 순서, 실행 중 개수, 상한
+POST /api/runs/{id}/cancel   → 대기 중이면 즉시 cancelled
+```
+
+`priority` 가 높은 요청이 먼저 실행되고, 같으면 먼저 들어온 순서입니다.
+
+### 상태
+
+| 상태 | 의미 |
+| --- | --- |
+| `queued` | 슬롯 대기 중 |
+| `running` | 실행 중 |
+| `completed` / `failed` / `cancelled` | 종료 |
+| `interrupted` | 실행 중에 서버가 내려감. 자식 프로세스가 함께 죽었으므로 재개할 수 없습니다 |
+
+재시작 시 `queued` 였던 실행은 대기열로 복구되고, `running` 이었던 실행은 `interrupted` 로 표시됩니다. `REQUEUE_INTERRUPTED_RUNS=true` 를 주면 중단된 실행도 다시 대기열에 넣습니다 — **다만 신청·발송·결제처럼 재실행이 안전하지 않은 시나리오에서는 켜지 마세요.** 기본값은 `false` 입니다.
+
+`POST /api/runs/{runId}/retry` 는 종료된 실행과 같은 요청으로 새 실행을 큐에 넣습니다. 원본은 그대로 남고 새 실행에 `retryOf` 와 `attempt` 가 기록됩니다.
+
+### 스크립트 버전 고정
+
+실행을 큐에 넣는 시점에 스크립트를 복사하고 sha256 을 기록합니다. 대기 중에 파일이 수정·삭제되어도 그 실행은 스냅샷으로 수행되므로, 저장된 결과가 어떤 코드에 대한 것인지 항상 확정됩니다.
+
+```json
+"script": {
+  "scriptKey": "checkout/guest-order",
+  "sha256": "511a72cbbe2610df...",
+  "sizeBytes": 1284,
+  "git": { "available": true, "branch": "main", "commit": "c33c3f6b..." }
+}
+```
+
+### 조회
+
+```
+GET /api/runs?status=failed,interrupted&scriptKey=checkout/guest-order&limit=50&offset=0
+GET /api/runs/{runId}                    → tests[] 에 테스트별 상태·소요시간·오류
+GET /api/runs/{runId}/logs?limit=500     → 메모리 창을 벗어나면 디스크에서 읽습니다
+GET /api/runs/{runId}/artifacts/{relativePath}
+```
 
 ## Locator 검증
 
@@ -298,7 +362,7 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
 - `409 SESSION_DISCONNECTED`, `409 TRACE_NOT_STARTED`, `409 SCRIPT_ALREADY_EXISTS`
-- `429 SESSION_LIMIT_EXCEEDED`, `429 RUN_LIMIT_EXCEEDED`
+- `429 SESSION_LIMIT_EXCEEDED`, `429 RUN_QUEUE_FULL`
 
 ## 주의 사항
 
@@ -308,7 +372,7 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 - `URL_ALLOWLIST` 는 세션 브라우저의 **모든 요청**에 적용됩니다(리다이렉트·iframe·XHR 포함). 다만 `POST /api/runs` 로 실행되는 스크립트는 별도 프로세스이므로 이 정책이 적용되지 않습니다. 실행 격리는 다음 단계 과제입니다.
 - `page.evaluate` 의 `expression` 은 `"() => document.title"` 같은 함수 형태와 `"1 + 2"` 같은 단순 식을 모두 지원하며, 함수인 경우 `arg` 가 인자로 전달됩니다.
 - MCP는 Streamable HTTP 규격의 POST/DELETE 중심으로 구현했고, GET 기반 SSE stream 은 아직 비활성화했습니다.
-- 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션과 런 상태는 초기화됩니다.
+- 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션은 사라지지만, 실행 이력과 증적은 `RUNS_DIR` 에 남아 계속 조회할 수 있습니다.
 
 ## 내장 페이지
 

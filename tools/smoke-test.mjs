@@ -64,6 +64,27 @@ async function call(method, urlPath, body, { auth = true, headers = {} } = {}) {
   return { status: response.status, payload, headers: response.headers };
 }
 
+// Runs are queued, so a test that needs them finished has to wait for the whole
+// set rather than assume the first one started immediately.
+async function waitForRuns(runIds, timeoutMs = 180_000) {
+  const deadline = Date.now() + timeoutMs;
+  const pending = new Set(runIds);
+  while (pending.size && Date.now() < deadline) {
+    for (const runId of [...pending]) {
+      const { status, payload } = await call("GET", `/api/runs/${runId}`);
+      if (status !== 200 || ["completed", "failed", "cancelled", "interrupted"].includes(payload.data.status)) {
+        pending.delete(runId);
+      }
+    }
+    if (pending.size) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  if (pending.size) {
+    throw new Error(`runs did not finish within ${timeoutMs}ms: ${[...pending].join(", ")}`);
+  }
+}
+
 async function waitForHealth(url = baseUrl) {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     try {
@@ -144,6 +165,303 @@ async function start() {
 }
 
 let stopping = false;
+
+// The point of persisting runs is surviving a restart, so this starts a server,
+// produces history, kills it without a graceful shutdown, starts a new process
+// against the same RUNS_DIR, and queries what came back.
+async function runRestartChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-restart-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "restart.spec.js"),
+    "import { test, expect } from \"@playwright/test\";\n\ntest(\"restart evidence\", async () => {\n  expect(1).toBe(1);\n});\n",
+    "utf8",
+  );
+
+  const restartPort = port + 2;
+  const restartUrl = `http://127.0.0.1:${restartPort}`;
+  const env = {
+    PORT: String(restartPort),
+    HOST: "127.0.0.1",
+    SCRIPTS_DIR: scriptsDir,
+    RUNS_DIR: path.join(dataDir, "runs"),
+    ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+    STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+    MAX_CONCURRENT_RUNS: "1",
+  };
+
+  const spawnServer = async () => {
+    const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+      cwd: rootDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...env },
+    });
+    const log = [];
+    proc.stdout.on("data", (chunk) => log.push(chunk.toString()));
+    proc.stderr.on("data", (chunk) => log.push(chunk.toString()));
+    await waitForHealth(restartUrl);
+    return { proc, log };
+  };
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${restartUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  const waitFor = async (runId) => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const { payload } = await api("GET", `/api/runs/${runId}`);
+      if (["completed", "failed", "cancelled", "interrupted"].includes(payload.data.status)) {
+        return payload.data;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`run ${runId} never finished`);
+  };
+
+  let first;
+  try {
+    first = await spawnServer();
+  } catch (error) {
+    record("restart recovery checks", "fail", error.message);
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+    return;
+  }
+
+  let finishedRunId;
+  let queuedRunId;
+  let runningRunId;
+  try {
+    const done = await api("POST", "/api/runs", { scriptKey: "restart", project: "chromium" });
+    if (done.status !== 201) {
+      record("restart recovery checks", "fail", done.payload?.error?.message || `HTTP ${done.status}`);
+      return;
+    }
+    finishedRunId = done.payload.data.runId;
+    const finished = await waitFor(finishedRunId);
+    if (finished.status !== "completed") {
+      const message = (await api("GET", `/api/runs/${finishedRunId}/logs`)).payload.data.logs
+        .map((entry) => entry.line).join(" ").slice(0, 200);
+      const browserMissing = /Executable doesn't exist|playwright install/i.test(message);
+      if (browserMissing && !requireBrowser) {
+        record("restart recovery checks", "skip", "no Playwright browser installed");
+        return;
+      }
+      record("restart recovery checks", "fail", `seed run ${finished.status}: ${message}`);
+      return;
+    }
+
+    // One running and one queued when the process dies.
+    runningRunId = (await api("POST", "/api/runs", { scriptKey: "restart", project: "chromium" })).payload.data.runId;
+    queuedRunId = (await api("POST", "/api/runs", { scriptKey: "restart", project: "chromium" })).payload.data.runId;
+  } finally {
+    // SIGKILL: no graceful shutdown, no chance to write anything on the way out.
+    first.proc.kill("SIGKILL");
+    await new Promise((resolve) => first.proc.on("exit", resolve));
+  }
+
+  let second;
+  try {
+    second = await spawnServer();
+  } catch (error) {
+    record("restart recovery checks", "fail", `restart failed: ${error.message}`);
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+    return;
+  }
+
+  try {
+    await check("a completed run's result survives a hard restart", async () => {
+      const { status, payload } = await api("GET", `/api/runs/${finishedRunId}`);
+      assert(status === 200, `run lookup returned ${status}`);
+      assert(payload.data.status === "completed", payload.data.status);
+      assert(payload.data.tests.length > 0, "per-test results were lost");
+      assert(payload.data.tests[0].title.includes("restart evidence"), JSON.stringify(payload.data.tests[0]));
+      assert(payload.data.script?.sha256, "the pinned script hash was lost");
+    });
+
+    await check("evidence stays downloadable after a hard restart", async () => {
+      const artifacts = await api("GET", `/api/runs/${finishedRunId}/artifacts`);
+      const names = artifacts.payload.data.artifacts.map((entry) => entry.relativePath);
+      assert(names.includes("report.json"), `artifacts lost: ${names.join(", ")}`);
+      const download = await fetch(`${restartUrl}/api/runs/${finishedRunId}/artifacts/report.json`);
+      assert(download.ok, `artifact download returned ${download.status}`);
+    });
+
+    await check("logs written by the previous process are still readable", async () => {
+      const { payload } = await api("GET", `/api/runs/${finishedRunId}/logs`);
+      assert(payload.data.source === "file", `read from ${payload.data.source}, expected the on-disk log`);
+      assert(payload.data.logs.length > 0, "no log lines recovered");
+      assert(payload.data.logs.some((entry) => entry.line.includes("passed")), "the run output was lost");
+    });
+
+    await check("a run interrupted by the restart is reported, not silently lost", async () => {
+      const { payload } = await api("GET", `/api/runs/${runningRunId}`);
+      assert(payload.data.status === "interrupted", payload.data.status);
+      assert(payload.data.interruptedReason, "no reason recorded");
+      assert(payload.data.endedAt, "no end time recorded");
+    });
+
+    await check("a run that was still queued is picked back up", async () => {
+      const { payload } = await api("GET", `/api/runs/${queuedRunId}`);
+      assert(["queued", "running", "completed"].includes(payload.data.status),
+        `queued run came back as ${payload.data.status}`);
+      const finished = await waitFor(queuedRunId);
+      assert(finished.status === "completed", `requeued run ended as ${finished.status}`);
+    });
+
+    await check("history can be filtered by status after a restart", async () => {
+      const interrupted = await api("GET", "/api/runs?status=interrupted");
+      assert(interrupted.payload.data.runs.length === 1, `${interrupted.payload.data.runs.length} interrupted runs`);
+      assert(interrupted.payload.data.runs[0].runId === runningRunId, "wrong run reported as interrupted");
+
+      const completed = await api("GET", "/api/runs?status=completed&limit=1");
+      assert(completed.payload.data.limit === 1, "limit was ignored");
+      assert(completed.payload.data.total >= 1, "no completed runs in history");
+    });
+  } finally {
+    second.proc.kill("SIGKILL");
+    await new Promise((resolve) => second.proc.on("exit", resolve));
+  }
+
+  // RUNS_DIR is normally a mounted volume, so the same data can legitimately
+  // appear at a different absolute path in the next lifetime. Stored records
+  // hold absolute paths, so this checks they are re-derived and not trusted.
+  const movedRuns = path.join(dataDir, "runs-moved");
+  let third;
+  try {
+    await fsPromises.rename(path.join(dataDir, "runs"), movedRuns);
+    env.RUNS_DIR = movedRuns;
+    third = await spawnServer();
+
+    await check("history survives RUNS_DIR being remounted at a new path", async () => {
+      const { status, payload } = await api("GET", `/api/runs/${finishedRunId}`);
+      assert(status === 200, `run lookup returned ${status}`);
+      assert(payload.data.paths.runDir.startsWith(movedRuns),
+        `stale path kept: ${payload.data.paths.runDir}`);
+
+      const download = await fetch(`${restartUrl}/api/runs/${finishedRunId}/artifacts/report.json`);
+      assert(download.ok, `artifact download returned ${download.status}`);
+
+      const logs = await api("GET", `/api/runs/${finishedRunId}/logs`);
+      assert(logs.payload.data.logs.length > 0, "logs unreadable after the move");
+    });
+  } catch (error) {
+    record("history survives RUNS_DIR being remounted at a new path", "fail", error.message);
+  } finally {
+    if (third) {
+      third.proc.kill("SIGKILL");
+      await new Promise((resolve) => third.proc.on("exit", resolve));
+    }
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+// Retention used to drop any run that was not "running", which after the queue
+// landed also matched "queued" - a waiting run could be deleted out from under
+// the queue.
+async function runRetentionChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-retain-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "retain.spec.js"),
+    "import { test, expect } from \"@playwright/test\";\n\ntest(\"retain\", async () => {\n  expect(1).toBe(1);\n});\n",
+    "utf8",
+  );
+
+  const retainPort = port + 3;
+  const retainUrl = `http://127.0.0.1:${retainPort}`;
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(retainPort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: scriptsDir,
+      RUNS_DIR: path.join(dataDir, "runs"),
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      MAX_CONCURRENT_RUNS: "1",
+      MAX_RETAINED_RUNS: "2",
+    },
+  });
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${retainUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  try {
+    await waitForHealth(retainUrl);
+
+    await check("retention never prunes a run that is still queued", async () => {
+      // Four runs, one slot, retention of two: pruning is forced to happen while
+      // other runs are still waiting. `status !== "running"` used to match
+      // "queued" too, so those waiting runs were deleted out from under the queue.
+      const created = [];
+      for (let index = 0; index < 4; index += 1) {
+        const response = await api("POST", "/api/runs", { scriptKey: "retain", project: "chromium" });
+        assert(response.status === 201, `create ${index} returned ${response.status}`);
+        created.push(response.payload.data.runId);
+      }
+
+      // Waiting for every run to finish is slow and unnecessary; the invariant
+      // only concerns runs while they are queued.
+      const deadline = Date.now() + 300_000;
+      const seenQueued = new Set();
+      let pending = new Set(created);
+      while (pending.size && Date.now() < deadline) {
+        for (const runId of [...pending]) {
+          const { status, payload } = await api("GET", `/api/runs/${runId}`);
+          assert(status === 200, `run ${runId} disappeared from history while queued (HTTP ${status})`);
+          if (payload.data.status === "queued") {
+            seenQueued.add(runId);
+          } else {
+            pending.delete(runId);
+          }
+        }
+        if (pending.size) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+
+      assert(pending.size === 0, `runs never left the queue: ${[...pending].join(", ")}`);
+      assert(seenQueued.size >= 2, `only ${seenQueued.size} runs were ever queued; pruning was not exercised`);
+
+      // Retention really did fire: with a cap of two, the earliest finished runs
+      // must be gone even though later ones were queued the whole time.
+      const remaining = await api("GET", "/api/runs?limit=500");
+      assert(remaining.payload.data.total <= 3,
+        `retention did not prune: ${remaining.payload.data.total} records kept with MAX_RETAINED_RUNS=2`);
+
+      const missing = [];
+      for (const runId of created) {
+        const { status } = await api("GET", `/api/runs/${runId}`);
+        if (status === 404) {
+          missing.push(runId);
+        }
+      }
+      assert(missing.length > 0, "nothing was pruned, so the regression could not have been detected");
+    });
+
+  } catch (error) {
+    record("retention never prunes a run that is still queued", "fail", error.message);
+  } finally {
+    proc.kill("SIGKILL");
+    await new Promise((resolve) => proc.on("exit", resolve));
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
 
 async function runAllowlistChecks() {
   let extra;
@@ -428,26 +746,137 @@ async function run() {
     await call("DELETE", "/api/scripts/env-probe");
   });
 
-  await check("concurrent run requests cannot exceed the limit", async () => {
-    // MAX_CONCURRENT_RUNS is 2 for this harness. Fired together, these used to
-    // all pass the check before any of them registered.
+  await check("excess runs queue instead of being rejected, and the limit holds", async () => {
+    // MAX_CONCURRENT_RUNS is 2 for this harness. Every request is accepted; the
+    // ones that cannot start yet wait in the queue.
     const responses = await Promise.all(
       Array.from({ length: 6 }, () => call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" })),
     );
-    const accepted = responses.filter((entry) => entry.status === 201);
-    const rejected = responses.filter((entry) => entry.payload?.error?.code === "RUN_LIMIT_EXCEEDED");
-    assert(accepted.length <= 2, `${accepted.length} runs accepted, limit is 2`);
-    assert(rejected.length === responses.length - accepted.length, "unexpected rejection reason");
+    assert(responses.every((entry) => entry.status === 201),
+      `not all accepted: ${JSON.stringify(responses.map((entry) => entry.status))}`);
 
-    for (const entry of accepted) {
-      const runId = entry.payload.data.runId;
-      let status = "running";
-      for (let attempt = 0; attempt < 120 && status === "running"; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        status = (await call("GET", `/api/runs/${runId}`)).payload.data.status;
-      }
+    const running = responses.filter((entry) => entry.payload.data.status === "running");
+    const queued = responses.filter((entry) => entry.payload.data.status === "queued");
+    assert(running.length <= 2, `${running.length} started at once, limit is 2`);
+    assert(queued.length === 6 - running.length, "the rest should be queued");
+
+    const snapshot = await call("GET", "/api/queue");
+    assert(snapshot.payload.data.running <= 2, `queue reports ${snapshot.payload.data.running} running`);
+    assert(snapshot.payload.data.entries.every((entry, index) => entry.position === index),
+      "queue positions must be contiguous");
+
+    const runIds = responses.map((entry) => entry.payload.data.runId);
+    await waitForRuns(runIds);
+    for (const runId of runIds) {
       await call("DELETE", `/api/runs/${runId}`);
     }
+  });
+
+  await check("a queued run can be cancelled before it starts", async () => {
+    const created = await Promise.all(
+      Array.from({ length: 4 }, () => call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" })),
+    );
+    const queued = created.find((entry) => entry.payload.data.status === "queued");
+    assert(queued, "nothing was queued, cannot exercise the cancel path");
+
+    const runId = queued.payload.data.runId;
+    const cancelled = await call("POST", `/api/runs/${runId}/cancel`);
+    assert(cancelled.payload.data.status === "cancelled", cancelled.payload.data.status);
+
+    const after = await call("GET", `/api/runs/${runId}`);
+    assert(after.payload.data.status === "cancelled", after.payload.data.status);
+    assert(after.payload.data.startedAt === null, "a cancelled queued run must never have started");
+
+    const queueNow = await call("GET", "/api/queue");
+    assert(!queueNow.payload.data.entries.some((entry) => entry.runId === runId), "still in the queue");
+
+    const runIds = created.map((entry) => entry.payload.data.runId);
+    await waitForRuns(runIds);
+    for (const id of runIds) {
+      await call("DELETE", `/api/runs/${id}`);
+    }
+  });
+
+  await check("higher priority runs ahead of what is already waiting", async () => {
+    const filler = await Promise.all(
+      Array.from({ length: 4 }, () => call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" })),
+    );
+    const urgent = await call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium", priority: 10 });
+    const snapshot = await call("GET", "/api/queue");
+    const entries = snapshot.payload.data.entries;
+    assert(entries.length > 1, "need a queue to test ordering");
+    assert(entries[0].runId === urgent.payload.data.runId,
+      `priority 10 sat at position ${entries.findIndex((entry) => entry.runId === urgent.payload.data.runId)}`);
+
+    const runIds = [...filler.map((entry) => entry.payload.data.runId), urgent.payload.data.runId];
+    for (const runId of runIds) {
+      await call("POST", `/api/runs/${runId}/cancel`);
+    }
+    await waitForRuns(runIds);
+    for (const runId of runIds) {
+      await call("DELETE", `/api/runs/${runId}`);
+    }
+  });
+
+  await check("a run pins the script it was queued with", async () => {
+    await call("PUT", "/api/scripts/pinned", {
+      content: "import { test, expect } from \"@playwright/test\";\n\ntest(\"original\", async () => { expect(1).toBe(1); });\n",
+    });
+    const created = await call("POST", "/api/runs", { scriptKey: "pinned", project: "chromium" });
+    const runId = created.payload.data.runId;
+    const pinned = created.payload.data.script;
+    assert(pinned?.sha256, "no script hash recorded");
+
+    // Change the file out from under the run.
+    await call("PUT", "/api/scripts/pinned", {
+      content: "import { test, expect } from \"@playwright/test\";\n\ntest(\"edited\", async () => { expect(2).toBe(2); });\n",
+    });
+
+    await waitForRuns([runId]);
+    const finished = await call("GET", `/api/runs/${runId}`);
+    assert(finished.payload.data.script.sha256 === pinned.sha256, "the recorded hash changed");
+    const titles = finished.payload.data.tests.map((entry) => entry.title).join(" ");
+    assert(titles.includes("original"), `the run used the edited script: ${titles}`);
+
+    await call("DELETE", `/api/runs/${runId}`);
+    await call("DELETE", "/api/scripts/pinned");
+  });
+
+  await check("a finished run can be retried as a new run", async () => {
+    const created = await call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" });
+    const runId = created.payload.data.runId;
+    await waitForRuns([runId]);
+
+    const retried = await call("POST", `/api/runs/${runId}/retry`);
+    assert(retried.status === 201, `retry returned ${retried.status}`);
+    assert(retried.payload.data.runId !== runId, "retry must create a new run");
+    assert(retried.payload.data.retryOf === runId, retried.payload.data.retryOf);
+    assert(retried.payload.data.attempt === 2, `attempt=${retried.payload.data.attempt}`);
+
+    await waitForRuns([retried.payload.data.runId]);
+    const original = await call("GET", `/api/runs/${runId}`);
+    assert(original.status === 200, "the original run must survive a retry");
+
+    await call("DELETE", `/api/runs/${runId}`);
+    await call("DELETE", `/api/runs/${retried.payload.data.runId}`);
+  });
+
+  await check("run bookkeeping is not served as an artifact", async () => {
+    const created = await call("POST", "/api/runs", { scriptKey: "smoke", project: "chromium" });
+    const runId = created.payload.data.runId;
+    await waitForRuns([runId]);
+
+    const artifacts = await call("GET", `/api/runs/${runId}/artifacts`);
+    const names = artifacts.payload.data.artifacts.map((entry) => entry.relativePath);
+    assert(!names.includes("run.json"), "run.json listed as an artifact");
+    assert(!names.includes("logs.jsonl"), "logs.jsonl listed as an artifact");
+    assert(names.includes("report.json"), "report.json should still be evidence");
+
+    const blocked = await call("GET", `/api/runs/${runId}/artifacts/run.json`);
+    assert(blocked.status === 400, `expected 400, got ${blocked.status}`);
+    assert(blocked.payload.error.code === "NOT_AN_ARTIFACT", blocked.payload.error.code);
+
+    await call("DELETE", `/api/runs/${runId}`);
   });
 
   await check("scaffolded scripts read run-time variables", async () => {
@@ -593,6 +1022,10 @@ async function run() {
     }
     assert(missing.length === 0, `undocumented: ${missing.join(", ")}`);
   });
+
+  // ---- restart recovery and retention (need their own server instances) ----
+  await runRestartChecks();
+  await runRetentionChecks();
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
@@ -27,7 +27,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.4.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.5.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -46,7 +46,9 @@ const config = {
   maxContextsPerSession: parseInteger(process.env.MAX_CONTEXTS_PER_SESSION, 5),
   maxPagesPerSession: parseInteger(process.env.MAX_PAGES_PER_SESSION, 10),
   maxConcurrentRuns: parseInteger(process.env.MAX_CONCURRENT_RUNS, 4),
+  maxQueuedRuns: parseInteger(process.env.MAX_QUEUED_RUNS, 100),
   maxRetainedRuns: parseInteger(process.env.MAX_RETAINED_RUNS, 50),
+  requeueInterruptedRuns: parseBoolean(process.env.REQUEUE_INTERRUPTED_RUNS, false),
   mcpSessionTtlMs: parseInteger(process.env.MCP_SESSION_TTL_MS, 60 * 60 * 1000),
   maxActionLogEntries: parseInteger(process.env.MAX_ACTION_LOG_ENTRIES, 500),
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
@@ -192,6 +194,19 @@ async function statOrNull(filePath) {
   } catch {
     return null;
   }
+}
+
+// A half-written run record is worse than none: the reader cannot tell it is
+// truncated. Write to a sibling and rename, which is atomic on both POSIX and
+// NTFS.
+async function writeJsonAtomic(filePath, value) {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await fsPromises.writeFile(tempPath, JSON.stringify(value, null, 2), "utf8");
+  await fsPromises.rename(tempPath, filePath);
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function removeDir(dirPath) {
@@ -573,17 +588,208 @@ export default defineConfig({
 `;
 }
 
+// Run state used to live only in memory, so a container restart erased every
+// result and its evidence became unreachable. Each run now owns a directory
+// holding `run.json` (the record) and `logs.jsonl` (append-only output), next to
+// the artifacts it already produced. No external database: this has to work in a
+// single air-gapped container.
+const RUN_RECORD_FILE = "run.json";
+const RUN_LOG_FILE = "logs.jsonl";
+const RUN_SCRIPT_SNAPSHOT_DIR = "script";
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+// Bookkeeping, not test evidence: both have dedicated endpoints, and listing
+// them as artifacts inflates artifactCount and clutters the download list.
+const RUN_INTERNAL_FILES = new Set([RUN_RECORD_FILE, RUN_LOG_FILE]);
+
+function isRunEvidence(relativePath) {
+  return !RUN_INTERNAL_FILES.has(relativePath);
+}
+
 class RunManager {
   constructor(options) {
     this.options = options;
     this.registry = options.registry;
     this.runs = new Map();
+    this.queue = [];
+    this.pendingWrites = new Map();
+    this.draining = false;
   }
 
-  listRuns() {
-    return [...this.runs.values()]
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .map((run) => this.serializeRun(run));
+  // ---- persistence --------------------------------------------------------
+
+  runDir(runId) {
+    return path.join(this.options.runsDir, runId);
+  }
+
+  // Records store absolute paths, but RUNS_DIR is configurable and is usually a
+  // mounted volume, so the directory can legitimately move between lifetimes.
+  // Everything lives under the run directory, so re-derive from the current root.
+  rebasePaths(runId, storedPaths = {}) {
+    const runDir = this.runDir(runId);
+    const rebased = { runDir };
+    for (const [key, value] of Object.entries(storedPaths)) {
+      if (key === "runDir" || typeof value !== "string") {
+        continue;
+      }
+      rebased[key] = path.join(runDir, path.basename(value));
+    }
+
+    return rebased;
+  }
+
+  // Everything needed to answer a query after a restart. The live child process
+  // and the log array are deliberately excluded.
+  toRecord(run) {
+    return {
+      runId: run.runId,
+      scriptKey: run.scriptKey,
+      status: run.status,
+      priority: run.priority,
+      attempt: run.attempt,
+      retryOf: run.retryOf,
+      pid: run.pid,
+      createdAt: run.createdAt,
+      queuedAt: run.queuedAt,
+      startedAt: run.startedAt,
+      endedAt: run.endedAt,
+      exitCode: run.exitCode,
+      signal: run.signal,
+      interruptedReason: run.interruptedReason,
+      request: run.request,
+      script: run.script,
+      paths: run.paths,
+      summary: run.summary,
+      tests: run.tests,
+      logCount: run.logCount,
+      artifactCount: run.artifacts.length,
+      recordVersion: 1,
+    };
+  }
+
+  fromRecord(record) {
+    return {
+      ...record,
+      logs: [],
+      logCount: record.logCount ?? 0,
+      artifacts: [],
+      tests: record.tests ?? [],
+      priority: record.priority ?? 0,
+      attempt: record.attempt ?? 1,
+      process: null,
+      cancelRequested: false,
+      persisted: true,
+    };
+  }
+
+  // All disk work for a run goes through one chain. Two concurrent
+  // fsPromises.appendFile calls are not guaranteed to be atomic for a payload of
+  // arbitrary size, so unserialised appends could splice two log lines together
+  // and make the JSONL unparseable.
+  enqueueWrite(runId, work) {
+    const previous = this.pendingWrites.get(runId) || Promise.resolve();
+    const next = previous.catch(() => undefined).then(work).catch((error) => {
+      console.error(`[run] disk write failed for ${runId}`, error);
+    });
+    this.pendingWrites.set(runId, next);
+    return next;
+  }
+
+  persist(run) {
+    if (!run.paths?.runDir) {
+      return Promise.resolve();
+    }
+
+    const record = this.toRecord(run);
+    return this.enqueueWrite(run.runId, () => writeJsonAtomic(path.join(run.paths.runDir, RUN_RECORD_FILE), record));
+  }
+
+  async flushWrites() {
+    await Promise.allSettled([...this.pendingWrites.values()]);
+  }
+
+  // Rebuilds the index from disk and reconciles anything the previous process
+  // left mid-flight: those child processes died with it and cannot be resumed.
+  async restore() {
+    await ensureDir(this.options.runsDir);
+    const entries = await fsPromises.readdir(this.options.runsDir, { withFileTypes: true }).catch(() => []);
+    const restored = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("run_")) {
+        continue;
+      }
+
+      const record = await readJsonFile(path.join(this.options.runsDir, entry.name, RUN_RECORD_FILE));
+      if (!record?.runId) {
+        continue;
+      }
+
+      const run = this.fromRecord(record);
+      run.paths = this.rebasePaths(run.runId, run.paths);
+      if (run.script?.snapshotPath) {
+        run.script.snapshotPath = path.join(
+          run.paths.runDir,
+          RUN_SCRIPT_SNAPSHOT_DIR,
+          path.basename(run.script.snapshotPath),
+        );
+      }
+      run.artifacts = (await collectFilesWithMetadata(run.paths?.runDir || this.runDir(run.runId)))
+        .filter((file) => isRunEvidence(file.relativePath));
+      this.runs.set(run.runId, run);
+      restored.push(run);
+    }
+
+    const interrupted = [];
+    for (const run of restored) {
+      if (TERMINAL_RUN_STATUSES.has(run.status)) {
+        continue;
+      }
+
+      const wasQueued = run.status === "queued";
+      if (wasQueued || this.options.requeueInterruptedRuns) {
+        run.status = "queued";
+        run.queuedAt = run.queuedAt || toIso();
+        run.pid = null;
+        run.attempt = wasQueued ? run.attempt : (run.attempt ?? 1) + 1;
+        this.queue.push(run.runId);
+      } else {
+        run.status = "interrupted";
+        run.endedAt = toIso();
+        run.interruptedReason = "server stopped while the run was executing";
+        interrupted.push(run.runId);
+      }
+      await this.persist(run);
+    }
+
+    this.sortQueue();
+    console.log(
+      `[run] restored ${restored.length} run(s) from disk`
+      + `; ${this.queue.length} queued, ${interrupted.length} marked interrupted`,
+    );
+    this.drain();
+    return { restored: restored.length, queued: this.queue.length, interrupted };
+  }
+
+  listRuns(filter = {}) {
+    let runs = [...this.runs.values()];
+    if (filter.status) {
+      const wanted = new Set(parseCsv(filter.status));
+      runs = runs.filter((run) => wanted.has(run.status));
+    }
+    if (filter.scriptKey) {
+      runs = runs.filter((run) => run.scriptKey === filter.scriptKey);
+    }
+
+    runs.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    const total = runs.length;
+    const offset = Math.max(Number(filter.offset) || 0, 0);
+    const limit = Math.min(Math.max(Number(filter.limit) || 100, 1), 500);
+    return {
+      total,
+      offset,
+      limit,
+      runs: runs.slice(offset, offset + limit).map((run) => this.serializeRun(run)),
+    };
   }
 
   getRun(runId) {
@@ -600,33 +806,48 @@ class RunManager {
       runId: run.runId,
       scriptKey: run.scriptKey,
       status: run.status,
+      priority: run.priority ?? 0,
+      attempt: run.attempt ?? 1,
+      retryOf: run.retryOf ?? null,
+      queuePosition: run.status === "queued" ? this.queue.indexOf(run.runId) : null,
       pid: run.pid,
       createdAt: run.createdAt,
+      queuedAt: run.queuedAt ?? null,
       startedAt: run.startedAt,
       endedAt: run.endedAt,
       exitCode: run.exitCode,
       signal: run.signal,
+      interruptedReason: run.interruptedReason ?? null,
       request: run.request,
+      script: run.script ?? null,
       paths: run.paths,
-      logCount: run.logs.length,
+      logCount: run.logCount ?? run.logs.length,
       artifactCount: run.artifacts.length,
       summary: run.summary,
+      tests: run.tests ?? [],
     };
   }
 
   appendLog(run, stream, chunk) {
     const message = chunk.toString("utf8");
     const lines = message.split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      run.logs.push({
-        ts: toIso(),
-        stream,
-        line: truncate(line, 4000),
-      });
+    const entries = lines.map((line) => ({ ts: toIso(), stream, line: truncate(line, 4000) }));
+    if (!entries.length) {
+      return;
     }
 
+    run.logs.push(...entries);
+    run.logCount = (run.logCount ?? 0) + entries.length;
     if (run.logs.length > this.options.maxRunLogEntries) {
       run.logs.splice(0, run.logs.length - this.options.maxRunLogEntries);
+    }
+
+    // Appending keeps the full output on disk even though memory only holds the
+    // newest maxRunLogEntries lines.
+    if (run.paths?.runDir) {
+      const payload = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+      const filePath = path.join(run.paths.runDir, RUN_LOG_FILE);
+      this.enqueueWrite(run.runId, () => fsPromises.appendFile(filePath, payload, "utf8"));
     }
   }
 
@@ -634,16 +855,110 @@ class RunManager {
     return [...this.runs.values()].filter((run) => run.status === "running").length;
   }
 
+  countQueuedRuns() {
+    return this.queue.length;
+  }
+
+  // Higher priority first, then oldest first, so a burst cannot starve an
+  // earlier request.
+  sortQueue() {
+    this.queue.sort((leftId, rightId) => {
+      const left = this.runs.get(leftId);
+      const right = this.runs.get(rightId);
+      if (!left || !right) {
+        return 0;
+      }
+      return (right.priority ?? 0) - (left.priority ?? 0)
+        || (left.queuedAt || "").localeCompare(right.queuedAt || "");
+    });
+  }
+
+  describeQueue() {
+    return {
+      queued: this.queue.length,
+      running: this.countActiveRuns(),
+      maxConcurrentRuns: this.options.maxConcurrentRuns,
+      maxQueuedRuns: this.options.maxQueuedRuns,
+      entries: this.queue.map((runId, index) => {
+        const run = this.runs.get(runId);
+        return {
+          position: index,
+          runId,
+          scriptKey: run?.scriptKey,
+          priority: run?.priority ?? 0,
+          queuedAt: run?.queuedAt,
+          attempt: run?.attempt ?? 1,
+        };
+      }),
+    };
+  }
+
+  // Single-flight: `drain` is re-entered from several places (enqueue, child
+  // exit, restore) and must not start the same run twice.
+  drain() {
+    if (this.draining) {
+      return;
+    }
+
+    this.draining = true;
+    queueMicrotask(() => {
+      this.drainNow()
+        .catch((error) => console.error("[run] queue drain failed", error))
+        .finally(() => {
+          this.draining = false;
+          if (this.queue.length && this.countActiveRuns() < this.options.maxConcurrentRuns) {
+            this.drain();
+          }
+        });
+    });
+  }
+
+  async drainNow() {
+    while (this.queue.length && this.countActiveRuns() < this.options.maxConcurrentRuns) {
+      const runId = this.queue.shift();
+      const run = this.runs.get(runId);
+      if (!run) {
+        // A queued id with no record means something removed the run without
+        // dequeueing it. Retention used to do exactly that; say so loudly rather
+        // than dropping the request in silence.
+        console.error(`[run] queued run ${runId} has no record and was dropped`);
+        continue;
+      }
+      if (run.status !== "queued") {
+        continue;
+      }
+
+      // Claim the slot before the first await.
+      run.status = "running";
+      try {
+        await this.startRun(run);
+      } catch (error) {
+        const apiError = toApiError(error);
+        run.status = "failed";
+        run.endedAt = toIso();
+        run.exitCode = -1;
+        this.appendLog(run, "stderr", Buffer.from(`${apiError.code}: ${apiError.message}`, "utf8"));
+        await this.persist(run);
+        console.error(`[run] could not start ${run.runId}: ${apiError.message}`);
+      }
+    }
+  }
+
   // Keeps the newest `maxRetainedRuns` runs and deletes the on-disk output of
   // everything older. Without this, every run leaks a report + trace directory.
   async pruneRuns() {
-    const finished = [...this.runs.values()]
-      .filter((run) => run.status !== "running")
+    // Only terminal runs may be pruned. Before the queue existed "not running"
+    // meant "finished"; now it also matches "queued", and pruning one of those
+    // would delete a run that is still waiting to execute.
+    const prunable = [...this.runs.values()]
+      .filter((run) => TERMINAL_RUN_STATUSES.has(run.status))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     const excess = this.runs.size - this.options.maxRetainedRuns;
-    for (let index = 0; index < excess && index < finished.length; index += 1) {
-      const run = finished[index];
+    for (let index = 0; index < excess && index < prunable.length; index += 1) {
+      const run = prunable[index];
+      await (this.pendingWrites.get(run.runId) || Promise.resolve()).catch(() => undefined);
       this.runs.delete(run.runId);
+      this.pendingWrites.delete(run.runId);
       if (run.paths.runDir) {
         await removeDir(run.paths.runDir);
       }
@@ -653,48 +968,113 @@ class RunManager {
   // The slot has to be taken in the same synchronous turn as the check.
   // Checking first and registering the run after several awaits let concurrent
   // requests all pass the check and blow past the limit.
-  reserveRunSlot(runId, request) {
-    if (this.countActiveRuns() >= this.options.maxConcurrentRuns) {
+  // Exceeding the concurrency limit used to be a 429. A request that is valid
+  // now waits its turn instead of being thrown away; only a full queue rejects.
+  async createRun(request, meta = {}) {
+    const script = this.registry.get(request.scriptKey);
+    if (!(await fileExists(this.options.playwrightCliPath))) {
+      throw new ApiError(
+        500,
+        "PLAYWRIGHT_CLI_NOT_FOUND",
+        `Playwright CLI not found at ${this.options.playwrightCliPath}. Install dependencies first.`,
+      );
+    }
+    if (request.storageStateRef) {
+      const storagePath = this.resolveStorageState(request.storageStateRef);
+      if (!(await fileExists(storagePath))) {
+        throw new ApiError(400, "STORAGE_STATE_NOT_FOUND", `Storage state not found: ${request.storageStateRef}`);
+      }
+    }
+    if (this.queue.length >= this.options.maxQueuedRuns) {
       throw new ApiError(
         429,
-        "RUN_LIMIT_EXCEEDED",
-        `Maximum concurrent runs reached (${this.options.maxConcurrentRuns}). Wait for a run to finish or cancel one.`,
+        "RUN_QUEUE_FULL",
+        `The run queue is full (${this.options.maxQueuedRuns}). Wait for it to drain or cancel queued runs.`,
       );
     }
 
-    this.runs.set(runId, {
+    const runId = createId("run");
+    const runDir = this.runDir(runId);
+    await ensureDir(runDir);
+
+    // Pin the script: the file can change or be deleted while the run waits, so
+    // a snapshot plus its hash is what makes the stored result reproducible.
+    const pinnedScript = await this.snapshotScript(runDir, script);
+
+    const run = {
       runId,
       scriptKey: request.scriptKey,
       request,
-      status: "running",
+      script: pinnedScript,
+      status: "queued",
+      priority: Number.isFinite(Number(request.priority)) ? Number(request.priority) : 0,
+      attempt: meta.attempt ?? 1,
+      retryOf: meta.retryOf ?? null,
       createdAt: toIso(),
+      queuedAt: toIso(),
       startedAt: null,
       endedAt: null,
       exitCode: null,
       signal: null,
+      interruptedReason: null,
       pid: null,
-      paths: {},
+      paths: { runDir },
       logs: [],
+      logCount: 0,
       artifacts: [],
       summary: null,
+      tests: [],
       process: null,
       cancelRequested: false,
+    };
+
+    this.runs.set(runId, run);
+    this.queue.push(runId);
+    this.sortQueue();
+    await this.persist(run);
+
+    // Drain inline so the response reports what actually happened: a run that
+    // got a free slot comes back as "running" with its pid, rather than
+    // "queued" until a microtask fires. Concurrent creates are safe because the
+    // slot is claimed synchronously right after the queue shift.
+    await this.drainNow();
+    return this.serializeRun(run);
+  }
+
+  // Copies the script next to the run record and records its hash.
+  async snapshotScript(runDir, script) {
+    const snapshotDir = path.join(runDir, RUN_SCRIPT_SNAPSHOT_DIR);
+    await ensureDir(snapshotDir);
+    const fileName = path.basename(script.relativePath);
+    const snapshotPath = path.join(snapshotDir, fileName);
+    const content = await fsPromises.readFile(script.absolutePath, "utf8");
+    await fsPromises.writeFile(snapshotPath, content, "utf8");
+
+    return {
+      scriptKey: script.scriptKey,
+      relativePath: script.relativePath,
+      sha256: sha256Hex(content),
+      sizeBytes: Buffer.byteLength(content, "utf8"),
+      snapshotPath,
+      capturedAt: toIso(),
+      git: await this.registry.resolveGitInfo().catch(() => ({ available: false })),
+    };
+  }
+
+  async retryRun(runId) {
+    const original = this.getRun(runId);
+    if (!TERMINAL_RUN_STATUSES.has(original.status)) {
+      throw new ApiError(409, "RUN_NOT_FINISHED", `Run ${runId} is ${original.status}; cancel it before retrying`);
+    }
+
+    return this.createRun(original.request, {
+      attempt: (original.attempt ?? 1) + 1,
+      retryOf: original.retryOf ?? runId,
     });
   }
 
-  async createRun(request) {
-    const script = this.registry.get(request.scriptKey);
-    const runId = createId("run");
-    this.reserveRunSlot(runId, request);
-    try {
-      return await this.startReservedRun(runId, request, script);
-    } catch (error) {
-      this.runs.delete(runId);
-      throw error;
-    }
-  }
-
-  async startReservedRun(runId, request, script) {
+  async startRun(run) {
+    const { runId, request } = run;
     if (!(await fileExists(this.options.playwrightCliPath))) {
       throw new ApiError(
         500,
@@ -703,14 +1083,17 @@ class RunManager {
       );
     }
 
-    if (request.storageStateRef) {
-      const storagePath = this.resolveStorageState(request.storageStateRef);
-      if (!(await fileExists(storagePath))) {
-        throw new ApiError(400, "STORAGE_STATE_NOT_FOUND", `Storage state not found: ${request.storageStateRef}`);
-      }
+    // Without this the run would spawn against a missing file and report the
+    // unhelpful "no tests found" instead of naming the real problem.
+    if (!run.script?.snapshotPath || !(await fileExists(run.script.snapshotPath))) {
+      throw new ApiError(
+        500,
+        "SCRIPT_SNAPSHOT_MISSING",
+        `The pinned script snapshot for ${runId} is missing; delete the run and create it again`,
+      );
     }
 
-    const runDir = path.join(this.options.runsDir, runId);
+    const runDir = run.paths.runDir;
     const outputDir = path.join(runDir, "test-results");
     const htmlReportDir = path.join(runDir, "html-report");
     const jsonReportPath = path.join(runDir, "report.json");
@@ -721,7 +1104,7 @@ class RunManager {
     await fsPromises.writeFile(
       configPath,
       renderPlaywrightConfig({
-        scriptsDir: this.options.scriptsDir,
+        scriptsDir: path.dirname(run.script.snapshotPath),
         outputDir,
         htmlReportDir,
         jsonReportPath,
@@ -729,10 +1112,12 @@ class RunManager {
       "utf8",
     );
 
+    // The snapshot is what was pinned when the run was queued; the registry
+    // entry may have been edited or deleted since.
     const args = [
       this.options.playwrightCliPath,
       "test",
-      script.absolutePath,
+      run.script.snapshotPath,
       "--config",
       configPath,
     ];
@@ -769,7 +1154,6 @@ class RunManager {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const run = this.runs.get(runId);
     run.startedAt = toIso();
     run.pid = child.pid;
     run.paths = {
@@ -780,6 +1164,7 @@ class RunManager {
       jsonReportPath,
     };
     run.process = child;
+    await this.persist(run);
 
     child.stdout.on("data", (chunk) => {
       this.appendLog(run, "stdout", chunk);
@@ -792,6 +1177,8 @@ class RunManager {
       run.endedAt = toIso();
       run.exitCode = -1;
       this.appendLog(run, "stderr", Buffer.from(error.message, "utf8"));
+      this.persist(run);
+      this.drain();
     });
     child.on("close", (code, signal) => {
       run.exitCode = code;
@@ -810,19 +1197,60 @@ class RunManager {
       // the whole process down as an unhandled rejection.
       (async () => {
         run.summary = await this.buildSummary(run);
-        run.artifacts = await collectFilesWithMetadata(run.paths.runDir);
+        run.tests = await this.extractTestResults(run);
+        run.artifacts = (await collectFilesWithMetadata(run.paths.runDir))
+          .filter((file) => isRunEvidence(file.relativePath));
+        await this.persist(run);
         await this.pruneRuns();
       })().catch((error) => {
         console.error(`[run] post-processing failed runId=${run.runId}`, error);
+      }).finally(() => {
+        // Free the slot for whatever is waiting.
+        this.drain();
       });
     });
 
     return this.serializeRun(run);
   }
 
+  // Playwright's JSON report is deeply nested; flatten it once at completion so
+  // stored history can be queried without re-parsing the whole report.
+  async extractTestResults(run) {
+    const report = run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null;
+    if (!report?.suites) {
+      return [];
+    }
+
+    const tests = [];
+    const walk = (suites, titlePath) => {
+      for (const suite of suites || []) {
+        const nextPath = suite.title ? [...titlePath, suite.title] : titlePath;
+        for (const spec of suite.specs || []) {
+          for (const test of spec.tests || []) {
+            const last = test.results?.[test.results.length - 1];
+            tests.push(cleanObject({
+              title: [...nextPath, spec.title].filter(Boolean).join(" > "),
+              project: test.projectName || undefined,
+              status: last?.status ?? test.status ?? "unknown",
+              expectedStatus: test.expectedStatus,
+              durationMs: last?.duration ?? null,
+              retries: Math.max((test.results?.length ?? 1) - 1, 0),
+              file: spec.file || suite.file || undefined,
+              line: spec.line,
+              error: last?.error?.message ? truncate(last.error.message, 2000) : undefined,
+            }));
+          }
+        }
+        walk(suite.suites, nextPath);
+      }
+    };
+    walk(report.suites, []);
+    return tests;
+  }
+
   async buildSummary(run) {
     const report = run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null;
-    const artifacts = run.paths.runDir ? await collectFilesWithMetadata(run.paths.runDir) : [];
+    const artifacts = await this.listArtifacts(run.runId).catch(() => []);
     if (!report) {
       return {
         runId: run.runId,
@@ -976,6 +1404,20 @@ class RunManager {
 
   async cancelRun(runId) {
     const run = this.getRun(runId);
+
+    // A queued run has no process yet; it just leaves the queue.
+    if (run.status === "queued") {
+      const index = this.queue.indexOf(runId);
+      if (index >= 0) {
+        this.queue.splice(index, 1);
+      }
+      run.status = "cancelled";
+      run.cancelRequested = true;
+      run.endedAt = toIso();
+      await this.persist(run);
+      return { runId, status: "cancelled" };
+    }
+
     if (!run.process) {
       return {
         runId,
@@ -984,6 +1426,7 @@ class RunManager {
     }
 
     run.cancelRequested = true;
+    await this.persist(run);
     const child = run.process;
     child.kill("SIGTERM");
     const killTimer = setTimeout(() => {
@@ -1000,11 +1443,20 @@ class RunManager {
 
   async listArtifacts(runId) {
     const run = this.getRun(runId);
-    return run.paths.runDir ? collectFilesWithMetadata(run.paths.runDir) : [];
+    if (!run.paths.runDir) {
+      return [];
+    }
+
+    const files = await collectFilesWithMetadata(run.paths.runDir);
+    return files.filter((file) => isRunEvidence(file.relativePath));
   }
 
   async getReport(runId) {
     const run = this.getRun(runId);
+    if (!run.tests?.length && TERMINAL_RUN_STATUSES.has(run.status)) {
+      run.tests = await this.extractTestResults(run);
+    }
+
     return {
       ...this.serializeRun(run),
       report: run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null,
@@ -1012,20 +1464,46 @@ class RunManager {
     };
   }
 
-  getLogs(runId) {
+  // In-memory logs are capped and are empty for a run restored from disk, so
+  // fall back to the append-only file.
+  async getLogs(runId, options = {}) {
     const run = this.getRun(runId);
+    const wantsAll = options.source === "file" || !run.logs.length;
+    let logs = run.logs;
+    let source = "memory";
+
+    if (wantsAll && run.paths?.runDir) {
+      const filePath = path.join(run.paths.runDir, RUN_LOG_FILE);
+      const raw = await fsPromises.readFile(filePath, "utf8").catch(() => null);
+      if (raw !== null) {
+        logs = raw.split("\n").filter(Boolean).flatMap((line) => {
+          try {
+            return [JSON.parse(line)];
+          } catch {
+            return [];
+          }
+        });
+        source = "file";
+      }
+    }
+
+    const limit = Math.min(Math.max(Number(options.limit) || 1000, 1), 20_000);
     return {
       runId,
       status: run.status,
-      logs: run.logs,
+      source,
+      totalCount: run.logCount ?? logs.length,
+      logs: logs.slice(-limit),
     };
   }
 
   async deleteRun(runId) {
     const run = this.getRun(runId);
-    if (run.status === "running") {
-      throw new ApiError(409, "RUN_STILL_RUNNING", "Cancel the run before deleting it");
+    if (run.status === "running" || run.status === "queued") {
+      throw new ApiError(409, "RUN_STILL_RUNNING", `Run is ${run.status}; cancel it before deleting`);
     }
+
+    this.pendingWrites.delete(runId);
 
     this.runs.delete(runId);
     if (run.paths.runDir) {
@@ -1042,6 +1520,13 @@ class RunManager {
       throw new ApiError(409, "RUN_NOT_STARTED", `Run ${runId} has not produced any output yet`);
     }
     const absolutePath = resolveWithin(run.paths.runDir, relativePath, "artifact path");
+    if (!isRunEvidence(path.relative(run.paths.runDir, absolutePath).split(path.sep).join("/"))) {
+      throw new ApiError(
+        400,
+        "NOT_AN_ARTIFACT",
+        `${relativePath} is run bookkeeping; use GET /runs/{runId} or /runs/{runId}/logs instead`,
+      );
+    }
     const stats = await statOrNull(absolutePath);
     if (!stats || !stats.isFile()) {
       throw new ApiError(404, "ARTIFACT_NOT_FOUND", `Run artifact not found: ${relativePath}`);
@@ -1053,10 +1538,15 @@ class RunManager {
   async killAll() {
     for (const run of this.runs.values()) {
       if (run.process) {
-        run.cancelRequested = true;
         run.process.kill("SIGKILL");
+        run.status = "interrupted";
+        run.endedAt = toIso();
+        run.interruptedReason = "server shut down";
+        this.persist(run);
       }
     }
+
+    await this.flushWrites();
   }
 }
 
@@ -4469,6 +4959,12 @@ function buildOpenApiSpec(req) {
       },
       [`${api}/runs`]: {
         get: {
+          parameters: [
+            { name: "status", in: "query", required: false, schema: { type: "string" }, description: "Comma separated: queued, running, completed, failed, cancelled, interrupted" },
+            { name: "scriptKey", in: "query", required: false, schema: { type: "string" } },
+            { name: "limit", in: "query", required: false, schema: { type: "integer", default: 100 } },
+            { name: "offset", in: "query", required: false, schema: { type: "integer", default: 0 } },
+          ],
           tags: ["Runs"],
           summary: "List runs",
           responses: { 200: { description: "Run list" } },
@@ -4775,6 +5271,20 @@ function buildOpenApiSpec(req) {
           ],
           responses: { 200: { description: "Binary file download" }, 404: { description: "Artifact not found" } },
         },
+      },
+      [`${api}/queue`]: {
+        get: operation({
+          tag: "Runs",
+          summary: "Show the run queue and how many slots are busy",
+        }),
+      },
+      [`${api}/runs/{runId}/retry`]: {
+        post: operation({
+          tag: "Runs",
+          summary: "Queue a new run with the same request as a finished one",
+          parameters: [pathParam("runId")],
+          responses: { 201: { description: "New queued run" }, 409: { description: "The original run has not finished" } },
+        }),
       },
       [`${api}/runs/{runId}/artifacts/{artifactPath}`]: {
         get: operation({
@@ -5922,6 +6432,7 @@ const runManager = new RunManager({
   ...config,
   registry: scriptRegistry,
 });
+await runManager.restore();
 const sessionManager = new SessionManager(config);
 const scriptAssistant = new ScriptAssistant({
   ...config,
@@ -6051,8 +6562,9 @@ app.get("/health", asyncRoute(async (req, res) => {
     uptimeSec: Math.round(process.uptime()),
     docker: isDocker,
     scriptCount: scriptRegistry.list().length,
-    runCount: runManager.listRuns().length,
+    runCount: runManager.runs.size,
     activeRunCount: runManager.countActiveRuns(),
+    queuedRunCount: runManager.countQueuedRuns(),
     sessionCount: sessionManager.sessions.size,
     mcpSessionCount: mcpSessions.size,
     limits: {
@@ -6060,12 +6572,14 @@ app.get("/health", asyncRoute(async (req, res) => {
       maxContextsPerSession: config.maxContextsPerSession,
       maxPagesPerSession: config.maxPagesPerSession,
       maxConcurrentRuns: config.maxConcurrentRuns,
+      maxQueuedRuns: config.maxQueuedRuns,
       maxRetainedRuns: config.maxRetainedRuns,
     },
     features: {
       evaluate: config.enableEvaluate,
       authRequired: Boolean(config.apiToken),
       failureArtifacts: config.captureFailureArtifacts,
+      persistentRunHistory: true,
       urlAllowlist: config.urlAllowlist,
     },
   });
@@ -6137,9 +6651,16 @@ app.get(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, re
 }));
 
 app.get(`${config.apiBasePath}/runs`, asyncRoute(async (req, res) => {
-  ok(res, {
-    runs: runManager.listRuns(),
-  });
+  ok(res, runManager.listRuns({
+    status: req.query.status,
+    scriptKey: req.query.scriptKey,
+    limit: req.query.limit,
+    offset: req.query.offset,
+  }));
+}));
+
+app.get(`${config.apiBasePath}/queue`, asyncRoute(async (req, res) => {
+  ok(res, runManager.describeQueue());
 }));
 
 app.post(`${config.apiBasePath}/runs`, asyncRoute(async (req, res) => {
@@ -6166,7 +6687,14 @@ app.get(`${config.apiBasePath}/runs/:runId/report`, asyncRoute(async (req, res) 
 }));
 
 app.get(`${config.apiBasePath}/runs/:runId/logs`, asyncRoute(async (req, res) => {
-  ok(res, runManager.getLogs(req.params.runId));
+  ok(res, await runManager.getLogs(req.params.runId, {
+    source: req.query.source,
+    limit: req.query.limit,
+  }));
+}));
+
+app.post(`${config.apiBasePath}/runs/:runId/retry`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.retryRun(req.params.runId), 201);
 }));
 
 app.get(`${config.apiBasePath}/runs/:runId/artifacts/:artifactPath(*)`, asyncRoute(async (req, res) => {
@@ -6514,13 +7042,75 @@ const mcpTools = [
   defineTool("assist_examples", "Return localized prompt examples, reusable step patterns, and locator guidance for LLM-driven script generation.", { type: "object", properties: { language: { type: "string" } } }, async (args) => scriptAssistant.examples(args)),
   defineTool("assist_plan", "Turn a natural-language test request into a structured scenario plan with suggested steps and MCP workflow.", { type: "object", properties: { goal: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, scriptKey: { type: "string" }, language: { type: "string" }, tags: { type: "array" }, locators: { type: "object" }, expectations: { type: "array" }, variables: { type: "object" }, storageStateRef: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.plan(args)),
   defineTool("assist_scaffold", "Generate a Playwright script scaffold from a user goal or structured steps, optionally saving and validating it.", { type: "object", properties: { goal: { type: "string" }, testName: { type: "string" }, scriptKey: { type: "string" }, startUrl: { type: "string" }, baseURL: { type: "string" }, language: { type: "string", description: "Authoring locale for comments: ko or en." }, scriptLanguage: { type: "string", enum: ["js", "ts"], description: "Generated file language." }, steps: { type: "array" }, variables: { type: "object" }, save: { type: "boolean" }, overwrite: { type: "boolean" }, validate: { type: "boolean" }, project: { type: "string" }, pageInspection: { type: "object" } } }, async (args) => scriptAssistant.scaffold(args)),
-  defineTool("run_create", "Create a Playwright test run.", { type: "object", properties: { scriptKey: { type: "string" }, project: { type: "string" }, env: { type: "string" }, baseURL: { type: "string" }, grep: { type: "string" }, headed: { type: "boolean" }, trace: { type: "string" }, video: { type: "string" }, storageStateRef: { type: "string" }, shard: { type: "string" }, variables: { type: "object" } }, required: ["scriptKey"] }, async (args) => runManager.createRun(args)),
+  defineTool(
+    "run_create",
+    "Queue a Playwright test run. It starts as soon as a slot is free, so the returned status may be \"queued\"; poll run_get. The script is snapshotted and hashed at this point, so later edits do not affect this run.",
+    {
+      type: "object",
+      properties: {
+        scriptKey: { type: "string" },
+        project: { type: "string", enum: ["chromium", "firefox", "webkit"] },
+        env: { type: "string" },
+        baseURL: { type: "string" },
+        grep: { type: "string", example: "@smoke" },
+        headed: { type: "boolean" },
+        trace: { type: "string" },
+        video: { type: "string" },
+        screenshot: { type: "string" },
+        storageStateRef: { type: "string", description: "Path relative to STORAGE_STATE_DIR" },
+        shard: { type: "string", example: "1/3" },
+        timeoutMs: { type: "integer" },
+        priority: { type: "integer", default: 0, description: "Higher runs first" },
+        variables: { type: "object", additionalProperties: true },
+      },
+      required: ["scriptKey"],
+    },
+    async (args) => runManager.createRun(args),
+  ),
   defineTool("run_get", "Get one Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.serializeRun(runManager.getRun(args.runId))),
   defineTool("run_cancel", "Cancel a running Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.cancelRun(args.runId)),
   defineTool("run_artifacts", "List files produced by a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => ({ runId: args.runId, artifacts: await runManager.listArtifacts(args.runId) })),
   defineTool("run_report", "Get the JSON summary report for a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.getReport(args.runId)),
-  defineTool("run_logs", "Get captured stdout and stderr for a run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.getLogs(args.runId)),
-  defineTool("run_list", "List known runs, newest first.", { type: "object", properties: {} }, async () => ({ runs: runManager.listRuns() })),
+  defineTool(
+    "run_logs",
+    "Get captured stdout and stderr for a run. Reads the on-disk log when the in-memory window does not cover it, so logs from a previous server lifetime are still available.",
+    {
+      type: "object",
+      properties: {
+        runId: { type: "string" },
+        source: { type: "string", enum: ["memory", "file"], description: "Force the on-disk log" },
+        limit: { type: "integer", default: 1000, description: "Newest N lines, 1-20000" },
+      },
+      required: ["runId"],
+    },
+    async (args) => runManager.getLogs(args.runId, args),
+  ),
+  defineTool(
+    "run_list",
+    "List runs, newest first. History survives a restart, so this includes runs from previous server lifetimes.",
+    {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "Comma separated: queued, running, completed, failed, cancelled, interrupted" },
+        scriptKey: { type: "string" },
+        limit: { type: "integer", default: 100, description: "1-500" },
+        offset: { type: "integer", default: 0 },
+      },
+    },
+    async (args) => runManager.listRuns(args),
+  ),
+  defineTool(
+    "run_queue",
+    "Show the run queue: what is waiting, in what order, and how many slots are busy.",
+    { type: "object", properties: {} },
+    async () => runManager.describeQueue(),
+  ),
+  defineTool(
+    "run_retry",
+    "Queue a new run with the same request as a finished one. Returns the new runId; the original is left untouched.",
+    { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] },
+    async (args) => runManager.retryRun(args.runId),
+  ),
   defineTool("run_delete", "Delete a finished run and reclaim its artifacts from disk.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.deleteRun(args.runId)),
   defineTool("session_list", "List active browser sessions.", { type: "object", properties: {} }, async () => ({ sessions: sessionManager.listSessions() })),
   defineTool("session_create", "Create a low-level browser session for debugging.", { type: "object", properties: { browserType: { type: "string" }, headless: { type: "boolean" }, ttlMs: { type: "number" } } }, async (args) => sessionManager.createSession(args)),
