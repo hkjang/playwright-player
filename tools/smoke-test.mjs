@@ -744,7 +744,85 @@ async function run() {
       assert(withArg.payload.data.result === 42, `arg was not forwarded: ${JSON.stringify(withArg.payload.data.result)}`);
     });
 
+    await check("inspect reports real match counts, not just strategy confidence", async () => {
+      // Three identical buttons plus one with a testId: role+name looks like a
+      // 0.95-confidence locator for all four, but matches three of them.
+      const fixture = "data:text/html," + encodeURIComponent(
+        "<button>Save</button><button>Save</button><button>Save</button>"
+        + "<button data-testid=\"only-save\">Save</button>"
+        + "<label for=\"a\">Amount</label><input id=\"a\">"
+        + "<label for=\"b\">Amount</label><input id=\"b\" data-testid=\"second\">",
+      );
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: fixture });
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/inspect`, { maxElements: 20 });
+      const data = payload.data;
+
+      assert(data.locatorVerification, "no locatorVerification summary");
+      assert(data.locatorVerification.errors === 0, `${data.locatorVerification.errors} candidates failed to evaluate`);
+
+      const buttons = data.interactiveElements.filter((entry) => entry.tagName === "button");
+      assert(buttons.length === 4, `expected 4 buttons, got ${buttons.length}`);
+      assert(buttons.every((entry) => entry.locatorUnique),
+        `not every button got a unique locator: ${JSON.stringify(buttons.map((b) => b.bestLocator))}`);
+
+      // The one with a testId must keep it rather than fall back to an index.
+      const tagged = buttons.find((entry) => entry.testId === "only-save");
+      assert(tagged.bestLocator.testId === "only-save", JSON.stringify(tagged.bestLocator));
+      assert(tagged.bestLocator.nth === undefined, "a uniquely identifiable element should not need nth");
+
+      // The untagged ones are only distinguishable by position.
+      const positional = buttons.filter((entry) => entry.bestLocator?.nth !== undefined);
+      assert(positional.length === 3, `expected 3 nth-disambiguated buttons, got ${positional.length}`);
+      assert(new Set(positional.map((entry) => entry.bestLocator.nth)).size === 3, "nth values must be distinct");
+
+      // An ambiguous label must not win over a unique locator for the element.
+      const firstInput = data.interactiveElements.find((entry) => entry.tagName === "input" && entry.id === "a");
+      assert(firstInput.locatorUnique, JSON.stringify(firstInput.bestLocator));
+      assert(firstInput.bestLocator.label === undefined, `ambiguous label was chosen: ${JSON.stringify(firstInput.bestLocator)}`);
+
+      assert(!("domPath" in firstInput), "internal domPath must not be exposed as if it were a locator");
+    });
+
+    await check("every verified bestLocator actually resolves to one node", async () => {
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/inspect`, { maxElements: 20 });
+      for (const element of payload.data.interactiveElements) {
+        if (!element.locatorUnique) {
+          continue;
+        }
+        const query = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/locator/query`, {
+          locator: element.bestLocator,
+          operation: "count",
+        });
+        assert(query.payload.data.count === 1,
+          `${JSON.stringify(element.bestLocator)} matched ${query.payload.data.count}`);
+      }
+    });
+
+    await check("a numeric id yields a usable CSS locator", async () => {
+      // `#123abc` is a valid id but not a valid CSS selector, so it threw.
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: "data:text/html," + encodeURIComponent('<button id="123abc" aria-label="numeric">x</button>'),
+      });
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/inspect`, { maxElements: 5 });
+      assert(payload.data.locatorVerification.errors === 0, "a candidate threw while being verified");
+      const cssCandidates = payload.data.interactiveElements
+        .flatMap((entry) => entry.locatorCandidates || [])
+        .filter((entry) => entry.strategy === "css");
+      assert(cssCandidates.length > 0, "no css candidate generated");
+      assert(cssCandidates.every((entry) => !entry.locator.css.startsWith("#")),
+        `raw #id selector emitted: ${JSON.stringify(cssCandidates.map((c) => c.locator.css))}`);
+    });
+
+    await check("verifyLocators can be turned off", async () => {
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/inspect`, {
+        maxElements: 5,
+        verifyLocators: false,
+      });
+      assert(payload.data.locatorVerification === null, "verification ran when it was disabled");
+    });
+
     await check("a dialog no longer blocks the click that opened it", async () => {
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${baseUrl}/demo/test-page` });
       await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
         expression: `() => {
           const button = document.createElement("button");

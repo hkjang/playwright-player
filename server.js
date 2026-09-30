@@ -27,7 +27,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.3.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.4.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -1428,6 +1428,11 @@ class ScriptAssistant {
       registryScriptCount: this.registry.list().length,
       scriptLanguages: ["js", "ts"],
       inspectionAwarePlanning: true,
+      locatorVerification: {
+        supported: true,
+        description: "page_inspect resolves each candidate against the live DOM and reports matchCount plus locatorStatus. A confidence score alone does not mean the locator is unique.",
+        statuses: ["unique", "ambiguous", "not-found"],
+      },
       examplesAvailable: true,
       authoringLocales: ["ko", "en"],
       browserLanguageAwarePages: ["/", documentationPaths.playground, "/demo/test-page"],
@@ -3090,8 +3095,19 @@ class SessionManager {
         const maxElements = Math.min(Math.max(Number(request.maxElements) || 40, 1), 200);
         const maxTextLength = Math.min(Math.max(Number(request.maxTextLength) || 140, 20), 400);
         await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
+        const verifyLocators = request.verifyLocators !== false;
+        const maxVerifiedCandidates = Math.min(Math.max(Number(request.maxVerifiedCandidates) || 3, 1), 6);
         const snapshot = await pageRecord.page.evaluate(({ maxElements: limit, maxTextLength: textLimit }) => {
           const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, textLimit);
+          // A child-index chain identifies a node without mutating the page, so
+          // an ambiguous locator can be resolved to a concrete nth later.
+          const domPath = (element) => {
+            const parts = [];
+            for (let node = element; node && node.parentNode; node = node.parentNode) {
+              parts.unshift([...node.parentNode.childNodes].indexOf(node));
+            }
+            return parts.join("/");
+          };
           const isVisible = (element) => {
             const style = window.getComputedStyle(element);
             if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
@@ -3161,7 +3177,9 @@ class SessionManager {
             if (text && ["button", "a"].includes(element.tagName.toLowerCase())) {
               candidates.push({ strategy: "text", locator: { text }, confidence: 0.8 });
             }
-            if (id) candidates.push({ strategy: "css", locator: { css: `#${id}` }, confidence: 0.45 });
+            // `#123abc` is not a valid CSS selector even though it is a valid
+            // id, so the attribute form is used instead.
+            if (id) candidates.push({ strategy: "css", locator: { css: `[id="${id.replaceAll('"', '\\"')}"]` }, confidence: 0.45 });
 
             return candidates;
           };
@@ -3178,6 +3196,7 @@ class SessionManager {
             const text = normalize(element.innerText || element.textContent);
             const candidates = toLocatorCandidates(element);
             interactiveElements.push({
+              domPath: domPath(element),
               tagName: element.tagName.toLowerCase(),
               inputType: normalize(element.getAttribute("type")),
               role,
@@ -3218,15 +3237,148 @@ class SessionManager {
           };
         }, { maxElements, maxTextLength });
 
+        const verification = verifyLocators
+          ? await this.verifyLocatorCandidates(pageRecord.page, snapshot.interactiveElements, maxVerifiedCandidates)
+          : null;
+
         return {
           pageId,
           sessionId,
           url: pageRecord.page.url(),
           title: await pageRecord.page.title().catch(() => null),
           ...snapshot,
+          locatorVerification: verification,
         };
       });
     });
+  }
+
+  // The in-page pass can only guess: it scored candidates by strategy
+  // (testId 1.0, label 0.98, ...) without ever checking that the locator
+  // actually resolves to that one element. A confident-looking role+name can
+  // match six buttons, which is how an agent ends up clicking the wrong one.
+  // This resolves each candidate with Playwright's own engine and reports the
+  // real match count.
+  async verifyLocatorCandidates(page, elements, maxVerifiedCandidates) {
+    const summary = { verified: 0, unique: 0, ambiguous: 0, notFound: 0, refined: 0, errors: 0 };
+
+    const countFor = async (locator) => {
+      try {
+        // count() resolves immediately; it does not auto-wait.
+        return await resolveLocator(page, locator).count();
+      } catch {
+        summary.errors += 1;
+        return null;
+      }
+    };
+
+    for (const element of elements) {
+      const candidates = Array.isArray(element.locatorCandidates) ? element.locatorCandidates : [];
+      let chosen = null;
+
+      for (const candidate of candidates.slice(0, maxVerifiedCandidates)) {
+        const matchCount = await countFor(candidate.locator);
+        candidate.matchCount = matchCount;
+        candidate.unique = matchCount === 1;
+        if (matchCount === null) {
+          candidate.verifiedConfidence = 0;
+          candidate.note = "locator could not be evaluated";
+        } else if (matchCount === 1) {
+          candidate.verifiedConfidence = candidate.confidence;
+        } else if (matchCount === 0) {
+          candidate.verifiedConfidence = 0;
+          candidate.note = "matches nothing";
+        } else {
+          // Ambiguity is the failure mode that matters, so it costs more than a
+          // weaker-but-unique strategy.
+          candidate.verifiedConfidence = Number((candidate.confidence / (matchCount + 1)).toFixed(3));
+          candidate.note = `matches ${matchCount} elements`;
+
+          if (element.text) {
+            const refined = { ...candidate.locator, hasText: element.text };
+            const refinedCount = await countFor(refined);
+            if (refinedCount === 1) {
+              candidate.refinedLocator = refined;
+              candidate.note += "; narrowed by hasText";
+              summary.refined += 1;
+            }
+          }
+
+          // Identical siblings cannot be told apart by text, so fall back to a
+          // concrete index. This keeps the element addressable instead of
+          // leaving the caller with a locator that hits the wrong node.
+          if (!candidate.refinedLocator && element.domPath && matchCount <= 50) {
+            const index = await this.findLocatorIndex(page, candidate.locator, element.domPath);
+            if (index !== null) {
+              candidate.refinedLocator = { ...candidate.locator, nth: index };
+              candidate.note += `; use nth ${index}`;
+              summary.refined += 1;
+            }
+          }
+        }
+
+        summary.verified += 1;
+        if (candidate.unique) {
+          // A naturally unique locator beats any index-based fallback, so stop
+          // here; an nth is positional and breaks when the page reorders.
+          chosen = candidate.locator;
+          break;
+        }
+      }
+
+      if (!chosen) {
+        const refined = candidates.find((candidate) => candidate.refinedLocator);
+        chosen = refined?.refinedLocator || null;
+      }
+
+      element.locatorCandidates = [...candidates].sort(
+        (left, right) => (right.verifiedConfidence ?? right.confidence) - (left.verifiedConfidence ?? left.confidence),
+      );
+      element.bestLocator = chosen || element.locatorCandidates[0]?.locator || null;
+      element.locatorUnique = Boolean(chosen);
+
+      const verifiedCandidates = element.locatorCandidates.filter((entry) => entry.matchCount !== undefined);
+      if (chosen) {
+        element.locatorStatus = "unique";
+        summary.unique += 1;
+      } else if (verifiedCandidates.some((entry) => (entry.matchCount ?? 0) > 1)) {
+        element.locatorStatus = "ambiguous";
+        summary.ambiguous += 1;
+      } else {
+        element.locatorStatus = "not-found";
+        summary.notFound += 1;
+      }
+
+      if (chosen) {
+        element.enabled = await resolveLocator(page, chosen).isEnabled().catch(() => null);
+      }
+
+      delete element.domPath;
+    }
+
+    return {
+      ...summary,
+      guidance: summary.ambiguous
+        ? "Prefer candidates with locatorStatus \"unique\". For an ambiguous element use refinedLocator, or add hasText or nth yourself."
+        : "Every inspected element resolved to exactly one node.",
+    };
+  }
+
+  // One round trip: ask every matched node for its own path and find ours.
+  async findLocatorIndex(page, locator, domPath) {
+    try {
+      const paths = await resolveLocator(page, locator).evaluateAll((nodes) => nodes.map((node) => {
+        const parts = [];
+        for (let current = node; current && current.parentNode; current = current.parentNode) {
+          parts.unshift([...current.parentNode.childNodes].indexOf(current));
+        }
+        return parts.join("/");
+      }));
+      const index = paths.indexOf(domPath);
+      return index >= 0 ? index : null;
+    } catch {
+      return null;
+    }
   }
 
   async screenshot(sessionId, pageId, request = {}, lockedSession = null) {
@@ -4496,14 +4648,24 @@ function buildOpenApiSpec(req) {
                 schema: {
                   type: "object",
                   properties: {
-                    maxElements: { type: "integer", example: 40 },
-                    maxTextLength: { type: "integer", example: 140 },
+                    maxElements: { type: "integer", example: 40, description: "1-200" },
+                    maxTextLength: { type: "integer", example: 140, description: "20-400" },
+                    verifyLocators: {
+                      type: "boolean",
+                      default: true,
+                      description: "Resolve every candidate against the live DOM to get its real match count",
+                    },
+                    maxVerifiedCandidates: { type: "integer", default: 3, description: "1-6" },
                   },
                 },
               },
             },
           },
-          responses: { 200: { description: "Current page structure, visible text, and recommended locator candidates" } },
+          responses: {
+            200: {
+              description: "Page structure, visible text, and locator candidates verified against the live DOM. Each element carries locatorStatus (unique / ambiguous / not-found), locatorUnique, enabled, and a bestLocator that is known to resolve to one node; each candidate carries matchCount, verifiedConfidence, and a refinedLocator when ambiguity could be narrowed. locatorVerification summarises the page.",
+            },
+          },
         },
       },
       [`${api}/sessions/{sessionId}/pages/{pageId}/click`]: {
@@ -6417,7 +6579,21 @@ const mcpTools = [
   defineTool("context_headers", "Set default extra HTTP headers for a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" }, headers: { type: "object" } }, required: ["sessionId", "contextId", "headers"] }, async (args) => sessionManager.setHeaders(args.sessionId, args.contextId, args)),
   defineTool("page_create", "Create a new page in a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.createPage(args.sessionId, args.contextId)),
   defineTool("page_get", "Get one page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.getPage(args.sessionId, args.pageId)),
-  defineTool("page_inspect", "Inspect a live page and extract headings, visible text, and high-confidence locator candidates for script generation.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" }, maxElements: { type: "number" }, maxTextLength: { type: "number" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.inspectPage(args.sessionId, args.pageId, args)),
+  defineTool(
+    "page_inspect",
+    "Inspect a live page: headings, visible text, and locator candidates that have been resolved against the real DOM. Each element reports locatorStatus (\"unique\" | \"ambiguous\" | \"not-found\") and every candidate reports its real matchCount, so prefer bestLocator and treat any ambiguous element as unsafe to act on.",
+    sessionPageSchema({
+      maxElements: { type: "integer", default: 40, description: "1-200" },
+      maxTextLength: { type: "integer", default: 140, description: "20-400" },
+      verifyLocators: {
+        type: "boolean",
+        default: true,
+        description: "Resolve each candidate against the page to get its real match count. Disable only for a fast, unverified snapshot.",
+      },
+      maxVerifiedCandidates: { type: "integer", default: 3, description: "Candidates to verify per element, 1-6" },
+    }),
+    async (args) => sessionManager.inspectPage(args.sessionId, args.pageId, args),
+  ),
   defineTool("page_delete", "Close one page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.closePage(args.sessionId, args.pageId)),
   defineTool(
     "page_navigate",

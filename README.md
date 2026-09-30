@@ -16,7 +16,7 @@
 - `assert/visible`, `assert/text`, `assert/url`, `assert/count`
 - screenshot, pdf, trace, storage state import/export
 - LLM 보조 API: `assist/capabilities`, `assist/examples`, `assist/plan`, `assist/scaffold`
-- 페이지 구조 분석용 `page_inspect`
+- 실제 DOM 검증을 포함한 페이지 구조 분석 `page_inspect`
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -235,6 +235,33 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 3. 페이지 단위: `POST /api/sessions/{id}/pages/{pageId}/dialog-policy`
 
 처리 결과는 페이지 응답의 `lastDialog` 와 `sessions/{id}/actions` 의 이벤트 로그에서 확인할 수 있습니다.
+
+## Locator 검증
+
+`page_inspect` 는 후보 locator 를 **실제 DOM 에 적용해 본 뒤** 결과를 함께 반환합니다. 전략별 고정 점수(예: `testId`=1, `label`=0.98)만으로는 해당 locator 가 정말 하나의 요소를 가리키는지 알 수 없기 때문입니다.
+
+요소별 필드:
+
+| 필드 | 의미 |
+| --- | --- |
+| `locatorStatus` | `unique` / `ambiguous` / `not-found` |
+| `locatorUnique` | `bestLocator` 가 정확히 한 요소에 대응하는지 |
+| `bestLocator` | 검증을 통과한 locator. 고유한 의미 기반 locator 를 우선하고, 구분이 불가능할 때만 `nth` 를 붙입니다 |
+| `enabled` | 선택된 locator 의 활성 상태 |
+
+후보별 필드:
+
+| 필드 | 의미 |
+| --- | --- |
+| `matchCount` | 실제 일치 요소 수 |
+| `verifiedConfidence` | 일치 수를 반영한 점수. 0 이면 사용하면 안 됩니다 |
+| `refinedLocator` | 모호한 경우 `hasText` 또는 `nth` 로 좁힌 대안 |
+
+응답 최상위의 `locatorVerification` 에 페이지 전체 요약(`unique`/`ambiguous`/`not-found`/`refined`)이 담깁니다.
+
+예를 들어 같은 이름의 버튼이 4개이고 그중 하나에만 `data-testid` 가 있는 페이지에서는, `testId` 가 있는 요소는 `{"testId": "..."}` 를, 나머지 3개는 `{"role": "button", "name": "Save", "nth": 0|1|2}` 를 받습니다. 검증 전에는 네 요소 모두 `{"role": "button", "name": "Save"}` 를 신뢰도 0.95 로 제시했고, 이를 그대로 클릭하면 항상 첫 번째 버튼이 눌렸습니다.
+
+빠른 스냅샷만 필요하면 `verifyLocators: false` 로 끌 수 있고, 요소당 검증 후보 수는 `maxVerifiedCandidates` (기본 3) 로 조절합니다.
 
 ## 스크립트 검사 모드
 
