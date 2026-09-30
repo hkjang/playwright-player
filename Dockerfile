@@ -13,12 +13,17 @@ RUN npm ci --omit=dev --no-fund --no-audit
 COPY server.js ./
 COPY scripts ./scripts
 
-RUN mkdir -p /app/data/runs /app/data/artifacts /app/storage-states \
-  && chown -R pwuser:pwuser /app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# The base image ships an unprivileged pwuser; running the browser and the
-# spawned test processes as root is unnecessary privilege.
-USER pwuser
+RUN mkdir -p /app/data/runs /app/data/artifacts /app/storage-states \
+  && chown -R pwuser:pwuser /app \
+  && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# The server runs as the base image's unprivileged pwuser. The entrypoint starts
+# as root only long enough to align ownership of the mounted directories with
+# pwuser (uid 1001), which a host-created volume will not match, then drops
+# privileges with setpriv. Pass --user to skip that and pick the uid yourself.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 EXPOSE 3000
 

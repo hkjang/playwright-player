@@ -82,6 +82,8 @@ SMOKE_REQUIRE_BROWSER=1 npm test
 docker compose up --build
 ```
 
+컨테이너는 베이스 이미지의 비특권 사용자 `pwuser`(uid 1001)로 서버를 실행합니다. 호스트에서 만든 볼륨은 보통 uid 1000 소유이므로, entrypoint 가 부팅 시 `/app/data` 와 `/app/storage-states` 의 소유권만 맞춘 뒤 권한을 내려놓습니다. `/app/scripts` 는 운영자의 소스일 수 있어 건드리지 않습니다 — 업로드 API 를 쓰려면 그 디렉터리를 uid 1001 이 쓸 수 있게 하거나 `--user` 로 uid 를 직접 지정하세요. 쓸 수 없으면 부팅 로그에 경고가 남고 업로드는 `403 SCRIPTS_DIR_NOT_WRITABLE` 을 반환합니다.
+
 Playwright 공식 권장값에 맞춰 Compose 예시는 `init: true`, `ipc: host` 를 사용합니다.
 
 ### 오프라인망 Docker 이미지 실행

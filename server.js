@@ -27,7 +27,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.5.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.5.1",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -89,9 +89,26 @@ const isDocker = (() => {
   }
 })();
 
-await ensureDir(config.scriptsDir);
-await ensureDir(config.runsDir);
-await ensureDir(config.artifactsDir);
+for (const [label, dirPath] of [
+  ["SCRIPTS_DIR", config.scriptsDir],
+  ["RUNS_DIR", config.runsDir],
+  ["ARTIFACTS_DIR", config.artifactsDir],
+]) {
+  try {
+    await ensureDir(dirPath);
+  } catch (error) {
+    if (error.code === "EACCES" || error.code === "EPERM") {
+      console.error(
+        `cannot write to ${label} (${dirPath}): ${error.code}.\n`
+        + `The process runs as uid ${process.getuid?.() ?? "?"}. If this is a mounted volume, `
+        + "make it writable by that uid (for example `chown -R 1001:1001 ./data`) or run the "
+        + "container with --user matching the directory's owner.",
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
+}
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
@@ -6601,8 +6618,22 @@ async function uploadScript({ scriptKey, content, fileName }) {
   }
 
   const target = resolveScriptUploadPath(config.scriptsDir, scriptKey, fileName);
-  await ensureDir(path.dirname(target.absolutePath));
-  await fsPromises.writeFile(target.absolutePath, content, "utf8");
+  try {
+    await ensureDir(path.dirname(target.absolutePath));
+    await fsPromises.writeFile(target.absolutePath, content, "utf8");
+  } catch (error) {
+    // A read-only or foreign-owned SCRIPTS_DIR is the usual cause, and a bare
+    // EACCES as a 500 tells the caller nothing about how to fix it.
+    if (error.code === "EACCES" || error.code === "EPERM" || error.code === "EROFS") {
+      throw new ApiError(
+        403,
+        "SCRIPTS_DIR_NOT_WRITABLE",
+        `Cannot write to ${config.scriptsDir} (${error.code}). The process runs as uid `
+        + `${process.getuid?.() ?? "?"}; make the scripts directory writable by that uid or mount it read-write.`,
+      );
+    }
+    throw error;
+  }
   await scriptRegistry.refresh();
   console.log(`[scripts] uploaded scriptKey=${target.scriptKey} path=${target.absolutePath} size=${content.length}`);
   return scriptRegistry.get(target.scriptKey);
@@ -6619,7 +6650,19 @@ app.put(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, re
 app.delete(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, res) => {
   const scriptKey = req.params.scriptKey;
   const script = scriptRegistry.get(scriptKey);
-  await fsPromises.unlink(script.absolutePath);
+  try {
+    await fsPromises.unlink(script.absolutePath);
+  } catch (error) {
+    if (error.code === "EACCES" || error.code === "EPERM" || error.code === "EROFS") {
+      throw new ApiError(
+        403,
+        "SCRIPTS_DIR_NOT_WRITABLE",
+        `Cannot delete from ${config.scriptsDir} (${error.code}). The process runs as uid `
+        + `${process.getuid?.() ?? "?"}; make the scripts directory writable by that uid.`,
+      );
+    }
+    throw error;
+  }
   await scriptRegistry.refresh();
   ok(res, { deleted: scriptKey });
 }));

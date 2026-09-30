@@ -16,6 +16,8 @@ services:
       # Restrict which hosts sessions may navigate to:
       # URL_ALLOWLIST: "example.com,*.internal.example.com"
     volumes:
+      # ./data holds run history and evidence and must be kept across restarts.
+      # The entrypoint aligns its ownership with the container user on boot.
       - ./scripts:/app/scripts
       - ./storage-states:/app/storage-states
       - ./data:/app/data
