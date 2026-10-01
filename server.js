@@ -20,6 +20,18 @@ const swaggerUiAssetDir = path.dirname(require.resolve("swagger-ui-dist/package.
 // createRequire to this installation resolves it from the server's tree
 // instead, and works whichever entry point the installed version exposes.
 const serverModuleAnchorUrl = pathToFileURL(path.join(rootDir, "package.json")).href;
+// The version used to be a literal here, which meant every release had to
+// remember to edit two files. v0.13.0 shipped as "0.12.0" in /health until the
+// release checklist caught it; reading package.json removes the chance to drift.
+function readPackageVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")).version;
+  } catch {
+    // Reporting a stale number would be worse than admitting we do not know.
+    return "unknown";
+  }
+}
+
 const documentationPaths = {
   openApi: "/openapi.json",
   docs: "/docs",
@@ -30,7 +42,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.12.0",
+  serviceVersion: process.env.SERVICE_VERSION || readPackageVersion(),
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",

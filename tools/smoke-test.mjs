@@ -1586,6 +1586,13 @@ async function stop() {
 async function run() {
   await start();
 
+  await check("health reports the version in package.json", async () => {
+    // A hand-edited version constant shipped v0.13.0 reporting "0.12.0".
+    const declared = JSON.parse(await fsPromises.readFile(path.join(rootDir, "package.json"), "utf8")).version;
+    const { payload } = await call("GET", "/health", undefined, { auth: false });
+    assert(payload.data.version === declared, `/health says ${payload.data.version}, package.json says ${declared}`);
+  });
+
   await check("health is public and reports limits", async () => {
     const { status, payload } = await call("GET", "/health", undefined, { auth: false });
     assert(status === 200, `expected 200, got ${status}`);
