@@ -22,6 +22,7 @@
 - 실행 목록과 단계별 타임라인을 보여주는 `/runs` 화면
 - 환경·계정·데이터셋 분리와 비밀정보 참조
 - cron 예약 실행, 배포 파이프라인 트리거, 실패 알림 콜백
+- 조건 분기·반복·승인 대기를 지원하는 업무 흐름(`if`/`repeat`/`forEach`/`while`/`break`/`continue`/`approval`)
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -245,6 +246,11 @@ MCP endpoint 는 `/mcp` 입니다.
 | `NOTIFY_ALLOWLIST` | 없음 | 알림 URL 로 허용할 host. 비어 있으면 `URL_ALLOWLIST` 를 따릅니다 |
 | `NOTIFY_TIMEOUT_MS` | `10000` | 알림 POST 타임아웃 |
 | `MAX_DOWNLOAD_BYTES` | `67108864` | 캡처할 다운로드 파일 크기 상한 |
+| `MAX_WORKFLOW_ITERATIONS` | `200` | 반복 1개가 돌 수 있는 최대 회차. 초과하면 잘라내지 않고 거부합니다 |
+| `MAX_WORKFLOW_STEPS` | `500` | 워크플로 하나가 실행할 수 있는 단계 총량. 중첩 반복이 폭주하는 것을 막습니다 |
+| `MAX_WORKFLOW_DURATION_MS` | `300000` | 워크플로 전체 시간 상한. 세션 잠금을 쥐고 돌기 때문에 필요합니다 |
+| `APPROVAL_TIMEOUT_MS` | `3600000` | 승인 대기 게이트 기본 만료. 방치된 게이트가 브라우저 페이지를 계속 붙잡지 않게 합니다 |
+| `MAX_PENDING_APPROVALS` | `50` | 동시에 승인을 기다릴 수 있는 워크플로 수. 초과 시 `429 APPROVAL_LIMIT_EXCEEDED` |
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
@@ -547,6 +553,101 @@ POST /api/sessions/{sessionId}/contexts/{contextId}/request
 
 **캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
 
+## 업무 흐름 분기
+
+평평한 단계 목록은 "언제나 전부 실행한다" 밖에 표현하지 못합니다. 실제 업무는 **분기**하고(승인 배너가 떠 있으면 누르고, 없으면 양식을 채운다) **반복**하고(데이터셋 행마다 같은 처리), 때로는 **사람을 기다립니다**. `execute` 의 `steps` 는 중첩할 수 있습니다.
+
+| 동작 | 필드 | 설명 |
+| --- | --- | --- |
+| `if` | `when`, `then`, `else` | 조건이 참이면 `then`, 거짓이면 `else`(없으면 건너뜀) |
+| `repeat` | `times`, `steps`, `as`/`indexAs` | 정해진 횟수만큼 반복 |
+| `forEach` | `items`, `steps`, `as`/`indexAs` | 배열(또는 `{{captured}}` 배열)의 각 항목마다 반복 |
+| `while` | `when`, `steps`, `maxIterations` | 조건이 참인 동안 반복 |
+| `break` / `continue` | — | 가장 안쪽 반복을 벗어나거나 다음 항목으로 |
+| `approval` | `name`, `message`, `approvers`, `onReject` | 멈추고 사람의 결정을 기다림 |
+
+```jsonc
+{
+  "pageId": "page_...",
+  "variables": { "rows": [{ "id": "A-1" }, { "id": "A-2" }] },
+  "steps": [
+    { "action": "forEach", "items": "{{rows}}", "as": "row", "steps": [
+      { "action": "fill", "locator": { "testId": "order-id" }, "value": "{{row.id}}" },
+      { "action": "click", "locator": { "testId": "search" } },
+      // 화면 상태에 따라 갈라짐
+      { "action": "if",
+        "when": { "locator": { "testId": "already-done" }, "state": "visible" },
+        "then": [{ "action": "continue" }],
+        "else": [{ "action": "click", "locator": { "testId": "approve" } }] }
+    ] }
+  ]
+}
+```
+
+`as` 로 묶은 항목은 `{{row}}` 로, 객체 내부는 `{{row.id}}` 로 참조합니다. 결과의 각 항목에는 `path`(`0.forEach.1` 같은 트리 위치)가 붙습니다 — 중첩되면 평평한 번호만으로는 어느 단계였는지 알 수 없습니다.
+
+### 조건
+
+조건은 **질문**이고 단언이 아닙니다. 답이 "아니오" 인 것은 실패가 아닙니다.
+
+- 값 비교 — `{ "value": "{{status}}", "equals": "APPROVED" }`. 연산자는 `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `endsWith`, `matches`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`, `empty`, `notEmpty` 중 **하나**입니다.
+- 화면 상태 — `{ "locator": {...}, "state": "visible" }`, `{ "locator": {...}, "count": 3, "operator": "gte" }`, `{ "locator": {...}, "text": "완료" }`, `{ "url": "/done" }`, `{ "loadState": "networkidle" }`
+- 조합 — `{ "all": [...] }`, `{ "any": [...] }`, `{ "not": {...} }`
+
+세 가지 결정이 조용한 오답을 막습니다.
+
+**요소가 보이지 않는 것은 거짓이고, 평가할 수 없는 선택자는 오류입니다.** 둘을 같이 묶으면 선택자 오타가 "조건이 거짓이었다"로 둔갑해 분기 전체가 조용히 안 돌아갑니다.
+
+**`matches` 는 정규식 리터럴만 받습니다.** `"matches": "ORD"` 를 부분일치로 받아주면 구분자 오타가 조건을 슬그머니 느슨하게 만듭니다. 평문 비교는 `contains`/`equals` 를 쓰세요.
+
+**숫자 비교는 숫자만 받습니다.** 문자열로 비교하면 `"17" < "9"` 가 참이 되어 수량 검증이 엉뚱한 행을 통과시킵니다.
+
+객체를 문자열에 치환하면 JSON 이 되므로, 조건의 문자열 비교도 같은 형태를 봅니다 — `{ "value": "{{row}}", "contains": "A-1" }` 이 동작합니다. `in` 은 배열을, 숫자 비교는 숫자를 그대로 받습니다.
+
+조건 안에서는 빈 캡처값이 허용됩니다(`{ "value": "{{code}}", "empty": true }` 가 바로 그 질문이므로). 다만 **없는 이름은 여전히 오류**입니다 — 오타를 조건 실패로 숨기지 않습니다.
+
+`continueOnError` 는 단계 실패만 넘깁니다. **조건이 잘못된 요청이면 그대로 실패합니다** — 오타 하나로 분기 하나가 조용히 건너뛰어지면 안 됩니다.
+
+### 반복 상한
+
+```
+WORKFLOW 상한: MAX_WORKFLOW_ITERATIONS=200, MAX_WORKFLOW_STEPS=500, MAX_WORKFLOW_DURATION_MS=300000
+```
+
+**초과하면 잘라내지 않고 거부합니다.** 10,000행 데이터셋에서 앞 200행만 돌고 "완료" 로 보고하는 것이 가장 위험한 실패 방식입니다. 단계별 `maxIterations` 로 줄일 수 있고, 요청의 `limits` 는 **서버 상한보다 좁게만** 적용됩니다(URL 허용목록과 같은 규칙입니다. 그러지 않으면 모든 상한이 요청으로 해제 가능한 권고사항이 됩니다).
+
+조건이 끝까지 거짓이 되지 않은 `while` 은 **조용히 빠져나오지 않고 실패합니다**(`LOOP_LIMIT_EXCEEDED`). 기다리던 상태에 페이지가 도달하지 못한 것이므로, 통과로 보고하면 하지 않은 일을 했다고 말하는 셈입니다.
+
+워크플로는 세션 잠금을 쥐고 돌기 때문에 전체 시간 상한도 함께 적용됩니다.
+
+### 승인 대기
+
+`approval` 단계는 워크플로를 멈추고 응답을 돌려줍니다.
+
+```jsonc
+{ "action": "approval", "name": "finance", "message": "결제 금액을 확인해 주세요",
+  "approvers": ["kim@example.com"], "onReject": "stop", "timeoutMs": 3600000 }
+```
+
+```
+POST /api/sessions/{sessionId}/execute          → status: "awaiting_approval", approval.gateId
+GET  /api/sessions/{sessionId}/approvals
+POST /api/sessions/{sessionId}/approvals/{gateId}/decide   { decision, decidedBy, comment }
+POST /api/sessions/{sessionId}/execute/resume              { gateId }
+```
+
+**사람을 기다리는 동안 세션 잠금을 쥐고 있지 않습니다.** 잠금을 들고 기다리면 그 세션의 다른 요청이 전부 막히고, 승인자가 퇴근하면 영구히 막힙니다. 그래서 단계 목록을 점프가 있는 명령어 배열로 컴파일하고, 프로그램 카운터·캡처값·반복 프레임만 남겨둡니다 — 재귀 실행기는 중간에 멈춰 다음 요청에서 이어받을 수 없습니다. 반복 안의 게이트도 **같은 회차로 돌아와** 이어집니다.
+
+결정은 `{{name}}` 으로 캡처됩니다. `onReject` 기본값은 `stop`(반려 시 이후 단계 미실행, `status: "rejected"`)이고, `continue` 로 두면 이후 단계가 돌며 `if` 로 분기할 수 있습니다.
+
+`/playground` 의 **업무 흐름과 승인** 패널에서 대기 중인 게이트를 사람이 직접 승인·반려할 수 있습니다. 결정 후 `resume` 까지 이어서 호출합니다.
+
+**`decidedBy` 는 감사 기록이고 인증이 아닙니다.** API 토큰은 어느 클라이언트가 호출했는지만 말해주고, 누가 승인했는지는 말해주지 않습니다. `approvers` 목록도 같은 성격의 확인이지 신원 검증이 아닙니다. 게이트를 인증된 사용자에 묶는 것은 프로젝트별 권한 작업이고 아직 없습니다.
+
+멈춘 워크플로는 프로그램·캡처값·결과를 메모리에 들고 있으므로 개수를 제한합니다(`MAX_PENDING_APPROVALS`, 기본 50). 아무것도 결정하지 않는 호출자가 서버를 무한히 키우지 못하게 하는 상한이고, 하나를 결정하면 자리가 다시 납니다.
+
+**대기 중인 게이트는 재시작을 넘기지 못합니다.** 이어서 실행할 브라우저 페이지도 함께 사라지므로, 세션이 닫히거나 만료되면 그 세션의 게이트도 버립니다. 적용할 수 없는 결정을 남겨두지 않기 위한 것입니다. `timeoutMs`(기본 `APPROVAL_TIMEOUT_MS`, 1시간) 가 지난 게이트도 정리됩니다 — 멈춘 워크플로가 브라우저 페이지를 계속 붙잡고 있기 때문입니다.
+
 ## 실행 이력 화면
 
 `/runs` 에서 실행 목록과 단계별 타임라인을 봅니다. 새 API 없이 기존 엔드포인트만 사용합니다.
@@ -709,6 +810,7 @@ Docker 이미지에는 `public/` 이 포함되어야 합니다. 없으면 모든
   - 링크 허브 및 상태 진입점
 - `/playground`
   - 브라우저에서 직접 REST API를 호출하는 운영자용 플레이그라운드
+  - 승인 대기 중인 워크플로를 목록으로 보고 승인·반려할 수 있습니다
 - `/runs`
   - 실행 목록과 단계별 타임라인, 실패 원인과 증적
 - `/demo/test-page`

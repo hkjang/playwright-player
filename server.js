@@ -60,6 +60,11 @@ const config = {
   requeueInterruptedRuns: parseBoolean(process.env.REQUEUE_INTERRUPTED_RUNS, false),
   mcpSessionTtlMs: parseInteger(process.env.MCP_SESSION_TTL_MS, 60 * 60 * 1000),
   maxActionLogEntries: parseInteger(process.env.MAX_ACTION_LOG_ENTRIES, 500),
+  maxWorkflowIterations: parseInteger(process.env.MAX_WORKFLOW_ITERATIONS, 200),
+  maxWorkflowSteps: parseInteger(process.env.MAX_WORKFLOW_STEPS, 500),
+  maxWorkflowDurationMs: parseInteger(process.env.MAX_WORKFLOW_DURATION_MS, 5 * 60 * 1000),
+  approvalTimeoutMs: parseInteger(process.env.APPROVAL_TIMEOUT_MS, 60 * 60 * 1000),
+  maxPendingApprovals: parseInteger(process.env.MAX_PENDING_APPROVALS, 50),
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
   maxRunLogEntries: parseInteger(process.env.MAX_RUN_LOG_ENTRIES, 3000),
   enableEvaluate: parseBoolean(process.env.ENABLE_EVALUATE, true),
@@ -2931,6 +2936,17 @@ class ScriptAssistant {
         description: "page_inspect resolves each candidate against the live DOM and reports matchCount plus locatorStatus. A confidence score alone does not mean the locator is unique.",
         statuses: ["unique", "ambiguous", "not-found"],
       },
+      // Scaffolded scripts are plain Playwright files, so they use native
+      // JavaScript control flow. This block is about session_execute, where
+      // branching is expressed in the step tree instead.
+      sessionWorkflow: {
+        controlFlow: ["if", "repeat", "forEach", "while", "break", "continue", "approval"],
+        description:
+          "session_execute steps nest. if/then/else branches on a captured value or on live page state; "
+          + "repeat, forEach and while loop, with break and continue; approval stops the workflow for a person. "
+          + "A page condition that is simply not true comes back false rather than failing the workflow.",
+        approvalFlow: ["session_execute", "session_approvals", "session_approval_decide", "session_execute_resume"],
+      },
       examplesAvailable: true,
       authoringLocales: ["ko", "en"],
       browserLanguageAwarePages: ["/", documentationPaths.playground, documentationPaths.runs, "/demo/test-page"],
@@ -3211,10 +3227,28 @@ const ALLOWED_API_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "H
 // A reference number read off the page has to be usable by a later step, and in
 // an `execute` batch the caller does not see intermediate results until the whole
 // batch returns. `{{name}}` is substituted from values captured by earlier steps.
-function substituteCaptured(value, captured, seen = new Set()) {
+// A forEach row is usually an object, so `{{row.email}}` has to reach into it.
+// A literal key still wins, so a bag that already holds "a.b" keeps working.
+function lookupCaptured(captured, name) {
+  if (name in captured) {
+    return { found: true, value: captured[name] };
+  }
+
+  if (name.includes(".")) {
+    const [head, ...rest] = name.split(".");
+    if (head in captured) {
+      return { found: true, value: readJsonPath(captured[head], rest.join(".")) };
+    }
+  }
+
+  return { found: false };
+}
+
+function substituteCaptured(value, captured, options = {}, seen = new Set()) {
   if (typeof value === "string") {
     return value.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (match, name) => {
-      if (!(name in captured)) {
+      const hit = lookupCaptured(captured, name);
+      if (!hit.found) {
         throw new ApiError(
           400,
           "UNKNOWN_CAPTURED_VALUE",
@@ -3222,11 +3256,16 @@ function substituteCaptured(value, captured, seen = new Set()) {
         );
       }
 
-      const replacement = captured[name];
+      const replacement = hit.value;
       // Capturing right after a click often reads the element before the page
       // has filled it in. Substituting "" silently produced things like
       // "/api/orders/" and a confusing 404 instead of naming the real problem.
       if (replacement === null || replacement === undefined || replacement === "") {
+        // A condition may be asking whether the value is empty, which is a
+        // legitimate question rather than the mistake above.
+        if (options.allowEmpty) {
+          return "";
+        }
         throw new ApiError(
           422,
           "EMPTY_CAPTURED_VALUE",
@@ -3236,12 +3275,12 @@ function substituteCaptured(value, captured, seen = new Set()) {
         );
       }
 
-      return String(replacement);
+      return typeof replacement === "object" ? JSON.stringify(replacement) : String(replacement);
     });
   }
 
   if (Array.isArray(value)) {
-    return value.map((entry) => substituteCaptured(entry, captured, seen));
+    return value.map((entry) => substituteCaptured(entry, captured, options, seen));
   }
 
   if (value && typeof value === "object") {
@@ -3250,7 +3289,7 @@ function substituteCaptured(value, captured, seen = new Set()) {
     }
     seen.add(value);
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, substituteCaptured(entry, captured, seen)]),
+      Object.entries(value).map(([key, entry]) => [key, substituteCaptured(entry, captured, options, seen)]),
     );
   }
 
@@ -3434,6 +3473,12 @@ function textMatches(actual, expected, mode = "contains") {
   }
 }
 
+// Playwright signals "the state never arrived" with a TimeoutError. For an
+// assertion that is a failure; for a condition it is simply the answer "no".
+function isTimeoutError(error) {
+  return error?.name === "TimeoutError" || /Timeout \d+ms exceeded/.test(error?.message || "");
+}
+
 async function poll(timeoutMs, fn, onTimeoutMessage) {
   const startedAt = monotonicNow();
   do {
@@ -3444,6 +3489,677 @@ async function poll(timeoutMs, fn, onTimeoutMessage) {
   } while (monotonicNow() - startedAt < timeoutMs);
 
   throw new ApiError(408, "TIMEOUT", onTimeoutMessage);
+}
+
+// ---------------------------------------------------------------------------
+// Workflow control flow
+//
+// A batch used to be a flat list: every step ran, in order, always. Real office
+// work branches — "if the approval banner is up, click it, otherwise fill the
+// form" — and repeats over rows of a dataset, and sometimes has to stop and wait
+// for a person. These three needs are what the rest of this section covers.
+// ---------------------------------------------------------------------------
+
+// A condition comparing `{{row}}` against a list or a number needs the value
+// itself, not its stringification, so a reference on its own passes through raw.
+const SINGLE_CAPTURED_REFERENCE = /^\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}$/;
+
+function resolveConditionValue(spec, captured) {
+  if (typeof spec === "string") {
+    const single = SINGLE_CAPTURED_REFERENCE.exec(spec);
+    if (single) {
+      const hit = lookupCaptured(captured, single[1]);
+      if (!hit.found) {
+        throw new ApiError(
+          400,
+          "UNKNOWN_CAPTURED_VALUE",
+          `${spec} refers to a value no earlier step captured. Captured so far: ${Object.keys(captured).join(", ") || "(none)"}`,
+        );
+      }
+      return hit.value;
+    }
+  }
+
+  return substituteCaptured(spec, captured, { allowEmpty: true });
+}
+
+const VALUE_OPERATORS = [
+  "equals", "notEquals", "contains", "notContains", "startsWith", "endsWith",
+  "matches", "in", "notIn", "gt", "gte", "lt", "lte", "empty", "notEmpty",
+];
+
+function isEmptyValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return true;
+  }
+  return Array.isArray(value) ? value.length === 0 : false;
+}
+
+function compareNumeric(operator, actual, expected, label) {
+  const left = Number(actual);
+  const right = Number(expected);
+  // "17" < "9" is true for strings and false for numbers. Guessing which the
+  // caller meant is how a quantity check silently passes on the wrong rows.
+  if (!Number.isFinite(left) || !Number.isFinite(right)) {
+    throw new ApiError(
+      400,
+      "INVALID_CONDITION",
+      `${label}: ${operator} compares numbers, but got ${JSON.stringify(actual)} and ${JSON.stringify(expected)}`,
+    );
+  }
+
+  switch (operator) {
+    case "gt": return left > right;
+    case "gte": return left >= right;
+    case "lt": return left < right;
+    default: return left <= right;
+  }
+}
+
+// An object substituted into a string becomes JSON, so a text comparison
+// against one should see the same thing rather than "[object Object]".
+function textualForm(value) {
+  return value !== null && typeof value === "object" ? JSON.stringify(value) : value;
+}
+
+const TEXT_CONDITION_OPERATORS = new Set([
+  "equals", "notEquals", "contains", "notContains", "startsWith", "endsWith", "matches",
+]);
+
+function evaluateValueCondition(when, captured, label) {
+  const resolved = resolveConditionValue(when.value, captured);
+  const used = VALUE_OPERATORS.filter((operator) => operator in when);
+  if (!used.length) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label}: value needs one of ${VALUE_OPERATORS.join(", ")}`);
+  }
+  // Two operators in one condition means one of them is being ignored, and the
+  // caller cannot tell which.
+  if (used.length > 1) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label}: use one operator at a time, got ${used.join(" and ")}`);
+  }
+
+  const operator = used[0];
+  // `in` needs its array and a numeric comparison needs its number, so only the
+  // text operators see the JSON form.
+  const isTextOperator = TEXT_CONDITION_OPERATORS.has(operator);
+  const actual = isTextOperator ? textualForm(resolved) : resolved;
+  const rawExpected = operator === "empty" || operator === "notEmpty"
+    ? undefined
+    : resolveConditionValue(when[operator], captured);
+  const expected = isTextOperator ? textualForm(rawExpected) : rawExpected;
+
+  switch (operator) {
+    case "empty":
+      return when.empty ? isEmptyValue(actual) : !isEmptyValue(actual);
+    case "notEmpty":
+      return when.notEmpty ? !isEmptyValue(actual) : isEmptyValue(actual);
+    case "equals":
+      return textMatches(actual, normalizePattern(expected), when.match || "equals");
+    case "notEquals":
+      return !textMatches(actual, normalizePattern(expected), when.match || "equals");
+    case "contains":
+      return textMatches(actual, expected, "contains");
+    case "notContains":
+      return !textMatches(actual, expected, "contains");
+    case "startsWith":
+      return textMatches(actual, expected, "startsWith");
+    case "endsWith":
+      return textMatches(actual, expected, "endsWith");
+    case "matches": {
+      // Letting `matches: "ORD"` fall back to a substring test would make a typo
+      // in the delimiters quietly loosen the condition instead of failing.
+      const pattern = parseRegexLiteral(expected);
+      if (!pattern) {
+        throw new ApiError(
+          400,
+          "INVALID_CONDITION",
+          `${label}: matches needs a regular expression literal such as /^ORD-\\d+$/i, got ${JSON.stringify(expected)}. `
+          + "Use contains or equals for plain text.",
+        );
+      }
+      return pattern.test(String(actual ?? ""));
+    }
+    case "in":
+    case "notIn": {
+      if (!Array.isArray(expected)) {
+        throw new ApiError(400, "INVALID_CONDITION", `${label}: ${operator} needs an array, got ${JSON.stringify(expected)}`);
+      }
+      const hit = expected.some((entry) => String(entry) === String(actual));
+      return operator === "in" ? hit : !hit;
+    }
+    default:
+      return compareNumeric(operator, actual, expected, label);
+  }
+}
+
+// `probe` answers the page-state conditions. It is passed in so this stays
+// testable without a browser, and so a false condition never needs an exception.
+async function evaluateCondition(when, captured, probe, label = "when") {
+  if (!when || typeof when !== "object" || Array.isArray(when)) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label} must be an object`);
+  }
+
+  if (Array.isArray(when.all)) {
+    for (const [index, entry] of when.all.entries()) {
+      if (!(await evaluateCondition(entry, captured, probe, `${label}.all[${index}]`))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (Array.isArray(when.any)) {
+    for (const [index, entry] of when.any.entries()) {
+      if (await evaluateCondition(entry, captured, probe, `${label}.any[${index}]`)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (when.not !== undefined) {
+    return !(await evaluateCondition(when.not, captured, probe, `${label}.not`));
+  }
+
+  if (when.locator || when.url !== undefined || when.loadState) {
+    if (!probe) {
+      throw new ApiError(400, "INVALID_CONDITION", `${label}: locator, url and loadState conditions need a page`);
+    }
+    return probe(substituteCaptured(when, captured, { allowEmpty: true }), label);
+  }
+
+  if ("value" in when) {
+    return evaluateValueCondition(when, captured, label);
+  }
+
+  throw new ApiError(
+    400,
+    "INVALID_CONDITION",
+    `${label} needs one of value, locator, url, loadState, all, any, or not`,
+  );
+}
+
+// Whether a condition is well formed does not depend on any runtime value, so
+// it is checked while compiling. A workflow with a malformed condition then
+// fails immediately and without a browser, instead of halfway through the run.
+function validateConditionShape(when, label) {
+  if (!when || typeof when !== "object" || Array.isArray(when)) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label} must be an object`);
+  }
+
+  if (Array.isArray(when.all) || Array.isArray(when.any)) {
+    const key = Array.isArray(when.all) ? "all" : "any";
+    if (!when[key].length) {
+      throw new ApiError(400, "INVALID_CONDITION", `${label}.${key} must not be empty`);
+    }
+    when[key].forEach((entry, index) => validateConditionShape(entry, `${label}.${key}[${index}]`));
+    return;
+  }
+  if (when.not !== undefined) {
+    validateConditionShape(when.not, `${label}.not`);
+    return;
+  }
+  if (when.locator || when.url !== undefined || when.loadState) {
+    return;
+  }
+
+  if (!("value" in when)) {
+    throw new ApiError(
+      400,
+      "INVALID_CONDITION",
+      `${label} needs one of value, locator, url, loadState, all, any, or not`,
+    );
+  }
+
+  const used = VALUE_OPERATORS.filter((operator) => operator in when);
+  if (!used.length) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label}: value needs one of ${VALUE_OPERATORS.join(", ")}`);
+  }
+  if (used.length > 1) {
+    throw new ApiError(400, "INVALID_CONDITION", `${label}: use one operator at a time, got ${used.join(" and ")}`);
+  }
+  // A pattern built from a {{reference}} can only be checked once it is
+  // substituted; a literal one is checkable now.
+  if (used[0] === "matches" && typeof when.matches === "string" && !when.matches.includes("{{")
+    && !parseRegexLiteral(when.matches)) {
+    throw new ApiError(
+      400,
+      "INVALID_CONDITION",
+      `${label}: matches needs a regular expression literal such as /^ORD-\\d+$/i, got ${JSON.stringify(when.matches)}. `
+      + "Use contains or equals for plain text.",
+    );
+  }
+}
+
+const CONTROL_FLOW_ACTIONS = new Set(["if", "repeat", "forEach", "while", "break", "continue", "approval"]);
+const MAX_WORKFLOW_DEPTH = 8;
+const MAX_WORKFLOW_INSTRUCTIONS = 2000;
+
+// The step tree is compiled to a flat instruction list with jumps rather than
+// walked recursively. A recursive walker cannot be suspended at an approval gate
+// and resumed by a later HTTP request; a program counter plus a frame stack is
+// plain JSON, so the whole machine state survives the wait.
+function compileWorkflow(steps, options = {}) {
+  const program = [];
+  const maxDepth = options.maxDepth || MAX_WORKFLOW_DEPTH;
+  // break and continue need addresses inside a loop that has not finished
+  // compiling, so their jumps are collected here and patched on the way out.
+  const loopStack = [];
+  let gateCount = 0;
+
+  const compileBlock = (block, prefix, depth, label) => {
+    if (!Array.isArray(block) || !block.length) {
+      throw new ApiError(400, "INVALID_STEP", `${label} must be a non-empty array of steps`);
+    }
+    if (depth > maxDepth) {
+      throw new ApiError(400, "WORKFLOW_TOO_DEEP", `${label} nests deeper than ${maxDepth} levels`);
+    }
+    block.forEach((step, index) => compileStep(step, `${prefix}${index}`, depth));
+  };
+
+  const compileStep = (step, at, depth) => {
+    if (!step || typeof step !== "object" || Array.isArray(step)) {
+      throw new ApiError(400, "INVALID_STEP", `step ${at} must be an object`);
+    }
+    if (program.length > MAX_WORKFLOW_INSTRUCTIONS) {
+      throw new ApiError(
+        400,
+        "WORKFLOW_TOO_LARGE",
+        `the workflow compiles to more than ${MAX_WORKFLOW_INSTRUCTIONS} instructions`,
+      );
+    }
+
+    switch (step.action) {
+      case "if": {
+        validateConditionShape(step.when, `step ${at}.when`);
+        const testAt = program.length;
+        program.push({ op: "test", at, when: step.when, ifFalse: -1, hasElse: step.else !== undefined });
+        compileBlock(step.then, `${at}.then.`, depth + 1, `step ${at}.then`);
+        if (step.else !== undefined) {
+          const jumpAt = program.length;
+          program.push({ op: "jump", at, target: -1 });
+          program[testAt].ifFalse = program.length;
+          compileBlock(step.else, `${at}.else.`, depth + 1, `step ${at}.else`);
+          program[jumpAt].target = program.length;
+        } else {
+          program[testAt].ifFalse = program.length;
+        }
+        return;
+      }
+
+      case "repeat":
+      case "forEach": {
+        if (step.action === "repeat" && step.times === undefined) {
+          throw new ApiError(400, "INVALID_STEP", `step ${at}: repeat needs times`);
+        }
+        if (step.action === "forEach" && step.items === undefined) {
+          throw new ApiError(400, "INVALID_STEP", `step ${at}: forEach needs items`);
+        }
+        // A literal count over budget is knowable now. A {{reference}} is not,
+        // and is caught by the same limit when the loop starts.
+        const literalTimes = Number(step.times);
+        if (step.action === "repeat" && Number.isFinite(literalTimes)) {
+          const cap = Math.min(Number(step.maxIterations) || WORKFLOW_LIMITS.maxIterations, WORKFLOW_LIMITS.maxIterations);
+          if (literalTimes > cap) {
+            throw new ApiError(
+              400,
+              "LOOP_LIMIT_EXCEEDED",
+              `step ${at}: ${literalTimes} iterations exceeds the limit of ${cap}. `
+              + "Raise maxIterations for this step, or split the work across runs.",
+            );
+          }
+        }
+        program.push({
+          op: "loopStart",
+          at,
+          kind: step.action,
+          times: step.times,
+          items: step.items,
+          as: step.as,
+          indexAs: step.indexAs,
+          maxIterations: step.maxIterations,
+        });
+        const testAt = program.length;
+        program.push({ op: "loopTest", at, end: -1 });
+        const frame = { popFrames: 1, breaks: [], continues: [] };
+        loopStack.push(frame);
+        compileBlock(step.steps, `${at}.${step.action}.`, depth + 1, `step ${at}.steps`);
+        loopStack.pop();
+        const backAt = program.length;
+        program.push({ op: "loopBack", at, target: testAt });
+        program[testAt].end = program.length;
+        for (const index of frame.breaks) {
+          program[index].target = program.length;
+        }
+        for (const index of frame.continues) {
+          program[index].target = backAt;
+        }
+        return;
+      }
+
+      case "while": {
+        validateConditionShape(step.when, `step ${at}.when`);
+        // The counter is reset on entry, so an enclosing loop running this while
+        // loop a second time gets a fresh budget rather than a spent one.
+        const slot = `while@${program.length}`;
+        program.push({ op: "whileInit", at, slot });
+        const testAt = program.length;
+        program.push({ op: "whileTest", at, when: step.when, slot, end: -1, maxIterations: step.maxIterations });
+        const frame = { popFrames: 0, breaks: [], continues: [] };
+        loopStack.push(frame);
+        compileBlock(step.steps, `${at}.while.`, depth + 1, `step ${at}.steps`);
+        loopStack.pop();
+        program.push({ op: "jump", at, target: testAt });
+        program[testAt].end = program.length;
+        for (const index of frame.breaks) {
+          program[index].target = program.length;
+        }
+        for (const index of frame.continues) {
+          program[index].target = testAt;
+        }
+        return;
+      }
+
+      case "break":
+      case "continue": {
+        const frame = loopStack[loopStack.length - 1];
+        if (!frame) {
+          throw new ApiError(
+            400,
+            "INVALID_STEP",
+            `step ${at}: ${step.action} is only valid inside repeat, forEach or while`,
+          );
+        }
+        const isBreak = step.action === "break";
+        (isBreak ? frame.breaks : frame.continues).push(program.length);
+        program.push({
+          op: isBreak ? "loopBreak" : "loopContinue",
+          at,
+          target: -1,
+          popFrames: isBreak ? frame.popFrames : 0,
+        });
+        return;
+      }
+
+      case "approval": {
+        if (!step.name || typeof step.name !== "string") {
+          throw new ApiError(400, "INVALID_STEP", `step ${at}: approval needs a name`);
+        }
+        gateCount += 1;
+        program.push({ op: "gate", at, gate: step });
+        return;
+      }
+
+      default:
+        program.push({ op: "exec", at, step });
+    }
+  };
+
+  compileBlock(steps, "", 0, "steps");
+  return { program, gateCount };
+}
+
+const WORKFLOW_LIMITS = {
+  maxIterations: config.maxWorkflowIterations,
+  maxSteps: config.maxWorkflowSteps,
+  maxDurationMs: config.maxWorkflowDurationMs,
+};
+
+// A caller may tighten its own budget but not loosen the deployment's. The same
+// narrow-only rule the URL allowlist uses: otherwise every limit here is just a
+// suggestion a request can opt out of, and one workflow can hold a session for
+// an hour.
+function normalizeWorkflowLimits(requested) {
+  if (requested === undefined || requested === null) {
+    return undefined;
+  }
+  if (typeof requested !== "object" || Array.isArray(requested)) {
+    throw new ApiError(400, "INVALID_REQUEST", "limits must be an object");
+  }
+
+  const narrowed = {};
+  for (const key of ["maxIterations", "maxSteps", "maxDurationMs"]) {
+    if (requested[key] === undefined) {
+      continue;
+    }
+    const value = Number(requested[key]);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new ApiError(400, "INVALID_REQUEST", `limits.${key} must be a positive number`);
+    }
+    narrowed[key] = Math.min(Math.floor(value), WORKFLOW_LIMITS[key]);
+  }
+
+  return Object.keys(narrowed).length ? narrowed : undefined;
+}
+
+function newWorkflowState(variables = {}) {
+  return { pc: 0, captured: { ...variables }, frames: [], counters: {}, executed: 0, sequence: 0 };
+}
+
+async function runWorkflow(program, state, hooks, options = {}) {
+  const limits = { ...WORKFLOW_LIMITS, ...(options.limits || {}) };
+  const results = options.results || [];
+  const startedAtMonotonic = monotonicNow();
+
+  const record = (entry) => {
+    results.push(cleanObject({ index: state.sequence, ...entry }));
+    state.sequence += 1;
+  };
+
+  while (state.pc < program.length) {
+    // The batch holds the session lock, so a workflow that loops for an hour
+    // would make the session look hung to everyone else.
+    if (elapsedMs(startedAtMonotonic) > limits.maxDurationMs) {
+      throw new ApiError(408, "WORKFLOW_TIMEOUT", `the workflow ran longer than ${limits.maxDurationMs}ms`);
+    }
+
+    const instruction = program[state.pc];
+    switch (instruction.op) {
+      case "exec": {
+        state.executed += 1;
+        if (state.executed > limits.maxSteps) {
+          throw new ApiError(
+            400,
+            "WORKFLOW_STEP_BUDGET_EXCEEDED",
+            `the workflow ran more than ${limits.maxSteps} steps; check the loop bounds`,
+          );
+        }
+        // Declared outside the try so the catch can still name the step that
+        // failed; substitution itself can throw on an unknown {{reference}}.
+        let step = instruction.step;
+        try {
+          step = substituteCaptured(instruction.step, state.captured);
+          const result = await hooks.exec(step, instruction.at);
+          if (step.saveAs) {
+            state.captured[step.saveAs] = pickCapturedValue(step.action, result, step);
+          }
+          record({ path: instruction.at, action: step.action, status: "ok", saveAs: step.saveAs, result });
+        } catch (error) {
+          const apiError = toApiError(error);
+          record({
+            path: instruction.at,
+            action: step.action,
+            status: "error",
+            error: { code: apiError.code, message: apiError.message },
+            artifacts: apiError.artifacts,
+          });
+          if (!options.continueOnError) {
+            apiError.details = {
+              ...(apiError.details || {}),
+              failedStepIndex: state.sequence - 1,
+              failedStepPath: instruction.at,
+              results,
+            };
+            throw apiError;
+          }
+        }
+        state.pc += 1;
+        break;
+      }
+
+      case "test": {
+        // A malformed condition is a bad request, not a step failure, so
+        // continueOnError must not quietly skip a whole branch over a typo.
+        const matched = await evaluateCondition(
+          instruction.when,
+          state.captured,
+          hooks.probe,
+          `step ${instruction.at}.when`,
+        );
+        record({
+          path: instruction.at,
+          action: "if",
+          status: "ok",
+          result: { matched, branch: matched ? "then" : (instruction.hasElse ? "else" : "skipped") },
+        });
+        state.pc = matched ? state.pc + 1 : instruction.ifFalse;
+        break;
+      }
+
+      case "jump":
+        state.pc = instruction.target;
+        break;
+
+      case "loopStart": {
+        let items = null;
+        let count;
+        if (instruction.kind === "repeat") {
+          count = Number(resolveConditionValue(instruction.times, state.captured));
+        } else {
+          const resolved = resolveConditionValue(instruction.items, state.captured);
+          items = typeof resolved === "string" ? parseJsonArray(resolved, instruction.at) : resolved;
+          if (!Array.isArray(items)) {
+            throw new ApiError(
+              400,
+              "INVALID_STEP",
+              `step ${instruction.at}: forEach items must be an array, got ${JSON.stringify(resolved)}`,
+            );
+          }
+          count = items.length;
+        }
+
+        if (!Number.isInteger(count) || count < 0) {
+          throw new ApiError(
+            400,
+            "INVALID_STEP",
+            `step ${instruction.at}: iteration count must be a non-negative whole number, got ${JSON.stringify(count)}`,
+          );
+        }
+        const cap = Math.min(Number(instruction.maxIterations) || limits.maxIterations, limits.maxIterations);
+        // Truncating silently would make a 10,000-row dataset look like it ran
+        // in full, so an over-budget loop is refused instead.
+        if (count > cap) {
+          throw new ApiError(
+            400,
+            "LOOP_LIMIT_EXCEEDED",
+            `step ${instruction.at}: ${count} iterations exceeds the limit of ${cap}. `
+            + "Raise maxIterations for this step, or split the work across runs.",
+          );
+        }
+
+        state.frames.push({
+          at: instruction.at,
+          kind: instruction.kind,
+          i: 0,
+          total: count,
+          items,
+          as: instruction.as,
+          indexAs: instruction.indexAs,
+        });
+        state.pc += 1;
+        break;
+      }
+
+      case "loopTest": {
+        const frame = state.frames[state.frames.length - 1];
+        if (frame.i >= frame.total) {
+          state.frames.pop();
+          record({ path: frame.at, action: frame.kind, status: "ok", result: { iterations: frame.i } });
+          state.pc = instruction.end;
+          break;
+        }
+        if (frame.as) {
+          state.captured[frame.as] = frame.kind === "forEach" ? frame.items[frame.i] : frame.i;
+        }
+        if (frame.indexAs) {
+          state.captured[frame.indexAs] = frame.i;
+        }
+        state.pc += 1;
+        break;
+      }
+
+      case "loopBack":
+        state.frames[state.frames.length - 1].i += 1;
+        state.pc = instruction.target;
+        break;
+
+      case "whileInit":
+        state.counters[instruction.slot] = 0;
+        state.pc += 1;
+        break;
+
+      case "whileTest": {
+        const cap = Math.min(Number(instruction.maxIterations) || limits.maxIterations, limits.maxIterations);
+        const done = state.counters[instruction.slot] ?? 0;
+        if (done >= cap) {
+          // The condition never went false, which means the page never reached
+          // the state the workflow was waiting for. Leaving the loop quietly
+          // would report success for work that did not happen.
+          throw new ApiError(
+            408,
+            "LOOP_LIMIT_EXCEEDED",
+            `step ${instruction.at}: while ran ${done} iterations without its condition going false`,
+          );
+        }
+        const matched = await evaluateCondition(
+          instruction.when,
+          state.captured,
+          hooks.probe,
+          `step ${instruction.at}.when`,
+        );
+        if (!matched) {
+          record({ path: instruction.at, action: "while", status: "ok", result: { iterations: done } });
+          state.pc = instruction.end;
+          break;
+        }
+        state.counters[instruction.slot] = done + 1;
+        state.pc += 1;
+        break;
+      }
+
+      case "loopBreak": {
+        for (let popped = 0; popped < instruction.popFrames; popped += 1) {
+          state.frames.pop();
+        }
+        record({ path: instruction.at, action: "break", status: "ok" });
+        state.pc = instruction.target;
+        break;
+      }
+
+      case "loopContinue":
+        record({ path: instruction.at, action: "continue", status: "ok" });
+        state.pc = instruction.target;
+        break;
+
+      case "gate":
+        // Returning here releases the session lock. Waiting for a person while
+        // holding it would block every other request for this session.
+        return { status: "awaiting_approval", gateAt: state.pc, gate: instruction.gate, results };
+
+      default:
+        throw new ApiError(500, "INVALID_INSTRUCTION", `Unknown workflow instruction ${instruction.op}`);
+    }
+  }
+
+  return { status: "completed", results };
+}
+
+function parseJsonArray(value, at) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new ApiError(400, "INVALID_STEP", `step ${at}: forEach items is not a JSON array: ${truncate(value, 120)}`);
+  }
 }
 
 class SessionManager {
@@ -3461,6 +4177,9 @@ class SessionManager {
     // evidence collected during a run became unreachable the moment the
     // session ended.
     this.artifactIndex = new Map();
+    // Workflows suspended at an approval gate, keyed by gateId. In memory only:
+    // the browser page the continuation needs does not survive a restart either.
+    this.pendingApprovals = new Map();
     this.pageLookup = new WeakMap();
     this.cleanupTimer = setInterval(() => {
       this.cleanupExpiredSessions().catch((error) => {
@@ -3822,6 +4541,7 @@ class SessionManager {
   async closeSession(sessionId, reason = "closed") {
     const session = this.getSession(sessionId);
     this.sessions.delete(sessionId);
+    this.discardApprovals(sessionId, reason);
     await session.browser.close().catch(() => undefined);
     session.status = reason;
     session.updatedAt = toIso();
@@ -4812,7 +5532,7 @@ class SessionManager {
       }
 
       // A Playwright timeout is a failed expectation, not a server fault.
-      const isTimeout = error?.name === "TimeoutError" || /Timeout \d+ms exceeded/.test(error?.message || "");
+      const isTimeout = isTimeoutError(error);
       throw toApiError(error, {
         statusCode: error instanceof ApiError ? error.statusCode : (isTimeout ? 408 : 500),
         code: error instanceof ApiError ? error.code : (isTimeout ? "TIMEOUT" : "PLAYWRIGHT_ACTION_ERROR"),
@@ -5541,8 +6261,74 @@ class SessionManager {
       case "screenshot":
         return this.screenshot(session.sessionId, pageId, step, session);
       default:
+        // A control-flow action is handled by the compiler, never dispatched as
+        // a page command. Reaching here means a caller bypassed compileWorkflow.
+        if (CONTROL_FLOW_ACTIONS.has(step.action)) {
+          throw new ApiError(
+            400,
+            "INVALID_STEP",
+            `${step.action} is a control-flow action and only works inside an execute workflow`,
+          );
+        }
         throw new ApiError(400, "INVALID_STEP", `Unsupported execute step: ${step.action}`);
     }
+  }
+
+  // Answers the page-state half of a condition. A condition is a question, so
+  // "the element is not visible" has to come back as false; only a locator the
+  // page cannot even evaluate is an error. Conflating the two would turn every
+  // untaken branch into a failed workflow.
+  async probeCondition(session, pageId, spec, label) {
+    const outcome = await this.runPageCommandLocked(
+      session,
+      pageId,
+      "condition.probe",
+      { label, ...spec },
+      async (pageRecord) => {
+        const page = pageRecord.page;
+        const timeoutMs = Math.min(Math.max(Number(spec.timeoutMs) || 2000, 0), 30000);
+
+        if (spec.locator) {
+          const locator = resolveLocator(page, spec.locator);
+          if (spec.count !== undefined) {
+            const count = await locator.count();
+            return { matched: countMatches(count, Number(spec.count), spec.operator || "eq"), count };
+          }
+          if (spec.text !== undefined) {
+            const actual = (await locator.first().textContent().catch(() => null)) ?? "";
+            return {
+              matched: textMatches(actual, normalizePattern(spec.text), spec.match || "contains"),
+              actual: truncate(actual, 200),
+            };
+          }
+          try {
+            await locator.waitFor({ state: spec.state || "visible", timeout: timeoutMs });
+            return { matched: true };
+          } catch (error) {
+            if (isTimeoutError(error)) {
+              return { matched: false };
+            }
+            throw error;
+          }
+        }
+
+        if (spec.url !== undefined) {
+          return { matched: textMatches(page.url(), normalizePattern(spec.url), spec.match || "contains"), actual: page.url() };
+        }
+
+        try {
+          await page.waitForLoadState(spec.loadState, { timeout: timeoutMs });
+          return { matched: true };
+        } catch (error) {
+          if (isTimeoutError(error)) {
+            return { matched: false };
+          }
+          throw error;
+        }
+      },
+    );
+
+    return outcome.matched;
   }
 
   // The whole batch runs under a single session lock so a concurrent request
@@ -5555,50 +6341,270 @@ class SessionManager {
       throw new ApiError(400, "INVALID_REQUEST", "pageId is required");
     }
 
+    // Compiled before the lock is taken: a malformed workflow should be a 400
+    // without touching the browser.
+    const { program, gateCount } = compileWorkflow(request.steps);
+    const state = newWorkflowState(request.variables || {});
+
     return this.withLock(sessionId, async (session) => {
       this.getPageRecord(session, request.pageId);
-      const captured = { ...(request.variables || {}) };
-      const results = [];
-      for (const [index, rawStep] of request.steps.entries()) {
-        // Declared outside the try so the catch can still name the step that
-        // failed; substitution itself can throw on an unknown {{reference}}.
-        let step = rawStep;
-        try {
-          step = substituteCaptured(rawStep, captured);
-          const result = await this.runStepLocked(session, request.pageId, step);
-          if (step.saveAs) {
-            captured[step.saveAs] = pickCapturedValue(step.action, result, step);
-          }
-          results.push(cleanObject({
-            index,
-            action: step.action,
-            status: "ok",
-            saveAs: step.saveAs,
-            result,
-          }));
-        } catch (error) {
-          const apiError = toApiError(error);
-          results.push({
-            index,
-            action: step.action,
-            status: "error",
-            error: { code: apiError.code, message: apiError.message },
-            artifacts: apiError.artifacts,
-          });
-          if (!request.continueOnError) {
-            apiError.details = { ...(apiError.details || {}), failedStepIndex: index, results };
-            throw apiError;
-          }
-        }
+      return this.driveWorkflow(session, {
+        pageId: request.pageId,
+        program,
+        state,
+        gateCount,
+        continueOnError: Boolean(request.continueOnError),
+        limits: normalizeWorkflowLimits(request.limits),
+        stepCount: request.steps.length,
+        results: [],
+      });
+    });
+  }
+
+  // Shared by execute and resume so both paths report the same shape and both
+  // suspend the same way.
+  async driveWorkflow(session, context) {
+    const hooks = {
+      exec: (step) => this.runStepLocked(session, context.pageId, step),
+      probe: (spec, label) => this.probeCondition(session, context.pageId, spec, label),
+    };
+
+    const outcome = await runWorkflow(context.program, context.state, hooks, {
+      results: context.results,
+      continueOnError: context.continueOnError,
+      limits: context.limits,
+    });
+
+    const base = {
+      pageId: context.pageId,
+      status: outcome.status,
+      stepCount: context.stepCount,
+      executedCount: context.state.executed,
+      failedCount: context.results.filter((entry) => entry.status === "error").length,
+      captured: context.state.captured,
+      results: context.results,
+    };
+
+    if (outcome.status !== "awaiting_approval") {
+      return base;
+    }
+
+    const approval = this.suspendForApproval(session, context, outcome);
+    return { ...base, approval };
+  }
+
+  // A gate pauses the workflow and hands the decision to a person. The machine
+  // state is kept here, not in the request, so a caller cannot resume from a
+  // program counter it made up.
+  suspendForApproval(session, context, outcome) {
+    this.pruneApprovals();
+    // Each suspended workflow keeps its whole program, captured values and
+    // results in memory, and one session can suspend many. Without a cap, a
+    // caller that never decides anything grows the server without bound.
+    if (this.pendingApprovals.size >= this.options.maxPendingApprovals) {
+      throw new ApiError(
+        429,
+        "APPROVAL_LIMIT_EXCEEDED",
+        `${this.pendingApprovals.size} workflows are already waiting for approval (MAX_PENDING_APPROVALS). `
+        + "Decide or let the pending ones expire first.",
+      );
+    }
+    const gate = outcome.gate;
+    const gateId = createId("gate");
+    const timeoutMs = Math.min(Math.max(Number(gate.timeoutMs) || config.approvalTimeoutMs, 60000), 86400000);
+    const approvers = Array.isArray(gate.approvers) ? gate.approvers.map(String) : null;
+    const record = {
+      gateId,
+      sessionId: session.sessionId,
+      pageId: context.pageId,
+      name: gate.name,
+      message: gate.message ?? null,
+      approvers,
+      saveAs: gate.saveAs || gate.name,
+      onReject: gate.onReject === "continue" ? "continue" : "stop",
+      createdAt: toIso(),
+      expiresAt: toIso(Date.now() + timeoutMs),
+      status: "pending",
+      decision: null,
+      decidedBy: null,
+      decidedAt: null,
+      comment: null,
+      path: outcome.gateAt !== undefined ? context.program[outcome.gateAt]?.at : undefined,
+      // The continuation: program, counter, captured bag and loop frames.
+      program: context.program,
+      state: context.state,
+      gateCount: context.gateCount,
+      continueOnError: context.continueOnError,
+      limits: context.limits,
+      stepCount: context.stepCount,
+      results: context.results,
+    };
+    this.pendingApprovals.set(gateId, record);
+    this.touch(session);
+    console.log(`[approval] waiting gateId=${gateId} name=${gate.name} sessionId=${session.sessionId}`);
+    return this.serializeApproval(record);
+  }
+
+  serializeApproval(record) {
+    return cleanObject({
+      gateId: record.gateId,
+      sessionId: record.sessionId,
+      pageId: record.pageId,
+      name: record.name,
+      message: record.message,
+      approvers: record.approvers,
+      path: record.path,
+      status: record.status,
+      decision: record.decision,
+      decidedBy: record.decidedBy,
+      decidedAt: record.decidedAt,
+      comment: record.comment,
+      createdAt: record.createdAt,
+      expiresAt: record.expiresAt,
+      remainingInstructions: Math.max(0, record.program.length - record.state.pc),
+      captured: record.state.captured,
+    });
+  }
+
+  // A suspended workflow holds a browser page open, so an abandoned gate has to
+  // expire rather than pin the session forever.
+  pruneApprovals() {
+    const now = Date.now();
+    for (const [gateId, record] of this.pendingApprovals) {
+      if (Date.parse(record.expiresAt) <= now) {
+        this.pendingApprovals.delete(gateId);
+        console.log(`[approval] expired gateId=${gateId} name=${record.name}`);
+      }
+    }
+  }
+
+  // The continuation needs the page it was suspended on, so a closed session
+  // takes its gates with it rather than leaving them to be resumed into nothing.
+  discardApprovals(sessionId, reason) {
+    for (const [gateId, record] of this.pendingApprovals) {
+      if (record.sessionId === sessionId) {
+        this.pendingApprovals.delete(gateId);
+        console.log(`[approval] dropped gateId=${gateId} name=${record.name} session ${reason}`);
+      }
+    }
+  }
+
+  getApproval(gateId, sessionId) {
+    this.pruneApprovals();
+    const record = this.pendingApprovals.get(gateId);
+    if (!record) {
+      throw new ApiError(
+        404,
+        "APPROVAL_NOT_FOUND",
+        `No approval is waiting under ${gateId}. It may have been decided, expired, or its session closed.`,
+      );
+    }
+    if (sessionId && record.sessionId !== sessionId) {
+      throw new ApiError(404, "APPROVAL_NOT_FOUND", `No approval is waiting under ${gateId} for session ${sessionId}`);
+    }
+    return record;
+  }
+
+  listApprovals(sessionId) {
+    this.pruneApprovals();
+    return [...this.pendingApprovals.values()]
+      .filter((record) => !sessionId || record.sessionId === sessionId)
+      .map((record) => this.serializeApproval(record));
+  }
+
+  // Records the decision. `decidedBy` is an audit field, not an identity: the
+  // API token says which client called, not which person approved. Tying a gate
+  // to an authenticated user is the per-project roles work, still to come.
+  decideApproval(sessionId, gateId, request = {}) {
+    const record = this.getApproval(gateId, sessionId);
+    if (record.status !== "pending") {
+      throw new ApiError(409, "APPROVAL_ALREADY_DECIDED", `${gateId} was already ${record.status}`);
+    }
+
+    const decision = String(request.decision || "").toLowerCase();
+    if (decision !== "approve" && decision !== "reject") {
+      throw new ApiError(400, "INVALID_DECISION", `decision must be approve or reject (got ${request.decision})`);
+    }
+
+    const decidedBy = String(request.decidedBy || "").trim();
+    if (!decidedBy) {
+      throw new ApiError(400, "INVALID_REQUEST", "decidedBy is required so the decision can be attributed");
+    }
+    if (record.approvers && !record.approvers.includes(decidedBy)) {
+      throw new ApiError(
+        403,
+        "APPROVER_NOT_LISTED",
+        `${decidedBy} is not in the approvers list for ${record.name}: ${record.approvers.join(", ")}`,
+      );
+    }
+
+    record.status = decision === "approve" ? "approved" : "rejected";
+    record.decision = record.status;
+    record.decidedBy = decidedBy;
+    record.decidedAt = toIso();
+    record.comment = request.comment ? truncate(String(request.comment), 1000) : null;
+    console.log(`[approval] ${record.status} gateId=${gateId} by=${decidedBy}`);
+    return this.serializeApproval(record);
+  }
+
+  async resumeExecution(sessionId, request = {}) {
+    const record = this.getApproval(request.gateId, sessionId);
+    if (record.status === "pending") {
+      throw new ApiError(
+        409,
+        "APPROVAL_PENDING",
+        `${record.gateId} has not been decided yet. Record a decision first, then resume.`,
+      );
+    }
+
+    return this.withLock(sessionId, async (session) => {
+      // The page may have been closed while the gate was waiting.
+      this.getPageRecord(session, record.pageId);
+      record.state.captured[record.saveAs] = record.status;
+      record.state.pc += 1;
+
+      if (record.status === "rejected" && record.onReject === "stop") {
+        this.pendingApprovals.delete(record.gateId);
+        record.results.push(cleanObject({
+          index: record.state.sequence,
+          path: record.path,
+          action: "approval",
+          status: "rejected",
+          result: { decision: record.status, decidedBy: record.decidedBy, comment: record.comment },
+        }));
+        return {
+          pageId: record.pageId,
+          status: "rejected",
+          stepCount: record.stepCount,
+          executedCount: record.state.executed,
+          failedCount: record.results.filter((entry) => entry.status === "error").length,
+          captured: record.state.captured,
+          results: record.results,
+          approval: this.serializeApproval(record),
+        };
       }
 
-      return {
-        pageId: request.pageId,
-        stepCount: request.steps.length,
-        failedCount: results.filter((entry) => entry.status === "error").length,
-        captured,
-        results,
-      };
+      record.results.push(cleanObject({
+        index: record.state.sequence,
+        path: record.path,
+        action: "approval",
+        status: "ok",
+        result: { decision: record.status, decidedBy: record.decidedBy, comment: record.comment },
+      }));
+      record.state.sequence += 1;
+      this.pendingApprovals.delete(record.gateId);
+
+      return this.driveWorkflow(session, {
+        gateId: record.gateId,
+        pageId: record.pageId,
+        program: record.program,
+        state: record.state,
+        gateCount: record.gateCount,
+        continueOnError: record.continueOnError,
+        limits: record.limits,
+        stepCount: record.stepCount,
+        results: record.results,
+      });
     });
   }
 
@@ -6324,21 +7330,71 @@ function buildOpenApiSpec(req) {
             },
           },
         },
+        WorkflowCondition: {
+          type: "object",
+          description:
+            "Either a value test ({value, equals|contains|matches|in|gt|empty|...}), a page test "
+            + "({locator, state|count|text} or {url} or {loadState}), or a combinator ({all}, {any}, {not}). "
+            + "A page test that is simply not true comes back false; only a locator the page cannot evaluate errors.",
+          properties: {
+            value: { type: "string", example: "{{orderStatus}}" },
+            equals: { type: "string", example: "APPROVED" },
+            contains: { type: "string" },
+            matches: { type: "string", example: "/^ORD-\\d+$/" },
+            in: { type: "array", items: { type: "string" } },
+            gt: { type: "number" },
+            empty: { type: "boolean" },
+            locator: { $ref: "#/components/schemas/Locator" },
+            state: { type: "string", example: "visible" },
+            url: { type: "string" },
+            loadState: { type: "string", example: "networkidle" },
+            timeoutMs: { type: "integer", example: 2000 },
+            all: { type: "array", items: { $ref: "#/components/schemas/WorkflowCondition" } },
+            any: { type: "array", items: { $ref: "#/components/schemas/WorkflowCondition" } },
+            not: { $ref: "#/components/schemas/WorkflowCondition" },
+          },
+        },
+        WorkflowStep: {
+          type: "object",
+          description:
+            "A page action (goto, click, fill, assertText, apiRequest, ...) or one of the control-flow "
+            + "actions: if, repeat, forEach, while, break, continue, approval.",
+          properties: {
+            action: { type: "string", example: "click" },
+            url: { type: "string", example: `${baseUrl}/demo/test-page` },
+            locator: { $ref: "#/components/schemas/Locator" },
+            value: { type: "string" },
+            saveAs: { type: "string", example: "orderNumber" },
+            when: { $ref: "#/components/schemas/WorkflowCondition" },
+            then: { type: "array", items: { $ref: "#/components/schemas/WorkflowStep" } },
+            else: { type: "array", items: { $ref: "#/components/schemas/WorkflowStep" } },
+            steps: { type: "array", items: { $ref: "#/components/schemas/WorkflowStep" } },
+            times: { type: "integer", example: 3 },
+            items: { description: "Array, or a {{captured}} reference to one", example: "{{rows}}" },
+            as: { type: "string", example: "row" },
+            indexAs: { type: "string", example: "i" },
+            maxIterations: { type: "integer", example: 50 },
+            name: { type: "string", example: "finance", description: "approval: gate name" },
+            message: { type: "string", example: "결제 금액을 확인해 주세요" },
+            approvers: { type: "array", items: { type: "string" } },
+            onReject: { type: "string", enum: ["stop", "continue"], example: "stop" },
+            timeoutMs: { type: "integer", example: 3600000 },
+          },
+        },
         ExecuteBatchRequest: {
           type: "object",
           required: ["pageId", "steps"],
           properties: {
             pageId: { type: "string", example: "page_1234567890abcdef" },
-            steps: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  action: { type: "string", example: "goto" },
-                  url: { type: "string", example: `${baseUrl}/demo/test-page` },
-                  locator: { $ref: "#/components/schemas/Locator" },
-                  value: { type: "string" },
-                },
+            steps: { type: "array", items: { $ref: "#/components/schemas/WorkflowStep" } },
+            variables: { type: "object", additionalProperties: true },
+            continueOnError: { type: "boolean", example: false },
+            limits: {
+              type: "object",
+              properties: {
+                maxIterations: { type: "integer", example: 200 },
+                maxSteps: { type: "integer", example: 500 },
+                maxDurationMs: { type: "integer", example: 300000 },
               },
             },
           },
@@ -6685,7 +7741,7 @@ function buildOpenApiSpec(req) {
       [`${api}/sessions/{sessionId}/execute`]: {
         post: {
           tags: ["Sessions"],
-          summary: "Execute a batch of page actions",
+          summary: "Execute a workflow: actions with if, repeat, forEach, while and approval gates",
           parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
           requestBody: {
             required: true,
@@ -6695,7 +7751,81 @@ function buildOpenApiSpec(req) {
               },
             },
           },
-          responses: { 200: { description: "Batch execution result" } },
+          responses: {
+            200: {
+              description: "status completed, rejected, or awaiting_approval when the workflow stopped at a gate",
+            },
+          },
+        },
+      },
+      [`${api}/sessions/{sessionId}/execute/resume`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Resume a workflow that stopped at an approval gate",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["gateId"],
+                  properties: { gateId: { type: "string", example: "gate_1234567890abcdef" } },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Execution result after the gate" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/approvals`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "List workflows waiting for an approval decision",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Pending approvals" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/approvals/{gateId}`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "Read one approval gate",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "gateId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: { 200: { description: "Approval gate" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/approvals/{gateId}/decide`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Approve or reject a waiting workflow",
+          parameters: [
+            { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
+            { name: "gateId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["decision", "decidedBy"],
+                  properties: {
+                    decision: { type: "string", enum: ["approve", "reject"], example: "approve" },
+                    decidedBy: {
+                      type: "string",
+                      example: "kim@example.com",
+                      description: "Audit field. The API token identifies the client, not the person.",
+                    },
+                    comment: { type: "string", example: "금액 확인했습니다" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Recorded decision" } },
         },
       },
       [`${api}/sessions/{sessionId}/pages/{pageId}/goto`]: {
@@ -7379,6 +8509,10 @@ app.get("/health", asyncRoute(async (req, res) => {
       maxQueuedRuns: config.maxQueuedRuns,
       maxRetainedRuns: config.maxRetainedRuns,
       runTimeoutMs: config.runTimeoutMs,
+      maxWorkflowIterations: config.maxWorkflowIterations,
+      maxWorkflowSteps: config.maxWorkflowSteps,
+      maxWorkflowDurationMs: config.maxWorkflowDurationMs,
+      maxPendingApprovals: config.maxPendingApprovals,
     },
     features: {
       evaluate: config.enableEvaluate,
@@ -7386,6 +8520,10 @@ app.get("/health", asyncRoute(async (req, res) => {
       failureArtifacts: config.captureFailureArtifacts,
       persistentRunHistory: true,
       scheduler: config.scheduleTickMs > 0,
+      workflowControlFlow: ["if", "repeat", "forEach", "while", "break", "continue", "approval"],
+      // Gates live in memory with the session they suspended, so a restart
+      // cancels them rather than silently resuming later.
+      approvalGatesPersistAcrossRestart: false,
       urlAllowlist: config.urlAllowlist,
       urlAllowlistCoverage: config.urlAllowlist.length
         ? ["sessions", "runs"]
@@ -7696,6 +8834,22 @@ app.post(`${config.apiBasePath}/sessions/:sessionId/execute`, asyncRoute(async (
   ok(res, await sessionManager.execute(req.params.sessionId, req.body || {}));
 }));
 
+app.post(`${config.apiBasePath}/sessions/:sessionId/execute/resume`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.resumeExecution(req.params.sessionId, req.body || {}));
+}));
+
+app.get(`${config.apiBasePath}/sessions/:sessionId/approvals`, asyncRoute(async (req, res) => {
+  ok(res, { approvals: sessionManager.listApprovals(req.params.sessionId) });
+}));
+
+app.get(`${config.apiBasePath}/sessions/:sessionId/approvals/:gateId`, asyncRoute(async (req, res) => {
+  ok(res, sessionManager.serializeApproval(sessionManager.getApproval(req.params.gateId, req.params.sessionId)));
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/approvals/:gateId/decide`, asyncRoute(async (req, res) => {
+  ok(res, sessionManager.decideApproval(req.params.sessionId, req.params.gateId, req.body || {}));
+}));
+
 app.post(`${config.apiBasePath}/sessions/:sessionId/contexts`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.createContext(req.params.sessionId, req.body || {}), 201);
 }));
@@ -7859,6 +9013,55 @@ const DIALOG_POLICY_SCHEMA = {
   required: ["action"],
 };
 
+// A condition answers a question about the page or about a captured value. It
+// never fails the workflow when the answer is no, which is what separates it
+// from an assertion.
+const CONDITION_SCHEMA = {
+  type: "object",
+  description:
+    "A value test, a page test, or a combinator. Value test: {value, and one of equals, notEquals, contains, "
+    + "notContains, startsWith, endsWith, matches (regex literal), in, notIn, gt, gte, lt, lte, empty, notEmpty}. "
+    + "Page test: {locator, state} or {locator, count, operator} or {locator, text, match} or {url, match} or "
+    + "{loadState}. Combinators: {all: [...]}, {any: [...]}, {not: {...}}.",
+  properties: {
+    value: { type: "string", description: "Usually a {{captured}} reference" },
+    equals: { type: "string" },
+    notEquals: { type: "string" },
+    contains: { type: "string" },
+    notContains: { type: "string" },
+    startsWith: { type: "string" },
+    endsWith: { type: "string" },
+    matches: { type: "string", description: "Regular expression literal, e.g. /^ORD-\\d+$/i" },
+    in: { type: "array", items: { type: "string" } },
+    notIn: { type: "array", items: { type: "string" } },
+    gt: { type: "number" },
+    gte: { type: "number" },
+    lt: { type: "number" },
+    lte: { type: "number" },
+    empty: { type: "boolean" },
+    notEmpty: { type: "boolean" },
+    locator: LOCATOR_SCHEMA,
+    state: { type: "string", enum: ["attached", "detached", "visible", "hidden"] },
+    count: { type: "integer" },
+    operator: { type: "string", enum: ["eq", "gt", "gte", "lt", "lte"] },
+    text: { type: "string" },
+    match: { type: "string", enum: ["contains", "equals", "startsWith", "endsWith"] },
+    url: { type: "string" },
+    loadState: { type: "string", enum: ["load", "domcontentloaded", "networkidle"] },
+    timeoutMs: { type: "integer", description: "How long to wait for a page condition before answering no. Default 2000." },
+    all: { type: "array", items: { type: "object", additionalProperties: true } },
+    any: { type: "array", items: { type: "object", additionalProperties: true } },
+    not: { type: "object", additionalProperties: true },
+  },
+};
+
+const NESTED_STEPS_SCHEMA = {
+  type: "array",
+  minItems: 1,
+  items: { type: "object", additionalProperties: true },
+  description: "Nested steps, each the same shape as the step that contains them.",
+};
+
 const STEP_SCHEMA = {
   type: "object",
   description: "One automation step. Field requirements follow the action.",
@@ -7872,6 +9075,8 @@ const STEP_SCHEMA = {
         // Outcome checks: a green button is not a completed task.
         "apiRequest", "assertApiResponse", "assertValue", "assertDownload",
         "waitFor", "screenshot",
+        // Control flow: real work branches, repeats, and sometimes waits for a person.
+        "if", "repeat", "forEach", "while", "break", "continue", "approval",
       ],
     },
     url: { type: "string", description: "goto / assertUrl / waitFor" },
@@ -7908,6 +9113,20 @@ const STEP_SCHEMA = {
     // Capture and reuse
     saveAs: { type: "string", description: "Store this step's value under a name; later steps can use {{name}}" },
     savePath: { type: "string", description: "Dotted path to pluck from the result before saving" },
+    // Control flow
+    when: CONDITION_SCHEMA,
+    then: NESTED_STEPS_SCHEMA,
+    else: NESTED_STEPS_SCHEMA,
+    steps: NESTED_STEPS_SCHEMA,
+    times: { type: "integer", description: "repeat: how many iterations. May be a {{captured}} reference." },
+    items: { description: "forEach: an array, or a {{captured}} reference to one" },
+    as: { type: "string", description: "repeat / forEach: name the iteration value is bound to, usable as {{name}} or {{name.field}}" },
+    indexAs: { type: "string", description: "repeat / forEach: name the zero-based index is bound to" },
+    maxIterations: { type: "integer", description: "Per-loop iteration cap; cannot exceed the server limit" },
+    name: { type: "string", description: "approval: the gate name, also where the decision is captured" },
+    message: { type: "string", description: "approval: what the person is being asked to confirm" },
+    approvers: { type: "array", items: { type: "string" }, description: "approval: decidedBy must be one of these. An audit check, not authentication." },
+    onReject: { type: "string", enum: ["stop", "continue"], description: "approval: default stop. With continue, later steps run and can branch on {{name}}." },
   },
   required: ["action"],
 };
@@ -8252,7 +9471,7 @@ const mcpTools = [
   defineTool("session_trace", "Start or stop Playwright tracing for a context.", { type: "object", properties: { sessionId: { type: "string" }, action: { type: "string" }, contextId: { type: "string" }, title: { type: "string" } }, required: ["sessionId", "action", "contextId"] }, async (args) => args.action === "start" ? sessionManager.startTrace(args.sessionId, args) : sessionManager.stopTrace(args.sessionId, args)),
   defineTool(
     "session_execute",
-    "Execute a batch of page steps. The whole batch holds the session lock, so no other call can interleave between steps. A step can capture a value with saveAs and later steps reference it as {{name}}, which is how a reference number read off the page gets checked against the API in one call.",
+    "Run a workflow of page steps. The whole workflow holds the session lock, so no other call can interleave between steps. A step can capture a value with saveAs and later steps reference it as {{name}}, which is how a reference number read off the page gets checked against the API in one call. Steps are not limited to a flat list: use if/then/else to branch on the page or on a captured value, repeat/forEach/while to loop (with break and continue), and approval to stop and wait for a person. When a workflow reaches an approval gate the response comes back with status awaiting_approval and an approval.gateId; record a decision with session_approval_decide, then continue with session_execute_resume.",
     {
       type: "object",
       properties: {
@@ -8260,11 +9479,52 @@ const mcpTools = [
         pageId: { type: "string" },
         steps: { type: "array", items: STEP_SCHEMA, minItems: 1 },
         variables: { type: "object", additionalProperties: true, description: "Seed values available as {{name}} from the first step" },
-        continueOnError: { type: "boolean", default: false, description: "Keep running later steps after one fails." },
+        continueOnError: { type: "boolean", default: false, description: "Keep running later steps after one fails. A malformed condition still fails the workflow, so a typo cannot silently skip a branch." },
+        limits: {
+          type: "object",
+          description: "Tighten this workflow's budget. Values above the server limit are clamped down to it.",
+          properties: {
+            maxIterations: { type: "integer" },
+            maxSteps: { type: "integer" },
+            maxDurationMs: { type: "integer" },
+          },
+        },
       },
       required: ["sessionId", "pageId", "steps"],
     },
     async (args) => sessionManager.execute(args.sessionId, args),
+  ),
+  defineTool(
+    "session_approvals",
+    "List the workflows in a session that are stopped at an approval gate, with the message each one is waiting on.",
+    { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] },
+    async (args) => ({ approvals: sessionManager.listApprovals(args.sessionId) }),
+  ),
+  defineTool(
+    "session_approval_decide",
+    "Approve or reject a workflow waiting at a gate. decidedBy is recorded for the audit trail; it is not verified, so do not invent a name — pass the one the person gave you.",
+    {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        gateId: { type: "string" },
+        decision: { type: "string", enum: ["approve", "reject"] },
+        decidedBy: { type: "string", description: "Who decided. Required." },
+        comment: { type: "string" },
+      },
+      required: ["sessionId", "gateId", "decision", "decidedBy"],
+    },
+    async (args) => sessionManager.decideApproval(args.sessionId, args.gateId, args),
+  ),
+  defineTool(
+    "session_execute_resume",
+    "Continue a workflow that stopped at an approval gate, after a decision has been recorded. The remaining steps pick up where they left off, inside the same loop iteration if the gate was in a loop, and the decision is available as {{gateName}}.",
+    {
+      type: "object",
+      properties: { sessionId: { type: "string" }, gateId: { type: "string" } },
+      required: ["sessionId", "gateId"],
+    },
+    async (args) => sessionManager.resumeExecution(args.sessionId, args),
   ),
   defineTool(
     "context_create",

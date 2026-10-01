@@ -80,6 +80,17 @@
             <button type="button" id="closeSessionBtn" class="warn">{{copy.closeSessionButton}}</button>
           </div>
         </section>
+        <section class="panel">
+          <h2>{{copy.workflowTitle}}</h2>
+          <p>{{copy.workflowBody}}</p>
+          <div class="row">
+            <button type="button" id="runWorkflowBtn">{{copy.runWorkflowButton}}</button>
+            <button type="button" id="refreshApprovalsBtn" class="secondary">{{copy.refreshApprovalsButton}}</button>
+          </div>
+          <label>{{copy.decidedByLabel}}<input id="decidedBy" placeholder="{{copy.decidedByPlaceholder}}"></label>
+          <label>{{copy.approvalCommentLabel}}<input id="approvalComment" placeholder="{{copy.approvalCommentPlaceholder}}"></label>
+          <div id="approvalList" data-testid="approval-list" style="margin-top:12px;">{{copy.noApprovals}}</div>
+        </section>
       </div>
 
       <div>

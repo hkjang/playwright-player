@@ -83,7 +83,22 @@
       "source": "playground"
     },
     "demoPrimaryExpected": "Primary clicked",
-    "demoMessageSentExpected": "Message sent"
+    "demoMessageSentExpected": "Message sent",
+    "workflowTitle": "Workflow and approvals",
+    "workflowBody": "Run a workflow with branching, loops and approval gates. The sample increments the demo counter twice, waiting for a person on each pass.",
+    "runWorkflowButton": "Run the gated sample",
+    "refreshApprovalsButton": "Refresh approvals",
+    "decidedByLabel": "Decided by",
+    "decidedByPlaceholder": "kim@example.com",
+    "approvalCommentLabel": "Comment (optional)",
+    "approvalCommentPlaceholder": "Amount checked",
+    "noApprovals": "Nothing is waiting for approval.",
+    "noApprovalMessage": "(no message)",
+    "approveButton": "Approve",
+    "rejectButton": "Reject",
+    "decidedByRequired": "A decision has to say who made it. Fill in the approver field.",
+    "approvalSampleMessage": "May the counter go up by one?",
+    "workflowStatusPrefix": "Workflow status:"
   },
   "demo": {
     "title": "Playwright Player Demo Page",

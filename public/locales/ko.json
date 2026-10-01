@@ -83,7 +83,22 @@
       "source": "playground"
     },
     "demoPrimaryExpected": "기본 액션 클릭됨",
-    "demoMessageSentExpected": "메시지 전송 완료"
+    "demoMessageSentExpected": "메시지 전송 완료",
+    "workflowTitle": "업무 흐름과 승인",
+    "workflowBody": "조건 분기·반복·승인 대기를 포함한 워크플로를 실행합니다. 예시는 데모 페이지의 카운터를 두 번 올리는데, 각 회차마다 사람의 승인을 기다립니다.",
+    "runWorkflowButton": "승인이 필요한 예시 실행",
+    "refreshApprovalsButton": "승인 대기 새로고침",
+    "decidedByLabel": "승인자",
+    "decidedByPlaceholder": "kim@example.com",
+    "approvalCommentLabel": "의견 (선택)",
+    "approvalCommentPlaceholder": "금액 확인했습니다",
+    "noApprovals": "대기 중인 승인이 없습니다.",
+    "noApprovalMessage": "(안내 문구 없음)",
+    "approveButton": "승인",
+    "rejectButton": "반려",
+    "decidedByRequired": "누가 결정했는지 기록해야 합니다. 승인자 칸을 채우세요.",
+    "approvalSampleMessage": "카운터를 1 올려도 될까요?",
+    "workflowStatusPrefix": "워크플로 상태:"
   },
   "demo": {
     "title": "Playwright Player 데모 페이지",

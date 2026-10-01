@@ -1108,6 +1108,90 @@ async function runOutcomeChecks() {
   }
 }
 
+// Suspended workflows live in memory with their whole program and captured
+// values, so the number of them has to be bounded. Runs on its own instance
+// because the limit is read at boot.
+async function runApprovalLimitChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-gates-"));
+  const gatesPort = port + 7;
+  const gatesUrl = `http://127.0.0.1:${gatesPort}`;
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(gatesPort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: path.join(dataDir, "scripts"),
+      RUNS_DIR: path.join(dataDir, "runs"),
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      DATA_DIR: path.join(dataDir, "data"),
+      SCHEDULE_TICK_MS: "0",
+      MAX_PENDING_APPROVALS: "2",
+    },
+  });
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${gatesUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  try {
+    await waitForHealth(gatesUrl);
+    const session = await api("POST", "/api/sessions", {});
+    if (session.status !== 201) {
+      const message = session.payload?.error?.message || `HTTP ${session.status}`;
+      if (/Executable doesn't exist|playwright install/i.test(message) && !requireBrowser) {
+        record("approval limit checks", "skip", "no Playwright browser installed");
+        return;
+      }
+      record("approval limit checks", "fail", message.split("\n")[0]);
+      return;
+    }
+
+    const sessionId = session.payload.data.sessionId;
+    const contextId = (await api("POST", `/api/sessions/${sessionId}/contexts`, {})).payload.data.contextId;
+    const pageId = (await api("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {})).payload.data.pageId;
+    await api("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${gatesUrl}/demo/test-page` });
+
+    await check("waiting workflows cannot pile up without bound", async () => {
+      const gate = (name) => api("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{ action: "approval", name }],
+      });
+
+      const first = await gate("one");
+      const second = await gate("two");
+      assert(first.payload.data.status === "awaiting_approval", JSON.stringify(first.payload.data.status));
+      assert(second.payload.data.status === "awaiting_approval", JSON.stringify(second.payload.data.status));
+
+      const third = await gate("three");
+      assert(third.status === 429, `expected 429, got ${third.status}`);
+      assert(third.payload.error.code === "APPROVAL_LIMIT_EXCEEDED", third.payload.error.code);
+
+      // Deciding one frees the slot, so the limit is a queue depth and not a
+      // dead end.
+      const gateId = first.payload.data.approval.gateId;
+      await api("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+        decision: "approve", decidedBy: "kim@example.com",
+      });
+      await api("POST", `/api/sessions/${sessionId}/execute/resume`, { gateId });
+      const fourth = await gate("four");
+      assert(fourth.payload.data.status === "awaiting_approval", JSON.stringify(fourth.payload));
+    });
+
+    await api("DELETE", `/api/sessions/${sessionId}`);
+  } finally {
+    proc.kill("SIGTERM");
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
 async function runRetentionChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-retain-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -1980,6 +2064,113 @@ async function run() {
     assert(response.status === 403, `expected 403, got ${response.status}`);
   });
 
+  // A workflow is compiled before the session lock is taken, so these checks
+  // need no browser: a malformed workflow comes back as a 400 either way.
+  await check("a malformed workflow is rejected before any browser work", async () => {
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      steps: [{ action: "if", when: { value: "a", equals: "a" }, then: [] }],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(payload.error.code === "INVALID_STEP", payload.error.code);
+    assert(/non-empty/.test(payload.error.message), payload.error.message);
+  });
+
+  await check("break outside a loop is rejected", async () => {
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      steps: [{ action: "break" }],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(/only valid inside/.test(payload.error.message), payload.error.message);
+  });
+
+  await check("a workflow nested past the depth limit is rejected", async () => {
+    let node = { action: "click", locator: { testId: "x" } };
+    for (let depth = 0; depth < 12; depth += 1) {
+      node = { action: "repeat", times: 1, steps: [node] };
+    }
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      steps: [node],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(payload.error.code === "WORKFLOW_TOO_DEEP", payload.error.code);
+  });
+
+  await check("a request cannot raise the server's loop limit", async () => {
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      limits: { maxIterations: 100000 },
+      steps: [{ action: "repeat", times: 100000, maxIterations: 100000, steps: [{ action: "click", locator: { testId: "x" } }] }],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(payload.error.code === "LOOP_LIMIT_EXCEEDED", payload.error.code);
+    // Silently running only the first 200 rows of a 100000-row loop would
+    // report success for work that never happened.
+    assert(/exceeds the limit of 200/.test(payload.error.message), payload.error.message);
+  });
+
+  await check("matches needs a regular expression literal, not a bare string", async () => {
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      variables: { code: "ORD-1" },
+      steps: [{ action: "if", when: { value: "{{code}}", matches: "ORD" }, then: [{ action: "click", locator: { testId: "x" } }] }],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(payload.error.code === "INVALID_CONDITION", payload.error.code);
+    assert(/regular expression literal/.test(payload.error.message), payload.error.message);
+  });
+
+  await check("a condition with two operators is rejected", async () => {
+    const { status, payload } = await call("POST", "/api/sessions/no-such-session/execute", {
+      pageId: "page_nothing",
+      steps: [{ action: "if", when: { value: "a", equals: "a", contains: "a" }, then: [{ action: "click", locator: { testId: "x" } }] }],
+    });
+    assert(status === 400, `expected 400, got ${status}`);
+    assert(/one operator at a time/.test(payload.error.message), payload.error.message);
+  });
+
+  await check("mcp session_execute advertises control flow and the approval loop", async () => {
+    const init = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const mcpSessionId = init.headers.get("mcp-session-id");
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Mcp-Session-Id": mcpSessionId, Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    });
+    const tools = await response.json();
+    const byName = new Map(tools.result.tools.map((tool) => [tool.name, tool]));
+    const execute = byName.get("session_execute");
+    const actions = execute.inputSchema.properties.steps.items.properties.action.enum;
+    for (const action of ["if", "repeat", "forEach", "while", "break", "continue", "approval"]) {
+      assert(actions.includes(action), `session_execute does not advertise ${action}`);
+    }
+    const stepProps = execute.inputSchema.properties.steps.items.properties;
+    for (const field of ["when", "then", "else", "steps", "times", "items", "as"]) {
+      assert(stepProps[field], `session_execute step schema is missing ${field}`);
+    }
+    // An agent that cannot find these three has no way to clear a gate.
+    for (const name of ["session_approvals", "session_approval_decide", "session_execute_resume"]) {
+      assert(byName.has(name), `mcp is missing ${name}`);
+    }
+    assert(byName.get("session_approval_decide").inputSchema.required.includes("decidedBy"),
+      "a decision can be recorded without saying who made it");
+  });
+
+  await check("health reports the workflow limits and that gates do not survive a restart", async () => {
+    const { payload } = await call("GET", "/health", undefined, { auth: false });
+    assert(payload.data.limits.maxWorkflowIterations === 200, JSON.stringify(payload.data.limits));
+    assert(payload.data.features.approvalGatesPersistAcrossRestart === false,
+      JSON.stringify(payload.data.features.approvalGatesPersistAcrossRestart));
+    assert(payload.data.features.workflowControlFlow.includes("approval"),
+      JSON.stringify(payload.data.features.workflowControlFlow));
+  });
+
   await check("openapi documents every implemented route", async () => {
     const { payload } = await call("GET", "/openapi.json", undefined, { auth: false });
     const source = await fsPromises.readFile(path.join(rootDir, "server.js"), "utf8");
@@ -2026,6 +2217,7 @@ async function run() {
   // ---- restart recovery and retention (need their own server instances) ----
   await runRestartChecks();
   await runRetentionChecks();
+  await runApprovalLimitChecks();
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();
@@ -2535,6 +2727,384 @@ async function run() {
 
       await call("DELETE", `/api/runs/${runId}`);
       await call("DELETE", "/api/scripts/ui-timeline");
+    });
+
+    // The shared page is wherever the previous check left it, so every check
+    // below that uses the demo test ids navigates for itself rather than
+    // depending on the one before it.
+    const gotoDemo = () => call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+      url: `${baseUrl}/demo/test-page`,
+      waitUntil: "domcontentloaded",
+    });
+
+    await check("a workflow branches on what the page actually shows", async () => {
+      await gotoDemo();
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          {
+            action: "if",
+            when: { locator: { testId: "counter-value" }, state: "visible" },
+            then: [{ action: "click", locator: { testId: "increment-counter" } }],
+            else: [{ action: "click", locator: { testId: "primary-action" } }],
+          },
+          { action: "assertText", locator: { testId: "counter-value" }, expected: "1", match: "equals", timeoutMs: 5000 },
+        ],
+      });
+      assert(status === 200, `execute returned ${status}`);
+      assert(payload.data.status === "completed", payload.data.status);
+      assert(payload.data.results[0].result.branch === "then", JSON.stringify(payload.data.results[0]));
+      // The path says where in the tree a result came from, which a flat index
+      // cannot once steps nest.
+      assert(payload.data.results[1].path === "0.then.0", payload.data.results[1].path);
+    });
+
+    await check("a condition that is simply false is an answer, not a failure", async () => {
+      await gotoDemo();
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{
+          action: "if",
+          when: { locator: { testId: "not-on-this-page" }, state: "visible", timeoutMs: 500 },
+          then: [{ action: "click", locator: { testId: "primary-action" } }],
+          else: [{ action: "click", locator: { testId: "secondary-action" } }],
+        }],
+      });
+      assert(status === 200, `execute returned ${status}`);
+      assert(payload.data.results[0].result.matched === false, JSON.stringify(payload.data.results[0]));
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+    });
+
+    await check("a locator the page cannot evaluate still fails the workflow", async () => {
+      await gotoDemo();
+      // The distinction that matters: "not visible" is false, but a selector
+      // Playwright cannot parse is a mistake worth surfacing.
+      const { status } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{
+          action: "if",
+          when: { locator: { css: "###" }, state: "visible", timeoutMs: 500 },
+          then: [{ action: "click", locator: { testId: "primary-action" } }],
+        }],
+      });
+      assert(status >= 400, `a broken selector returned ${status}`);
+    });
+
+    await check("repeat and forEach drive the page", async () => {
+      await gotoDemo();
+      const repeated = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          { action: "repeat", times: 5, steps: [{ action: "click", locator: { testId: "increment-counter" } }] },
+          { action: "assertText", locator: { testId: "counter-value" }, expected: "5", match: "equals", timeoutMs: 5000 },
+        ],
+      });
+      assert(repeated.payload.data.failedCount === 0, JSON.stringify(repeated.payload.data.results));
+
+      const each = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        variables: { rows: [{ text: "첫째" }, { text: "둘째" }, { text: "셋째" }] },
+        steps: [
+          {
+            action: "forEach", items: "{{rows}}", as: "row",
+            steps: [
+              { action: "fill", locator: { testId: "message-input" }, value: "{{row.text}}" },
+              { action: "click", locator: { testId: "send-message" } },
+            ],
+          },
+          // The summary names the last row, which pins both the count and the order.
+          { action: "assertText", locator: { testId: "chat-summary" }, expected: "셋째", timeoutMs: 5000 },
+        ],
+      });
+      assert(each.payload.data.failedCount === 0, JSON.stringify(each.payload.data.results));
+      const loop = each.payload.data.results.find((entry) => entry.action === "forEach");
+      assert(loop.result.iterations === 3, JSON.stringify(loop));
+    });
+
+    await check("while waits for the page to reach a state", async () => {
+      await gotoDemo();
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          {
+            action: "while",
+            when: { not: { locator: { testId: "counter-value" }, text: "3", match: "equals" } },
+            maxIterations: 10,
+            steps: [{ action: "click", locator: { testId: "increment-counter" } }],
+          },
+          { action: "assertText", locator: { testId: "counter-value" }, expected: "3", match: "equals", timeoutMs: 5000 },
+        ],
+      });
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+      const loop = payload.data.results.find((entry) => entry.action === "while");
+      assert(loop.result.iterations === 3, JSON.stringify(loop));
+    });
+
+    await check("a while loop whose condition never settles fails instead of passing", async () => {
+      await gotoDemo();
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{
+          action: "while",
+          when: { locator: { testId: "counter-value" }, state: "visible" },
+          maxIterations: 3,
+          steps: [{ action: "click", locator: { testId: "increment-counter" } }],
+        }],
+      });
+      assert(status === 408, `expected 408, got ${status}`);
+      assert(payload.error.code === "LOOP_LIMIT_EXCEEDED", payload.error.code);
+    });
+
+    await check("break leaves a loop early", async () => {
+      await gotoDemo();
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          {
+            action: "repeat", times: 10, indexAs: "i",
+            steps: [
+              { action: "click", locator: { testId: "increment-counter" } },
+              { action: "if", when: { value: "{{i}}", gte: 2 }, then: [{ action: "break" }] },
+            ],
+          },
+          { action: "assertText", locator: { testId: "counter-value" }, expected: "3", match: "equals", timeoutMs: 5000 },
+        ],
+      });
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+    });
+
+    await check("an approval gate suspends the workflow and resumes inside the same iteration", async () => {
+      await gotoDemo();
+      const started = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          {
+            action: "repeat", times: 2,
+            steps: [
+              { action: "approval", name: "supervisor", message: "증가를 승인해 주세요", approvers: ["kim@example.com"] },
+              { action: "click", locator: { testId: "increment-counter" } },
+            ],
+          },
+        ],
+      });
+      assert(started.payload.data.status === "awaiting_approval", started.payload.data.status);
+      let gateId = started.payload.data.approval.gateId;
+      assert(started.payload.data.approval.message === "증가를 승인해 주세요", JSON.stringify(started.payload.data.approval));
+
+      const listed = await call("GET", `/api/sessions/${sessionId}/approvals`);
+      assert(listed.payload.data.approvals.length === 1, JSON.stringify(listed.payload.data.approvals));
+
+      // Resuming without a decision would defeat the point of the gate.
+      const early = await call("POST", `/api/sessions/${sessionId}/execute/resume`, { gateId });
+      assert(early.status === 409 && early.payload.error.code === "APPROVAL_PENDING",
+        `${early.status} ${early.payload.error?.code}`);
+
+      const stranger = await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+        decision: "approve", decidedBy: "park@example.com",
+      });
+      assert(stranger.status === 403 && stranger.payload.error.code === "APPROVER_NOT_LISTED",
+        `${stranger.status} ${stranger.payload.error?.code}`);
+
+      const anonymous = await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" });
+      assert(anonymous.status === 400, `an unattributed decision returned ${anonymous.status}`);
+
+      let outcome;
+      for (let guard = 0; guard < 4 && gateId; guard += 1) {
+        const decided = await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+          decision: "approve", decidedBy: "kim@example.com", comment: "확인했습니다",
+        });
+        assert(decided.status === 200, `decide returned ${decided.status}`);
+        const twice = await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+          decision: "reject", decidedBy: "kim@example.com",
+        });
+        assert(twice.status === 409, `a second decision returned ${twice.status}`);
+
+        outcome = await call("POST", `/api/sessions/${sessionId}/execute/resume`, { gateId });
+        gateId = outcome.payload.data.approval?.gateId;
+        if (outcome.payload.data.status === "completed") {
+          break;
+        }
+      }
+      assert(outcome.payload.data.status === "completed", JSON.stringify(outcome.payload.data.status));
+      assert(outcome.payload.data.captured.supervisor === "approved", JSON.stringify(outcome.payload.data.captured));
+
+      // Both iterations must have run their body, not just the one that was
+      // waiting when the gate opened.
+      const counted = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{ action: "assertText", locator: { testId: "counter-value" }, expected: "2", match: "equals", timeoutMs: 5000 }],
+      });
+      assert(counted.payload.data.failedCount === 0, JSON.stringify(counted.payload.data.results));
+    });
+
+    await check("a rejected gate stops the workflow and records who rejected it", async () => {
+      await gotoDemo();
+      const started = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          { action: "approval", name: "finance" },
+          { action: "click", locator: { testId: "increment-counter" } },
+        ],
+      });
+      const gateId = started.payload.data.approval.gateId;
+      await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+        decision: "reject", decidedBy: "lee@example.com", comment: "금액 불일치",
+      });
+      const resumed = await call("POST", `/api/sessions/${sessionId}/execute/resume`, { gateId });
+      assert(resumed.payload.data.status === "rejected", resumed.payload.data.status);
+      assert(resumed.payload.data.approval.decidedBy === "lee@example.com", JSON.stringify(resumed.payload.data.approval));
+      assert(resumed.payload.data.approval.comment === "금액 불일치", JSON.stringify(resumed.payload.data.approval));
+
+      const counted = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{ action: "assertText", locator: { testId: "counter-value" }, expected: "0", match: "equals", timeoutMs: 5000 }],
+      });
+      assert(counted.payload.data.failedCount === 0, "the step after a rejected gate ran anyway");
+    });
+
+    await check("onReject continue hands the decision to the workflow", async () => {
+      await gotoDemo();
+      const started = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          { action: "approval", name: "review", onReject: "continue" },
+          {
+            action: "if", when: { value: "{{review}}", equals: "approved" },
+            then: [{ action: "click", locator: { testId: "increment-counter" } }],
+            else: [{ action: "fill", locator: { testId: "message-input" }, value: "반려 처리" }],
+          },
+        ],
+      });
+      const gateId = started.payload.data.approval.gateId;
+      await call("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+        decision: "reject", decidedBy: "lee@example.com",
+      });
+      const resumed = await call("POST", `/api/sessions/${sessionId}/execute/resume`, { gateId });
+      assert(resumed.payload.data.status === "completed", resumed.payload.data.status);
+      const branch = resumed.payload.data.results.find((entry) => entry.action === "if");
+      assert(branch.result.branch === "else", JSON.stringify(branch));
+    });
+
+    await check("a condition reads inside a forEach row the same way substitution does", async () => {
+      await gotoDemo();
+      // An object substituted into a string becomes JSON, so a text comparison
+      // against one has to see the same thing and not "[object Object]".
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        variables: { rows: [{ id: "A-1", qty: 3 }, { id: "B-2", qty: 0 }] },
+        steps: [
+          { action: "click", locator: { testId: "reset-counter" } },
+          {
+            action: "forEach", items: "{{rows}}", as: "row",
+            steps: [{
+              action: "if",
+              when: { all: [{ value: "{{row.qty}}", gt: 0 }, { value: "{{row}}", contains: "A-" }] },
+              then: [{ action: "click", locator: { testId: "increment-counter" } }],
+            }],
+          },
+          // Only the first row satisfies both halves.
+          { action: "assertText", locator: { testId: "counter-value" }, expected: "1", match: "equals", timeoutMs: 5000 },
+        ],
+      });
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+      const branches = payload.data.results.filter((entry) => entry.action === "if");
+      assert(branches.length === 2, JSON.stringify(branches));
+      assert(branches[0].result.matched === true && branches[1].result.matched === false, JSON.stringify(branches));
+    });
+
+    await check("a numeric comparison on non-numeric text names the problem", async () => {
+      await gotoDemo();
+      // "17" < "9" is true for strings. Guessing which was meant is how a
+      // quantity check silently passes on the wrong rows.
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        variables: { qty: "약간" },
+        steps: [{ action: "if", when: { value: "{{qty}}", gt: 5 }, then: [{ action: "click", locator: { testId: "primary-action" } }] }],
+      });
+      assert(payload.error.code === "INVALID_CONDITION", JSON.stringify(payload));
+      assert(/compares numbers/.test(payload.error.message), payload.error.message);
+    });
+
+    await check("closing a session drops the gates that were waiting on it", async () => {
+      // The continuation needs the page it suspended on. Keeping the gate after
+      // the session is gone would leave a decision that can never be applied.
+      const other = await call("POST", "/api/sessions", {});
+      const otherId = other.payload.data.sessionId;
+      const otherContext = (await call("POST", `/api/sessions/${otherId}/contexts`, {})).payload.data.contextId;
+      const otherPage = (await call("POST", `/api/sessions/${otherId}/contexts/${otherContext}/pages`, {})).payload.data.pageId;
+      await call("POST", `/api/sessions/${otherId}/pages/${otherPage}/goto`, { url: `${baseUrl}/demo/test-page` });
+
+      const gated = await call("POST", `/api/sessions/${otherId}/execute`, {
+        pageId: otherPage,
+        steps: [{ action: "approval", name: "orphan" }],
+      });
+      const gateId = gated.payload.data.approval.gateId;
+      assert((await call("GET", `/api/sessions/${otherId}/approvals/${gateId}`)).status === 200, "the gate was not registered");
+
+      await call("DELETE", `/api/sessions/${otherId}`);
+      const afterClose = await call("GET", `/api/sessions/${otherId}/approvals/${gateId}`);
+      assert(afterClose.status === 404, `expected 404 after close, got ${afterClose.status}`);
+      assert(afterClose.payload.error.code === "APPROVAL_NOT_FOUND", afterClose.payload.error.code);
+    });
+
+    await check("a person can clear an approval gate from the playground page", async () => {
+      // An approval whose only interface is curl is not an approval: the whole
+      // point of stopping is that somebody looks at it.
+      const act = (action, body) => call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
+      const settle = (fragment) => act("assert/text", {
+        locator: { css: "#statusBox" }, expected: fragment, match: "contains", timeoutMs: 20000,
+      });
+
+      await act("goto", { url: `${baseUrl}/playground?lang=ko`, waitUntil: "domcontentloaded" });
+      await act("fill", { locator: { css: "#apiToken" }, value: token });
+      // Each button stores its id only after its fetch resolves, so the next
+      // click has to wait for the status line instead of firing immediately.
+      await act("click", { locator: { css: "#createSessionBtn" } });
+      await settle("/api/sessions completed");
+      await act("click", { locator: { css: "#createContextBtn" } });
+      await settle("/contexts completed");
+      await act("click", { locator: { css: "#createPageBtn" } });
+      await settle("/pages completed");
+
+      await act("fill", { locator: { css: "#decidedBy" }, value: "kim@example.com" });
+      await act("click", { locator: { css: "#runWorkflowBtn" } });
+      const listed = await act("wait-for", {
+        locator: { css: "[data-testid='approval-row']" }, state: "visible", timeoutMs: 25000,
+      });
+      assert(listed.status === 200, `the gate never appeared: ${listed.payload.error?.message}`);
+      // The status the person needs must survive the queue refresh that follows it.
+      const waiting = await act("assert/text", {
+        locator: { css: "#statusBox" }, expected: "awaiting_approval", match: "contains", timeoutMs: 10000,
+      });
+      assert(waiting.status === 200, "the page did not report that it is waiting for approval");
+
+      for (let pass = 0; pass < 2; pass += 1) {
+        await act("click", { locator: { css: "[data-testid='approve-approval']" } });
+        await settle("execute/resume completed");
+      }
+      const finished = await act("assert/text", {
+        locator: { css: "#statusBox" }, expected: "completed", match: "contains", timeoutMs: 10000,
+      });
+      assert(finished.status === 200, "approving twice did not finish the workflow");
+
+      // The server refuses an unattributed decision; the page should say so
+      // rather than send a request it knows will fail.
+      await act("click", { locator: { css: "#runWorkflowBtn" } });
+      await act("wait-for", { locator: { css: "[data-testid='approval-row']" }, state: "visible", timeoutMs: 25000 });
+      await act("fill", { locator: { css: "#decidedBy" }, value: "" });
+      await act("click", { locator: { css: "[data-testid='approve-approval']" } });
+      const refused = await act("assert/text", {
+        locator: { css: "#statusBox" }, expected: "승인자", match: "contains", timeoutMs: 10000,
+      });
+      assert(refused.status === 200, "an unattributed decision was not refused on the page");
+
+      await act("click", { locator: { css: "#closeSessionBtn" } });
     });
 
     await check("stopping a trace that never started is a 409", async () => {

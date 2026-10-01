@@ -267,3 +267,103 @@ if (CONFIG.authRequired) {
   setStatus(COPY.authRequiredNotice, false);
 }
 refreshScripts().catch((error) => setStatus(error.message, true));
+
+// Workflow branching and approval gates.
+//
+// A gate has to be clearable by a person, not only by curl: the whole point of
+// stopping the workflow is that someone looks at it. The decision is recorded
+// and the workflow then resumes from where it stopped.
+const approvalList = document.getElementById('approvalList');
+
+function renderApprovals(approvals) {
+  approvalList.replaceChildren();
+  if (!approvals.length) {
+    approvalList.textContent = COPY.noApprovals;
+    return;
+  }
+
+  approvals.forEach(function (approval) {
+    const row = document.createElement('div');
+    row.className = 'approval';
+    row.dataset.testid = 'approval-row';
+    row.style.cssText = 'padding:10px;border-radius:10px;background:rgba(15,118,110,0.06);margin-bottom:8px;';
+
+    const name = document.createElement('strong');
+    name.textContent = approval.name;
+    const message = document.createElement('div');
+    message.style.cssText = 'color:#5f6b82;font-size:.9rem;margin:4px 0 8px;';
+    message.textContent = approval.message || COPY.noApprovalMessage;
+
+    const buttons = document.createElement('div');
+    buttons.className = 'row';
+    [['approve', COPY.approveButton, '#0f766e'], ['reject', COPY.rejectButton, '#b91c1c']].forEach(function (entry) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.testid = entry[0] + '-approval';
+      button.textContent = entry[1];
+      button.style.cssText = 'padding:6px 14px;border-radius:999px;border:0;color:#fff;font-weight:600;cursor:pointer;background:' + entry[2] + ';';
+      button.addEventListener('click', function () {
+        decideAndResume(approval.gateId, entry[0]).catch(function (error) { setStatus(error.message, true); });
+      });
+      buttons.append(button);
+    });
+
+    row.append(name, message, buttons);
+    approvalList.append(row);
+  });
+}
+
+async function refreshApprovals() {
+  requireValue(state.sessionId, COPY.createSessionFirst);
+  const payload = await api('GET', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/approvals');
+  renderApprovals((payload.data && payload.data.approvals) || []);
+}
+
+async function decideAndResume(gateId, decision) {
+  const decidedBy = (document.getElementById('decidedBy').value || '').trim();
+  // The server rejects an unattributed decision; saying so here beats a 400.
+  requireValue(decidedBy, COPY.decidedByRequired);
+  const comment = (document.getElementById('approvalComment').value || '').trim();
+  await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/approvals/' + gateId + '/decide', {
+    decision: decision,
+    decidedBy: decidedBy,
+    comment: comment || undefined
+  });
+  const resumed = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/execute/resume', { gateId: gateId });
+  const status = resumed.data && resumed.data.status;
+  await refreshApprovals();
+  // Last, not first: api() writes the status line on every call, so refreshing
+  // the queue here would overwrite the one message the person is waiting for.
+  setStatus(COPY.workflowStatusPrefix + ' ' + status, status === 'rejected');
+}
+
+onClick('runWorkflowBtn', async () => {
+  requireValue(state.pageId, COPY.createPageFirst);
+  await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/goto', {
+    url: window.location.origin + CONFIG.demoPath,
+    waitUntil: 'domcontentloaded'
+  });
+  const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/execute', {
+    pageId: state.pageId,
+    steps: [
+      { action: 'click', locator: { testId: 'reset-counter' } },
+      {
+        action: 'repeat',
+        times: 2,
+        steps: [
+          { action: 'approval', name: 'supervisor', message: COPY.approvalSampleMessage },
+          {
+            action: 'if',
+            when: { locator: { testId: 'counter-value' }, state: 'visible' },
+            then: [{ action: 'click', locator: { testId: 'increment-counter' } }],
+            else: [{ action: 'click', locator: { testId: 'primary-action' } }]
+          }
+        ]
+      }
+    ]
+  });
+  await refreshApprovals();
+  setStatus(COPY.workflowStatusPrefix + ' ' + (payload.data && payload.data.status), false);
+});
+
+onClick('refreshApprovalsBtn', refreshApprovals);
