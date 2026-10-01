@@ -1192,6 +1192,179 @@ async function runApprovalLimitChecks() {
   }
 }
 
+// A pinned script used to be one file copied by basename, so a spec importing a
+// sibling module could not run and a key with a directory lost its path. Runs on
+// its own instance because it needs a scripts directory with a module graph.
+async function runScriptBundleChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-bundle-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  await fsPromises.mkdir(path.join(scriptsDir, "auth"), { recursive: true });
+  await fsPromises.mkdir(path.join(scriptsDir, "nested"), { recursive: true });
+
+  // A secret beside the scripts directory, which no script may drag in.
+  await fsPromises.writeFile(path.join(dataDir, "outside.js"), 'export const leaked = "SHOULD-NOT-BE-COPIED";\n', "utf8");
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "helpers.js"),
+    'export const greeting = "from the helper";\nexport { extra } from "./nested/extra.js";\n',
+    "utf8",
+  );
+  await fsPromises.writeFile(path.join(scriptsDir, "nested", "extra.js"), "export const extra = 7;\n", "utf8");
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "auth", "login.spec.js"),
+    'import { test, expect } from "@playwright/test";\n'
+    + 'import { greeting, extra } from "../helpers.js";\n'
+    // A commented-out import is why an unresolvable specifier is recorded
+    // rather than raised: a regex over JavaScript cannot tell the difference.
+    + '// import { gone } from "./not-here.js";\n'
+    + 'test("uses a sibling helper", async ({ page }) => {\n'
+    + '  await page.goto("data:text/html,<h1>" + greeting + " " + extra + "</h1>");\n'
+    + '  await expect(page.getByRole("heading")).toContainText("from the helper 7");\n'
+    + "});\n",
+    "utf8",
+  );
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "escape.spec.js"),
+    'import { test, expect } from "@playwright/test";\n'
+    + 'import { leaked } from "../outside.js";\n'
+    + 'test("reaches outside", async () => { expect(leaked).toBeTruthy(); });\n',
+    "utf8",
+  );
+  await fsPromises.writeFile(path.join(scriptsDir, "cycle-a.js"), 'import "./cycle-b.js";\nexport const a = 1;\n', "utf8");
+  await fsPromises.writeFile(path.join(scriptsDir, "cycle-b.js"), 'import "./cycle-a.js";\nexport const b = 2;\n', "utf8");
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "cycle.spec.js"),
+    'import { test, expect } from "@playwright/test";\n'
+    + 'import { a } from "./cycle-a.js";\n'
+    + 'test("cycle", async () => { expect(a).toBe(1); });\n',
+    "utf8",
+  );
+
+  const bundlePort = port + 8;
+  const bundleUrl = `http://127.0.0.1:${bundlePort}`;
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(bundlePort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: scriptsDir,
+      RUNS_DIR: path.join(dataDir, "runs"),
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      DATA_DIR: path.join(dataDir, "data"),
+      SCHEDULE_TICK_MS: "0",
+      MAX_CONCURRENT_RUNS: "2",
+    },
+  });
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${bundleUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  const settle = async (runId) => {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const status = (await api("GET", `/api/runs/${runId}`)).payload.data.status;
+      if (status !== "running" && status !== "queued") {
+        return status;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    return "timed-out";
+  };
+
+  try {
+    await waitForHealth(bundleUrl);
+
+    await check("a script that imports a sibling module runs", async () => {
+      const keys = (await api("GET", "/api/scripts")).payload.data.scripts.map((script) => script.scriptKey);
+      assert(keys.includes("auth/login"), `a nested key lost its path: ${keys.join(", ")}`);
+
+      const created = await api("POST", "/api/runs", { scriptKey: "auth/login", project: "chromium" });
+      const runId = created.payload.data.runId;
+      const status = await settle(runId);
+      if (status !== "completed") {
+        const logs = (await api("GET", `/api/runs/${runId}/logs`)).payload.data.logs.map((entry) => entry.line).join("\n");
+        if (/Executable doesn't exist|playwright install/i.test(logs) && !requireBrowser) {
+          record("script bundle checks", "skip", "no Playwright browser installed");
+          return "skip";
+        }
+        assert(false, `run ${status}: ${logs.split("\n").slice(0, 3).join(" | ")}`);
+      }
+
+      const run = (await api("GET", `/api/runs/${runId}`)).payload.data;
+      const pinned = (run.script.files || []).map((file) => file.relativePath).sort();
+      // The pin only means something if it covers everything the run loads: a
+      // helper edited between two runs would otherwise be invisible.
+      assert(
+        JSON.stringify(pinned) === JSON.stringify(["auth/login.spec.js", "helpers.js", "nested/extra.js"]),
+        JSON.stringify(pinned),
+      );
+      assert(typeof run.script.bundleSha256 === "string" && run.script.bundleSha256.length === 64,
+        String(run.script.bundleSha256));
+
+      const snapshot = (await api("GET", `/api/runs/${runId}/artifacts`)).payload.data.artifacts
+        .map((artifact) => artifact.relativePath)
+        .filter((relativePath) => relativePath.startsWith("script/"))
+        .sort();
+      assert(
+        JSON.stringify(snapshot) === JSON.stringify([
+          "script/auth/login.spec.js", "script/helpers.js", "script/nested/extra.js",
+        ]),
+        JSON.stringify(snapshot),
+      );
+
+      // A commented-out import still matches the scanner, so an unresolvable
+      // specifier is reported instead of refusing to queue a working script.
+      assert(
+        JSON.stringify(run.script.unresolvedImports) === '[{"from":"auth/login.spec.js","specifier":"./not-here.js"}]',
+        JSON.stringify(run.script.unresolvedImports),
+      );
+      return undefined;
+    });
+
+    await check("an import reaching outside SCRIPTS_DIR is not snapshotted", async () => {
+      const created = await api("POST", "/api/runs", { scriptKey: "escape", project: "chromium" });
+      const runId = created.payload.data.runId;
+      await settle(runId);
+      const run = (await api("GET", `/api/runs/${runId}`)).payload.data;
+      const pinned = (run.script.files || []).map((file) => file.relativePath);
+      assert(JSON.stringify(pinned) === JSON.stringify(["escape.spec.js"]), JSON.stringify(pinned));
+      assert(
+        JSON.stringify(run.script.unresolvedImports) === '[{"from":"escape.spec.js","specifier":"../outside.js"}]',
+        JSON.stringify(run.script.unresolvedImports),
+      );
+      const snapshot = (await api("GET", `/api/runs/${runId}/artifacts`)).payload.data.artifacts
+        .map((artifact) => artifact.relativePath)
+        .filter((relativePath) => relativePath.startsWith("script/"));
+      assert(JSON.stringify(snapshot) === JSON.stringify(["script/escape.spec.js"]), JSON.stringify(snapshot));
+    });
+
+    await check("a circular import does not hang the snapshot walker", async () => {
+      const created = await api("POST", "/api/runs", { scriptKey: "cycle", project: "chromium" });
+      const runId = created.payload.data.runId;
+      const status = await settle(runId);
+      const run = (await api("GET", `/api/runs/${runId}`)).payload.data;
+      const pinned = (run.script.files || []).map((file) => file.relativePath).sort();
+      assert(
+        JSON.stringify(pinned) === JSON.stringify(["cycle-a.js", "cycle-b.js", "cycle.spec.js"]),
+        JSON.stringify(pinned),
+      );
+      if (status !== "completed" && requireBrowser) {
+        assert(false, `cycle run ${status}`);
+      }
+    });
+  } finally {
+    proc.kill("SIGTERM");
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
 async function runRetentionChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-retain-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -2225,6 +2398,7 @@ async function run() {
   await runRestartChecks();
   await runRetentionChecks();
   await runApprovalLimitChecks();
+  await runScriptBundleChecks();
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();

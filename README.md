@@ -251,6 +251,8 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_WORKFLOW_DURATION_MS` | `300000` | 워크플로 전체 시간 상한. 세션 잠금을 쥐고 돌기 때문에 필요합니다 |
 | `APPROVAL_TIMEOUT_MS` | `3600000` | 승인 대기 게이트 기본 만료. 방치된 게이트가 브라우저 페이지를 계속 붙잡지 않게 합니다 |
 | `MAX_PENDING_APPROVALS` | `50` | 동시에 승인을 기다릴 수 있는 워크플로 수. 초과 시 `429 APPROVAL_LIMIT_EXCEEDED` |
+| `MAX_SCRIPT_BUNDLE_FILES` | `50` | 스냅샷이 담을 수 있는 모듈 수 |
+| `MAX_SCRIPT_BUNDLE_BYTES` | `8388608` | 스냅샷 전체 크기 상한 |
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
@@ -481,14 +483,24 @@ POST /api/runs/{id}/cancel   → 대기 중이면 즉시 cancelled
 
 실행을 큐에 넣는 시점에 스크립트를 복사하고 sha256 을 기록합니다. 대기 중에 파일이 수정·삭제되어도 그 실행은 스냅샷으로 수행되므로, 저장된 결과가 어떤 코드에 대한 것인지 항상 확정됩니다.
 
+**상대 경로 import 를 따라가 모듈 그래프 전체를 담습니다.** `SCRIPTS_DIR` 안의 디렉터리 구조를 그대로 유지하므로, 형제 모듈을 가져오는 스펙(`import { attachHtml } from "./helpers.js"`)도 실행되고 `auth/login` 처럼 디렉터리가 있는 키도 경로를 잃지 않습니다. `bundleSha256` 은 포함된 모든 파일을 덮습니다 — 핀이 진입 파일만 덮으면 두 실행 사이에 헬퍼가 바뀐 것을 알 수 없습니다.
+
 ```json
 "script": {
   "scriptKey": "checkout/guest-order",
+  "relativePath": "checkout/guest-order.spec.js",
   "sha256": "511a72cbbe2610df...",
   "sizeBytes": 1284,
+  "bundleSha256": "f1bd963ed3610bf2...",
+  "files": [
+    { "relativePath": "checkout/guest-order.spec.js", "sha256": "511a72cb...", "sizeBytes": 1284 },
+    { "relativePath": "helpers.js", "sha256": "9c1f00ad...", "sizeBytes": 608 }
+  ],
   "git": { "available": true, "branch": "main", "commit": "c33c3f6b..." }
 }
 ```
+
+`SCRIPTS_DIR` 밖으로 나가는 import 는 복사하지 않습니다 — 스크립트가 읽을 수 있는 범위를 넓히면 안 됩니다. 해석되지 않은 지정자는 `unresolvedImports` 에 기록만 하고 큐 등록을 막지 않습니다. JavaScript 를 정규식으로 훑으면 주석 처리된 import 도 걸리므로, 그것 하나로 정상 스크립트를 거부하는 편이 더 나쁩니다. 실제로 없는 파일이면 실행이 Playwright 자신의 모듈 오류로 실패하고, 핀이 어느 import 가 해석되지 않았는지 알려줍니다.
 
 ### 조회
 

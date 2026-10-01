@@ -77,6 +77,8 @@ const config = {
   maxWorkflowDurationMs: parseInteger(process.env.MAX_WORKFLOW_DURATION_MS, 5 * 60 * 1000),
   approvalTimeoutMs: parseInteger(process.env.APPROVAL_TIMEOUT_MS, 60 * 60 * 1000),
   maxPendingApprovals: parseInteger(process.env.MAX_PENDING_APPROVALS, 50),
+  maxScriptBundleFiles: parseInteger(process.env.MAX_SCRIPT_BUNDLE_FILES, 50),
+  maxScriptBundleBytes: parseInteger(process.env.MAX_SCRIPT_BUNDLE_BYTES, 8 * 1024 * 1024),
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
   maxRunLogEntries: parseInteger(process.env.MAX_RUN_LOG_ENTRIES, 3000),
   enableEvaluate: parseBoolean(process.env.ENABLE_EVALUATE, true),
@@ -1026,6 +1028,105 @@ ${proxyUrl ? `    // URL_ALLOWLIST is enforced by a loopback proxy owned by the 
 const RUN_RECORD_FILE = "run.json";
 const RUN_LOG_FILE = "logs.jsonl";
 const RUN_SCRIPT_SNAPSHOT_DIR = "script";
+
+// A pinned script used to be a single file copied by basename, so a spec that
+// imported a sibling module could not run at all ("Cannot find module
+// .../script/helpers.js") and a key with a directory lost its path. Seven of
+// the nine scripts this repo ships import ./helpers.js, so they all failed.
+// The snapshot now carries the module graph, laid out as it is in SCRIPTS_DIR.
+//
+// `import x from "./a.js"`, `import "./a.js"`, `export * from "../a.js"`,
+// `import("./a.js")` and `require("./a.js")`. Only relative specifiers can
+// resolve inside SCRIPTS_DIR; a package or node: specifier is not ours to copy.
+const RELATIVE_SPECIFIER_PATTERN =
+  /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+)(["'])(\.{1,2}\/[^"']*)\1/g;
+
+// Node ESM wants an explicit extension, but Playwright's loader and TypeScript
+// specs also accept extensionless and directory imports.
+const SCRIPT_DEPENDENCY_SUFFIXES = ["", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"];
+
+function findRelativeSpecifiers(source) {
+  return [...source.matchAll(RELATIVE_SPECIFIER_PATTERN)].map((match) => match[2]);
+}
+
+async function resolveScriptDependency(scriptsRoot, fromFile, specifier) {
+  const base = path.resolve(path.dirname(fromFile), specifier);
+  const candidates = [
+    ...SCRIPT_DEPENDENCY_SUFFIXES.map((suffix) => base + suffix),
+    ...SCRIPT_DEPENDENCY_SUFFIXES.slice(1).map((suffix) => path.join(base, `index${suffix}`)),
+  ];
+
+  for (const candidate of candidates) {
+    // A dependency reached through ../.. outside the scripts directory is not
+    // ours to snapshot, and copying it would widen what a script can read.
+    const relative = path.relative(scriptsRoot, candidate);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      continue;
+    }
+    if (await fileExists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+// Walks the module graph from the entry script. An unresolvable specifier is
+// recorded rather than raised: a regex over JavaScript has false positives (a
+// commented-out import matches), and refusing to queue a working script over
+// one would be worse than the module error the run would report anyway.
+async function collectScriptBundle(scriptsDir, entryAbsolutePath, limits = {}) {
+  const scriptsRoot = path.resolve(scriptsDir);
+  const maxFiles = limits.maxFiles || 50;
+  const maxBytes = limits.maxBytes || 8 * 1024 * 1024;
+
+  const queue = [entryAbsolutePath];
+  const visited = new Set();
+  const files = [];
+  const unresolved = [];
+  let totalBytes = 0;
+
+  while (queue.length) {
+    const current = queue.shift();
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    const content = await fsPromises.readFile(current, "utf8");
+    const relativePath = path.relative(scriptsRoot, current).split(path.sep).join("/");
+    const sizeBytes = Buffer.byteLength(content, "utf8");
+    totalBytes += sizeBytes;
+
+    if (files.length >= maxFiles) {
+      throw new ApiError(
+        400,
+        "SCRIPT_BUNDLE_TOO_LARGE",
+        `${path.basename(entryAbsolutePath)} pulls in more than ${maxFiles} files (MAX_SCRIPT_BUNDLE_FILES)`,
+      );
+    }
+    if (totalBytes > maxBytes) {
+      throw new ApiError(
+        400,
+        "SCRIPT_BUNDLE_TOO_LARGE",
+        `${path.basename(entryAbsolutePath)} and its imports exceed ${maxBytes} bytes (MAX_SCRIPT_BUNDLE_BYTES)`,
+      );
+    }
+
+    files.push({ relativePath, absolutePath: current, content, sizeBytes, sha256: sha256Hex(content) });
+
+    for (const specifier of findRelativeSpecifiers(content)) {
+      const resolved = await resolveScriptDependency(scriptsRoot, current, specifier);
+      if (resolved) {
+        queue.push(resolved);
+      } else {
+        unresolved.push({ from: relativePath, specifier });
+      }
+    }
+  }
+
+  return { files, unresolved };
+}
 const RUN_STEPS_FILE = "steps.json";
 const RUN_STEP_REPORTER_FILE = "pw-player-steps-reporter.mjs";
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
@@ -1394,11 +1495,18 @@ class RunManager {
       const run = this.fromRecord(record);
       run.paths = this.rebasePaths(run.runId, run.paths);
       if (run.script?.snapshotPath) {
-        run.script.snapshotPath = path.join(
-          run.paths.runDir,
-          RUN_SCRIPT_SNAPSHOT_DIR,
-          path.basename(run.script.snapshotPath),
-        );
+        // Stored absolute paths are not trusted across a restart, so the
+        // snapshot is relocated under this run's directory.
+        const snapshotDir = path.join(run.paths.runDir, RUN_SCRIPT_SNAPSHOT_DIR);
+        run.script.snapshotDir = snapshotDir;
+        const relocated = run.script.relativePath
+          ? path.join(snapshotDir, ...run.script.relativePath.split("/"))
+          : path.join(snapshotDir, path.basename(run.script.snapshotPath));
+        // Runs queued before the snapshot kept its directory layout have the
+        // entry file flattened to the snapshot root.
+        run.script.snapshotPath = (await fileExists(relocated))
+          ? relocated
+          : path.join(snapshotDir, path.basename(run.script.snapshotPath));
       }
       run.artifacts = (await collectFilesWithMetadata(run.paths?.runDir || this.runDir(run.runId)))
         .filter((file) => isRunEvidence(file.relativePath));
@@ -1812,20 +1920,44 @@ class RunManager {
   async snapshotScript(runDir, script) {
     const snapshotDir = path.join(runDir, RUN_SCRIPT_SNAPSHOT_DIR);
     await ensureDir(snapshotDir);
-    const fileName = path.basename(script.relativePath);
-    const snapshotPath = path.join(snapshotDir, fileName);
-    const content = await fsPromises.readFile(script.absolutePath, "utf8");
-    await fsPromises.writeFile(snapshotPath, content, "utf8");
 
-    return {
+    const { files, unresolved } = await collectScriptBundle(this.options.scriptsDir, script.absolutePath, {
+      maxFiles: this.options.maxScriptBundleFiles,
+      maxBytes: this.options.maxScriptBundleBytes,
+    });
+
+    for (const file of files) {
+      // Laid out as it is in SCRIPTS_DIR so every relative import still
+      // resolves, and so a key with a directory keeps its path.
+      const target = resolveWithin(snapshotDir, file.relativePath, "script snapshot path");
+      await ensureDir(path.dirname(target));
+      await fsPromises.writeFile(target, file.content, "utf8");
+    }
+
+    const entry = files[0];
+    const snapshotPath = resolveWithin(snapshotDir, entry.relativePath, "script snapshot path");
+    if (unresolved.length) {
+      console.warn(
+        `[run] ${script.scriptKey}: could not resolve `
+        + unresolved.map((miss) => `${miss.specifier} (from ${miss.from})`).join(", "),
+      );
+    }
+
+    return cleanObject({
       scriptKey: script.scriptKey,
-      relativePath: script.relativePath,
-      sha256: sha256Hex(content),
-      sizeBytes: Buffer.byteLength(content, "utf8"),
+      relativePath: entry.relativePath,
+      sha256: entry.sha256,
+      sizeBytes: entry.sizeBytes,
+      // The pin only means something if it covers everything the run loads: a
+      // helper edited between two runs would otherwise be invisible.
+      bundleSha256: sha256Hex(files.map((file) => `${file.relativePath}:${file.sha256}`).sort().join("\n")),
+      files: files.map((file) => ({ relativePath: file.relativePath, sha256: file.sha256, sizeBytes: file.sizeBytes })),
+      unresolvedImports: unresolved.length ? unresolved : undefined,
       snapshotPath,
+      snapshotDir,
       capturedAt: toIso(),
       git: await this.registry.resolveGitInfo().catch(() => ({ available: false })),
-    };
+    });
   }
 
   async retryRun(runId) {
@@ -1891,7 +2023,7 @@ class RunManager {
     await fsPromises.writeFile(
       configPath,
       renderPlaywrightConfig({
-        scriptsDir: path.dirname(run.script.snapshotPath),
+        scriptsDir: run.script.snapshotDir || path.join(runDir, RUN_SCRIPT_SNAPSHOT_DIR),
         outputDir,
         htmlReportDir,
         jsonReportPath,
