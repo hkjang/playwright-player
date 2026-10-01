@@ -29,7 +29,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.6.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.7.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -158,6 +158,18 @@ function createId(prefix) {
 
 function toIso(value = Date.now()) {
   return new Date(value).toISOString();
+}
+
+// Date.now() is wall-clock and can step backwards (NTP correction, a host
+// suspend/resume under WSL2 or a VM), which produced negative durations and made
+// a failed step sort last in "slowest steps" - exactly backwards. Elapsed time
+// has to come from a monotonic source.
+function monotonicNow() {
+  return performance.now();
+}
+
+function elapsedMs(startedAtMonotonic) {
+  return Math.max(0, Math.round(monotonicNow() - startedAtMonotonic));
 }
 
 function sleep(ms) {
@@ -651,6 +663,7 @@ export default defineConfig({
   reporter: [
     ["list"],
     ["json", { outputFile: ${JSON.stringify(jsonReportPath)} }],
+    ["./${RUN_STEP_REPORTER_FILE}"],
     ["html", { open: "never", outputFolder: ${JSON.stringify(htmlReportDir)} }],
   ],
   use: {
@@ -683,10 +696,12 @@ ${proxyUrl ? `    // URL_ALLOWLIST is enforced by a loopback proxy owned by the 
 const RUN_RECORD_FILE = "run.json";
 const RUN_LOG_FILE = "logs.jsonl";
 const RUN_SCRIPT_SNAPSHOT_DIR = "script";
+const RUN_STEPS_FILE = "steps.json";
+const RUN_STEP_REPORTER_FILE = "pw-player-steps-reporter.mjs";
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 // Bookkeeping, not test evidence: both have dedicated endpoints, and listing
 // them as artifacts inflates artifactCount and clutters the download list.
-const RUN_INTERNAL_FILES = new Set([RUN_RECORD_FILE, RUN_LOG_FILE]);
+const RUN_INTERNAL_FILES = new Set([RUN_RECORD_FILE, RUN_LOG_FILE, RUN_STEPS_FILE]);
 
 function isRunEvidence(relativePath) {
   return !RUN_INTERNAL_FILES.has(relativePath);
@@ -697,6 +712,95 @@ function isRunEvidence(relativePath) {
 // left after v0.3.0. Each run now gets its own loopback-only proxy that the run's
 // browser is pointed at, which works for all three engines (a Chromium-specific
 // flag would not) and attributes every blocked request to the run that made it.
+// Playwright nests steps arbitrarily deep (a click inside an expect inside a
+// test.step). Keep the shape but drop everything a timeline does not use.
+// Playwright's json reporter does not include steps, so "the test took 12s" says
+// nothing about which click or assertion was slow. This reporter records the
+// step tree per test and writes it next to the report; `test.id` here equals
+// `spec.id` in the json report, which is how the two are joined.
+function renderStepReporter(outputPath) {
+  return `import fs from "node:fs";
+
+const OUTPUT = ${JSON.stringify(outputPath)};
+const MAX_DEPTH = 6;
+
+function trim(steps, depth = 0) {
+  if (!Array.isArray(steps) || depth > MAX_DEPTH) {
+    return undefined;
+  }
+
+  const mapped = [];
+  for (const step of steps) {
+    if (!step?.title) {
+      continue;
+    }
+    const entry = {
+      title: String(step.title).slice(0, 300),
+      category: step.category,
+      durationMs: typeof step.duration === "number" ? step.duration : null,
+    };
+    if (step.error?.message) {
+      entry.error = String(step.error.message).slice(0, 1000);
+    }
+    const nested = trim(step.steps, depth + 1);
+    if (nested) {
+      entry.steps = nested;
+    }
+    mapped.push(entry);
+  }
+
+  return mapped.length ? mapped : undefined;
+}
+
+export default class PwPlayerStepReporter {
+  constructor() {
+    this.byTest = {};
+  }
+
+  onTestEnd(test, result) {
+    try {
+      // Later retries overwrite earlier ones, matching the json report, which
+      // also reports the last result.
+      this.byTest[test.id] = {
+        retry: result.retry,
+        status: result.status,
+        steps: trim(result.steps) || [],
+      };
+    } catch {
+      // A reporter must never fail the run it is observing.
+    }
+  }
+
+  async onEnd() {
+    try {
+      fs.writeFileSync(OUTPUT, JSON.stringify(this.byTest), "utf8");
+    } catch {
+      // Steps are a convenience; losing them must not fail the run.
+    }
+  }
+}
+`;
+}
+
+function flattenReportSteps(steps, depth = 0) {
+  if (!Array.isArray(steps) || depth > 6) {
+    return undefined;
+  }
+
+  const mapped = steps
+    // pw:api covers the actual click/fill/assert calls; the rest is framework noise.
+    .filter((step) => step.title)
+    .map((step) => cleanObject({
+      title: truncate(step.title, 300),
+      category: step.category,
+      durationMs: typeof step.duration === "number" ? step.duration : undefined,
+      error: step.error?.message ? truncate(step.error.message, 1000) : undefined,
+      steps: flattenReportSteps(step.steps, depth + 1),
+    }));
+
+  return mapped.length ? mapped : undefined;
+}
+
 class RunNetworkGuard {
   constructor({ allowlist, maxBlockedEntries = 100 }) {
     this.allowlist = allowlist;
@@ -1342,6 +1446,11 @@ class RunManager {
     }
 
     await fsPromises.writeFile(
+      path.join(runDir, RUN_STEP_REPORTER_FILE),
+      renderStepReporter(path.join(runDir, RUN_STEPS_FILE)),
+      "utf8",
+    );
+    await fsPromises.writeFile(
       configPath,
       renderPlaywrightConfig({
         scriptsDir: path.dirname(run.script.snapshotPath),
@@ -1485,10 +1594,18 @@ class RunManager {
   // Playwright's JSON report is deeply nested; flatten it once at completion so
   // stored history can be queried without re-parsing the whole report.
   async extractTestResults(run) {
+    if (!run.paths?.runDir) {
+      return [];
+    }
+
     const report = run.paths.jsonReportPath ? await readJsonFile(run.paths.jsonReportPath) : null;
     if (!report?.suites) {
       return [];
     }
+
+    // Written by the generated step reporter; keyed by the same id the json
+    // report calls spec.id.
+    const stepsBySpecId = (await readJsonFile(path.join(run.paths.runDir, RUN_STEPS_FILE))) || {};
 
     const tests = [];
     const walk = (suites, titlePath) => {
@@ -1507,6 +1624,22 @@ class RunManager {
               file: spec.file || suite.file || undefined,
               line: spec.line,
               error: last?.error?.message ? truncate(last.error.message, 2000) : undefined,
+              // Playwright records a step per click/fill/assert with its own
+              // duration. Without these a "test took 12s" tells you nothing
+              // about which step was slow or which one failed.
+              steps: stepsBySpecId[spec.id]?.steps
+                // Fallback for a record written before the step reporter existed.
+                ?? flattenReportSteps(last?.steps),
+              // The screenshot, video and trace Playwright attached to this
+              // test, as paths relative to the run directory so they can be
+              // fetched through the run artifact route.
+              attachments: (last?.attachments || []).map((attachment) => cleanObject({
+                name: attachment.name,
+                contentType: attachment.contentType,
+                path: attachment.path
+                  ? path.relative(run.paths.runDir, attachment.path).split(path.sep).join("/")
+                  : undefined,
+              })).filter((attachment) => attachment.path),
             }));
           }
         }
@@ -2535,13 +2668,13 @@ function textMatches(actual, expected, mode = "contains") {
 }
 
 async function poll(timeoutMs, fn, onTimeoutMessage) {
-  const startedAt = Date.now();
+  const startedAt = monotonicNow();
   do {
     if (await fn()) {
       return;
     }
     await sleep(200);
-  } while (Date.now() - startedAt < timeoutMs);
+  } while (monotonicNow() - startedAt < timeoutMs);
 
   throw new ApiError(408, "TIMEOUT", onTimeoutMessage);
 }
@@ -2716,7 +2849,9 @@ class SessionManager {
   }
 
   logAction(session, action) {
+    session.actionSeq = (session.actionSeq ?? 0) + 1;
     session.actions.push({
+      actionId: `act_${session.actionSeq}`,
       ts: toIso(),
       ...action,
     });
@@ -2726,13 +2861,35 @@ class SessionManager {
   }
 
   logEvent(session, event) {
+    session.eventSeq = (session.eventSeq ?? 0) + 1;
     session.events.push({
+      seq: session.eventSeq,
       ts: toIso(),
       ...event,
     });
     if (session.events.length > this.options.maxEventLogEntries) {
       session.events.splice(0, session.events.length - this.options.maxEventLogEntries);
     }
+  }
+
+  // Which browser events are worth surfacing next to the action that triggered
+  // them. A console error or a failed request during a click is usually the
+  // reason the next assertion fails.
+  static classifyEvent(event) {
+    if (event.type === "pageerror") {
+      return "error";
+    }
+    if (event.type === "console" && ["error", "warning"].includes(event.level)) {
+      return event.level === "error" ? "error" : "warning";
+    }
+    if (event.type === "response" && Number(event.status) >= 400) {
+      return "error";
+    }
+    if (event.type === "dialog" || event.type === "dialog.error") {
+      return "notice";
+    }
+
+    return null;
   }
 
   // Shares isAllowedHost with the run network guard so a session and a script
@@ -2864,7 +3021,9 @@ class SessionManager {
       pages: new Map(),
       artifacts: new Map(),
       actions: [],
+      actionSeq: 0,
       events: [],
+      eventSeq: 0,
       queue: Promise.resolve(),
     };
 
@@ -3523,10 +3682,13 @@ class SessionManager {
   async runPageCommandLocked(session, pageId, type, input, executor) {
     const pageRecord = this.getPageRecord(session, pageId);
     const startedAt = Date.now();
+    const startedAtMonotonic = monotonicNow();
+    // Claim the event range this action is responsible for.
+    const fromEventSeq = (session.eventSeq ?? 0) + 1;
     console.log(`[session] ${type} start sessionId=${session.sessionId} pageId=${pageId}`);
     try {
       const result = await executor(pageRecord);
-      const elapsed = Date.now() - startedAt;
+      const elapsed = elapsedMs(startedAtMonotonic);
       pageRecord.updatedAt = toIso();
       this.touch(session);
       this.logAction(session, {
@@ -3534,13 +3696,18 @@ class SessionManager {
         status: "ok",
         pageId,
         contextId: pageRecord.contextId,
+        startedAt: toIso(startedAt),
+        durationMs: elapsed,
+        fromEventSeq,
+        toEventSeq: session.eventSeq ?? 0,
+        url: pageRecord.page.isClosed() ? pageRecord.lastUrl : pageRecord.page.url(),
         input,
         output: summarize(result),
       });
       console.log(`[session] ${type} ok ${elapsed}ms`);
       return result;
     } catch (error) {
-      const elapsed = Date.now() - startedAt;
+      const elapsed = elapsedMs(startedAtMonotonic);
       console.error(`[session] ${type} error ${elapsed}ms — ${error.message}`);
       // A rejected request body says nothing about the page, so no artifact.
       // Timeouts and genuine automation failures are exactly when a screenshot
@@ -3552,8 +3719,16 @@ class SessionManager {
         status: "error",
         pageId,
         contextId: pageRecord.contextId,
+        startedAt: toIso(startedAt),
+        durationMs: elapsed,
+        fromEventSeq,
+        toEventSeq: session.eventSeq ?? 0,
+        url: pageRecord.page.isClosed() ? pageRecord.lastUrl : pageRecord.page.url(),
         input,
         error: error.message,
+        // Linked so a timeline can show the before/after screen without
+        // re-deriving which artifacts belong to which step.
+        artifactIds: Object.values(artifacts).map((artifact) => artifact?.artifactId).filter(Boolean),
       });
       // A Playwright timeout is a failed expectation, not a server fault.
       const isTimeout = error?.name === "TimeoutError" || /Timeout \d+ms exceeded/.test(error?.message || "");
@@ -4328,6 +4503,93 @@ class SessionManager {
       throw new ApiError(404, "ARTIFACT_NOT_FOUND", `Artifact not found: ${artifactId}`);
     }
     return artifact;
+  }
+
+  // Actions, the browser events each one caused, and the artifacts it produced
+  // were three separate lists a caller had to correlate by hand. Finding out why
+  // step 7 failed meant eyeballing timestamps across all three.
+  async buildTimeline(sessionId, options = {}) {
+    const session = this.getSession(sessionId);
+    const includeEvents = options.includeEvents !== false;
+    const limit = Math.min(Math.max(Number(options.limit) || 200, 1), 2000);
+    const actions = session.actions.slice(-limit);
+
+    // One pass over the events, bucketed by the range each action claimed.
+    const eventsBySeq = new Map();
+    for (const event of session.events) {
+      eventsBySeq.set(event.seq, event);
+    }
+
+    const entries = actions.map((action) => {
+      const events = [];
+      if (action.fromEventSeq !== undefined) {
+        for (let seq = action.fromEventSeq; seq <= (action.toEventSeq ?? 0); seq += 1) {
+          const event = eventsBySeq.get(seq);
+          if (event) {
+            events.push(event);
+          }
+        }
+      }
+
+      const issues = [];
+      for (const event of events) {
+        const severity = SessionManager.classifyEvent(event);
+        if (!severity) {
+          continue;
+        }
+        issues.push(cleanObject({
+          severity,
+          type: event.type,
+          level: event.level,
+          status: event.status,
+          url: event.url,
+          message: truncate(event.message || event.text, 500),
+        }));
+      }
+
+      const artifacts = (action.artifactIds || [])
+        .map((artifactId) => this.artifactIndex.get(artifactId))
+        .filter(Boolean)
+        .map((artifact) => this.serializeArtifact(sessionId, artifact));
+
+      return cleanObject({
+        actionId: action.actionId,
+        type: action.type,
+        status: action.status,
+        pageId: action.pageId,
+        contextId: action.contextId,
+        startedAt: action.startedAt ?? action.ts,
+        endedAt: action.ts,
+        durationMs: action.durationMs ?? null,
+        url: action.url,
+        input: action.input,
+        output: action.output,
+        error: action.error,
+        artifacts: artifacts.length ? artifacts : undefined,
+        issueCount: issues.length,
+        issues: issues.length ? issues : undefined,
+        events: includeEvents && events.length ? events : undefined,
+      });
+    });
+
+    const durations = entries.map((entry) => entry.durationMs).filter((value) => typeof value === "number");
+    const slowest = [...entries]
+      .filter((entry) => typeof entry.durationMs === "number")
+      .sort((left, right) => right.durationMs - left.durationMs)
+      .slice(0, 5)
+      .map((entry) => ({ actionId: entry.actionId, type: entry.type, durationMs: entry.durationMs }));
+
+    return {
+      sessionId,
+      actionCount: session.actions.length,
+      eventCount: session.events.length,
+      returned: entries.length,
+      totalDurationMs: durations.reduce((sum, value) => sum + value, 0),
+      failedCount: entries.filter((entry) => entry.status === "error").length,
+      withIssuesCount: entries.filter((entry) => entry.issueCount > 0).length,
+      slowest,
+      entries,
+    };
   }
 
   async listActions(sessionId) {
@@ -5568,7 +5830,23 @@ function buildOpenApiSpec(req) {
         }),
       },
       [`${api}/sessions/{sessionId}/actions`]: {
-        get: operation({ tag: "Sessions", summary: "List action and browser event logs", parameters: sessionParams }),
+        get: operation({ tag: "Sessions", summary: "List the raw action and browser event logs", parameters: sessionParams }),
+      },
+      [`${api}/sessions/{sessionId}/timeline`]: {
+        get: operation({
+          tag: "Sessions",
+          summary: "Per-step timeline: each action with its duration, the console and network events it caused, and its failure artifacts",
+          parameters: [
+            ...sessionParams,
+            { name: "limit", in: "query", required: false, schema: { type: "integer", default: 200 }, description: "Most recent N actions, 1-2000" },
+            { name: "includeEvents", in: "query", required: false, schema: { type: "boolean", default: true }, description: "false returns only durations and issue counts" },
+          ],
+          responses: {
+            200: {
+              description: "Entries in order, each with durationMs, issues (console errors, failed responses, page errors) and linked artifacts, plus a slowest-steps summary",
+            },
+          },
+        }),
       },
       [`${api}/sessions/{sessionId}/trace/start`]: {
         post: operation({
@@ -7029,6 +7307,13 @@ app.get(`${config.apiBasePath}/sessions/:sessionId/actions`, asyncRoute(async (r
   ok(res, await sessionManager.listActions(req.params.sessionId));
 }));
 
+app.get(`${config.apiBasePath}/sessions/:sessionId/timeline`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.buildTimeline(req.params.sessionId, {
+    limit: req.query.limit,
+    includeEvents: req.query.includeEvents !== "false",
+  }));
+}));
+
 app.get(`${config.apiBasePath}/sessions/:sessionId/artifacts`, asyncRoute(async (req, res) => {
   ok(res, {
     sessionId: req.params.sessionId,
@@ -7416,7 +7701,21 @@ const mcpTools = [
   defineTool("session_delete", "Close a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.closeSession(args.sessionId, "closed")),
   defineTool("session_keepalive", "Extend a browser session TTL.", { type: "object", properties: { sessionId: { type: "string" }, ttlMs: { type: "number" } }, required: ["sessionId"] }, async (args) => sessionManager.keepAlive(args.sessionId, args.ttlMs)),
   defineTool("session_artifacts", "List artifacts captured in a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => ({ sessionId: args.sessionId, artifacts: await sessionManager.listArtifacts(args.sessionId) })),
-  defineTool("session_actions", "List action and event logs for a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.listActions(args.sessionId)),
+  defineTool("session_actions", "List the raw action and event logs for a browser session. Prefer session_timeline, which correlates them.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.listActions(args.sessionId)),
+  defineTool(
+    "session_timeline",
+    "Per-step timeline for a session: each action with its duration, the console and network events it caused, any failure artifacts, and the slowest steps. Use this to find why a step failed instead of correlating session_actions and the event log by hand.",
+    {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        limit: { type: "integer", default: 200, description: "Most recent N actions, 1-2000" },
+        includeEvents: { type: "boolean", default: true, description: "Set false for just durations and issue counts" },
+      },
+      required: ["sessionId"],
+    },
+    async (args) => sessionManager.buildTimeline(args.sessionId, args),
+  ),
   defineTool("session_trace", "Start or stop Playwright tracing for a context.", { type: "object", properties: { sessionId: { type: "string" }, action: { type: "string" }, contextId: { type: "string" }, title: { type: "string" } }, required: ["sessionId", "action", "contextId"] }, async (args) => args.action === "start" ? sessionManager.startTrace(args.sessionId, args) : sessionManager.stopTrace(args.sessionId, args)),
   defineTool(
     "session_execute",

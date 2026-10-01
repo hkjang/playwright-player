@@ -1130,6 +1130,61 @@ async function run() {
     await call("DELETE", `/api/runs/${runId}`);
   });
 
+  await check("a run records per-step durations and the step that failed", async () => {
+    await call("PUT", "/api/scripts/timeline", {
+      content: [
+        'import { test, expect } from "@playwright/test";',
+        "",
+        'test("multi step", async ({ page }) => {',
+        `  await page.goto("${baseUrl}/demo/test-page");`,
+        '  await page.getByTestId("message-input").fill("timeline");',
+        '  await page.getByTestId("send-message").click();',
+        '  await expect(page.getByTestId("status")).toContainText("will not match", { timeout: 1500 });',
+        "});",
+        "",
+      ].join("\n"),
+    });
+
+    const created = await call("POST", "/api/runs", { scriptKey: "timeline", project: "chromium" });
+    const runId = created.payload.data.runId;
+    await waitForRuns([runId]);
+
+    const { payload } = await call("GET", `/api/runs/${runId}`);
+    const test = payload.data.tests[0];
+    assert(test, "no test result recorded");
+    assert(test.status === "failed", `expected the test to fail, got ${test.status}`);
+
+    // Playwright's json reporter emits no steps at all, so these come from a
+    // reporter the server generates; without them "the test took 12s" says
+    // nothing about which click or assertion was slow.
+    const flatten = (steps) => (steps || []).flatMap((step) => [step, ...flatten(step.steps)]);
+    const steps = flatten(test.steps);
+    assert(steps.length > 0, "no steps recorded for the run");
+    assert(steps.every((step) => step.durationMs === null || step.durationMs >= 0),
+      `negative step duration: ${JSON.stringify(steps.filter((step) => step.durationMs < 0))}`);
+    assert(steps.some((step) => typeof step.durationMs === "number" && step.durationMs > 0),
+      "every step duration was null; the reporter output was dropped");
+
+    assert(steps.some((step) => /Fill/i.test(step.title)), `no fill step: ${steps.map((s) => s.title).join(" | ")}`);
+    assert(steps.some((step) => /Click/i.test(step.title)), "no click step");
+
+    const failing = steps.find((step) => step.error);
+    assert(failing, "the failing step was not identified");
+    assert(/Expect/i.test(failing.title), `the error landed on the wrong step: ${failing.title}`);
+
+    // Evidence for the failure, addressable through the run artifact route.
+    assert((test.attachments || []).length > 0, "no attachments linked to the test");
+    const screenshot = test.attachments.find((entry) => entry.name === "screenshot");
+    assert(screenshot?.path, `no screenshot attachment: ${JSON.stringify(test.attachments)}`);
+    const download = await fetch(`${baseUrl}/api/runs/${runId}/artifacts/${screenshot.path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(download.ok, `attachment download returned ${download.status}`);
+
+    await call("DELETE", `/api/runs/${runId}`);
+    await call("DELETE", "/api/scripts/timeline");
+  });
+
   await check("mcp initialize issues a session id", async () => {
     const response = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
@@ -1511,6 +1566,74 @@ async function run() {
         headers: { Authorization: `Bearer ${token}` },
       });
       assert(download.ok, `download returned ${download.status}`);
+    });
+
+    await check("the session timeline reports a duration for every action", async () => {
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${baseUrl}/demo/test-page` });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/fill`, {
+        locator: { testId: "message-input" },
+        value: "timeline",
+      });
+      const { status, payload } = await call("GET", `/api/sessions/${sessionId}/timeline?includeEvents=false`);
+      assert(status === 200, `timeline returned ${status}`);
+
+      const timed = payload.data.entries.filter((entry) => typeof entry.durationMs === "number");
+      assert(timed.length >= 2, `only ${timed.length} entries carried a duration`);
+      // Durations came from Date.now(), which can step backwards and produced
+      // negative values; a negative duration also sorted a failed step last in
+      // "slowest", which is exactly backwards.
+      assert(timed.every((entry) => entry.durationMs >= 0),
+        `negative duration: ${JSON.stringify(timed.filter((entry) => entry.durationMs < 0))}`);
+      assert(payload.data.totalDurationMs >= 0, `total was ${payload.data.totalDurationMs}`);
+      assert(timed.every((entry) => entry.startedAt && entry.endedAt), "an entry had no start/end time");
+    });
+
+    await check("the timeline credits console and network errors to the action that caused them", async () => {
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${baseUrl}/demo/test-page` });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: 'async () => { console.error("boom from the page"); try { await fetch("/does-not-exist"); } catch (error) {} return 1; }',
+      });
+      const { payload } = await call("GET", `/api/sessions/${sessionId}/timeline`);
+
+      const culprit = [...payload.data.entries].reverse().find((entry) => entry.type === "page.evaluate");
+      assert(culprit, "the evaluate action is missing from the timeline");
+      assert(culprit.issueCount > 0, "the evaluate action was credited with no issues");
+      assert(culprit.issues.some((issue) => (issue.message || "").includes("boom from the page")),
+        `console error not attributed: ${JSON.stringify(culprit.issues)}`);
+      // The harness runs with API_TOKEN set, so an unauthenticated in-page fetch
+      // is answered 401 rather than 404. Any 4xx/5xx proves the attribution.
+      assert(culprit.issues.some((issue) => issue.type === "response" && Number(issue.status) >= 400),
+        `failed request not attributed: ${JSON.stringify(culprit.issues)}`);
+
+      // The surrounding actions must not inherit them.
+      const neighbours = payload.data.entries.filter((entry) => entry.type === "page.goto");
+      assert(neighbours.every((entry) => entry.issueCount === 0),
+        "issues leaked onto a neighbouring action");
+    });
+
+    await check("a failing action links its artifacts and tops the slowest list", async () => {
+      const before = await call("GET", `/api/sessions/${sessionId}/timeline?includeEvents=false`);
+      const baseline = before.payload.data.failedCount;
+
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/assert/visible`, {
+        locator: { testId: "definitely-not-here" },
+        timeoutMs: 1200,
+      });
+
+      const { payload } = await call("GET", `/api/sessions/${sessionId}/timeline?includeEvents=false`);
+      assert(payload.data.failedCount === baseline + 1, "the failure was not recorded");
+
+      const failed = [...payload.data.entries].reverse().find((entry) => entry.status === "error");
+      assert(failed, "no failed entry in the timeline");
+      assert(failed.error, "the failed entry carries no error");
+      assert((failed.artifacts || []).length >= 1,
+        "the failure artifacts were not linked to the action that produced them");
+      assert(failed.artifacts.every((artifact) => artifact.downloadPath), "an artifact had no downloadPath");
+
+      // A ~1200ms timeout must rank above the millisecond-scale actions. With
+      // the old wall-clock arithmetic it could land negative and sort last.
+      assert(payload.data.slowest[0].durationMs >= 1000,
+        `slowest was ${JSON.stringify(payload.data.slowest[0])}`);
     });
 
     await check("stopping a trace that never started is a 409", async () => {

@@ -17,6 +17,7 @@
 - screenshot, pdf, trace, storage state import/export
 - LLM 보조 API: `assist/capabilities`, `assist/examples`, `assist/plan`, `assist/scaffold`
 - 실제 DOM 검증을 포함한 페이지 구조 분석 `page_inspect`
+- 단계별 소요시간·콘솔/네트워크 오류·증적을 연결한 실행 타임라인
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -159,6 +160,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 
 - `GET /api/sessions`
 - `POST /api/sessions`
+- `GET /api/sessions/{sessionId}/timeline`
 - `GET /api/sessions/{sessionId}`
 - `DELETE /api/sessions/{sessionId}`
 - `POST /api/sessions/{sessionId}/keepalive`
@@ -188,7 +190,7 @@ MCP endpoint 는 `/mcp` 입니다.
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
 - `run_create`, `run_list`, `run_queue`, `run_get`, `run_cancel`, `run_retry`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
-- `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`
+- `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`, `session_timeline`
 - `context_create`, `context_get`, `context_delete`
 - `context_storage_export`, `context_storage_import`
 - `context_route_add`, `context_route_remove`
@@ -344,6 +346,46 @@ GET /api/runs/{runId}                    → tests[] 에 테스트별 상태·�
 GET /api/runs/{runId}/logs?limit=500     → 메모리 창을 벗어나면 디스크에서 읽습니다
 GET /api/runs/{runId}/artifacts/{relativePath}
 ```
+
+## 실행 타임라인
+
+### 스크립트 실행
+
+Playwright 의 JSON 리포터는 step 정보를 내보내지 않습니다. 그래서 실행마다 전용 리포터를 함께 생성해 클릭·입력·검증별 소요시간을 기록합니다. `GET /api/runs/{runId}` 의 `tests[].steps` 에 담깁니다.
+
+```
+failed  2561ms  steps.spec.js > multi-step scenario
+  - 210ms   Before Hooks
+    - 55ms  Launch browser
+  - 83ms    Navigate to "/demo/test-page"
+  - 50ms    Fill "timeline" getByTestId('message-input')
+  - 47ms    Click getByTestId('send-message')
+  - 2003ms  Expect "toContainText" getByTestId('status')   ← 실패 단계
+```
+
+`tests[].attachments` 에 그 테스트의 스크린샷·비디오·trace 가 실행 디렉터리 기준 상대 경로로 들어갑니다. 그대로 `GET /api/runs/{runId}/artifacts/{relativePath}` 로 받을 수 있습니다.
+
+### 세션
+
+`GET /api/sessions/{sessionId}/timeline` 은 액션·브라우저 이벤트·증적을 하나로 묶어 반환합니다. 이전에는 세 배열을 직접 대조해야 했습니다.
+
+```
+page.evaluate   ok      7ms  issues=3
+      [error] console   boom from the page
+      [error] response  http://127.0.0.1:3080/does-not-exist (404)
+assert.visible  error 1201ms  artifacts=2
+```
+
+| 필드 | 의미 |
+| --- | --- |
+| `durationMs` | 액션 소요시간. 단조 시계로 측정하므로 시스템 시각이 뒤로 가도 음수가 되지 않습니다 |
+| `issues` | 해당 액션 구간에 발생한 콘솔 오류·경고, 페이지 예외, 4xx/5xx 응답, 대화상자 |
+| `artifacts` | 실패 시 저장된 스크린샷·DOM (다운로드 경로 포함) |
+| `slowest` | 가장 느린 단계 상위 5개 |
+
+이벤트는 시퀀스 번호로 액션 구간에 귀속됩니다. 밀리초 타임스탬프 비교가 아니므로 경계에서 잘못 묶이지 않습니다. 소요시간만 필요하면 `includeEvents=false` 로 이벤트 본문을 제외할 수 있습니다.
+
+MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 
 ## Locator 검증
 
