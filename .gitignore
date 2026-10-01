@@ -19,3 +19,4 @@ src/shared/ids.js
 secrets/
 data/environments/
 data/datasets/
+data/schedules/

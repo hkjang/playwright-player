@@ -30,7 +30,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.11.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.12.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -42,6 +42,7 @@ const config = {
   routeFixturesDir: path.resolve(process.env.ROUTE_FIXTURES_DIR || process.env.SCRIPTS_DIR || path.join(rootDir, "scripts")),
   environmentsDir: path.resolve(process.env.ENVIRONMENTS_DIR || path.join(rootDir, "data", "environments")),
   datasetsDir: path.resolve(process.env.DATASETS_DIR || path.join(rootDir, "data", "datasets")),
+  schedulesDir: path.resolve(process.env.SCHEDULES_DIR || path.join(rootDir, "data", "schedules")),
   secretsDir: path.resolve(process.env.SECRETS_DIR || path.join(rootDir, "secrets")),
   bodyLimit: process.env.BODY_LIMIT || "5mb",
   defaultBrowserType: process.env.DEFAULT_BROWSER_TYPE || "chromium",
@@ -76,6 +77,9 @@ const config = {
   // real value; only what is written to disk and returned by the API is masked.
   redactVariablePattern: process.env.REDACT_VARIABLE_PATTERN || "(pass|secret|token|credential|pwd|api[-_]?key)",
   maxDatasetRows: parseInteger(process.env.MAX_DATASET_ROWS, 200),
+  scheduleTickMs: parseInteger(process.env.SCHEDULE_TICK_MS, 30 * 1000),
+  notifyTimeoutMs: parseInteger(process.env.NOTIFY_TIMEOUT_MS, 10 * 1000),
+  notifyAllowlist: parseCsv(process.env.NOTIFY_ALLOWLIST),
   maxDownloadBytes: parseInteger(process.env.MAX_DOWNLOAD_BYTES, 64 * 1024 * 1024),
   maxApiResponseBodyBytes: parseInteger(process.env.MAX_API_RESPONSE_BODY_BYTES, 256 * 1024),
   apiRequestTimeoutMs: parseInteger(process.env.API_REQUEST_TIMEOUT_MS, 30 * 1000),
@@ -401,6 +405,81 @@ function narrowAllowlist(globalAllowlist, requested) {
   return { allowlist: allowlist.length ? allowlist : globalAllowlist, rejected };
 }
 
+// Minimal 5-field cron. No scheduling dependency is available here, so this
+// covers the subset people actually write: *, n, a,b, a-b, */n and a-b/n.
+const CRON_FIELDS = [
+  { name: "minute", min: 0, max: 59 },
+  { name: "hour", min: 0, max: 23 },
+  { name: "dayOfMonth", min: 1, max: 31 },
+  { name: "month", min: 1, max: 12 },
+  { name: "dayOfWeek", min: 0, max: 6 },
+];
+
+function parseCronField(raw, { name, min, max }) {
+  const allowed = new Set();
+  for (const part of String(raw).split(",")) {
+    const token = part.trim();
+    if (!token) {
+      throw new ApiError(400, "INVALID_CRON", `${name}: empty element in "${raw}"`);
+    }
+
+    const [range, stepRaw] = token.split("/");
+    const step = stepRaw === undefined ? 1 : Number(stepRaw);
+    if (!Number.isInteger(step) || step < 1) {
+      throw new ApiError(400, "INVALID_CRON", `${name}: step must be a positive integer, got "${stepRaw}"`);
+    }
+
+    let from;
+    let to;
+    if (range === "*") {
+      from = min;
+      to = max;
+    } else if (range.includes("-")) {
+      [from, to] = range.split("-").map(Number);
+    } else {
+      from = Number(range);
+      to = from;
+    }
+
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < min || to > max || from > to) {
+      throw new ApiError(400, "INVALID_CRON", `${name}: "${token}" is not a range within ${min}-${max}`);
+    }
+    for (let value = from; value <= to; value += step) {
+      allowed.add(value);
+    }
+  }
+
+  return allowed;
+}
+
+function parseCron(expression) {
+  const parts = String(expression ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length !== 5) {
+    throw new ApiError(
+      400,
+      "INVALID_CRON",
+      `cron needs 5 fields (minute hour dayOfMonth month dayOfWeek), got ${parts.length}`,
+    );
+  }
+
+  return CRON_FIELDS.map((field, index) => parseCronField(parts[index], field));
+}
+
+function cronMatches(fields, date) {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+  // Standard cron: when both day fields are restricted, either may match.
+  const domRestricted = dayOfMonth.size !== 31;
+  const dowRestricted = dayOfWeek.size !== 7;
+  const dayOk = domRestricted && dowRestricted
+    ? dayOfMonth.has(date.getDate()) || dayOfWeek.has(date.getDay())
+    : dayOfMonth.has(date.getDate()) && dayOfWeek.has(date.getDay());
+
+  return minute.has(date.getMinutes())
+    && hour.has(date.getHours())
+    && month.has(date.getMonth() + 1)
+    && dayOk;
+}
+
 const REDACTED = "***";
 const SECRET_REFERENCE_PATTERN = /\{\{\s*secret\.([A-Za-z0-9_.-]+)\s*\}\}/g;
 
@@ -508,6 +587,51 @@ function scrubSensitive(text, sensitiveValues) {
   }
 
   return out;
+}
+
+// A caller could otherwise make the server POST to any host it can reach, which
+// turns this into an SSRF proxy. NOTIFY_ALLOWLIST gates it; falling back to
+// URL_ALLOWLIST keeps a single-policy deployment safe by default, and an
+// unrestricted server stays unrestricted.
+function assertNotifyUrlAllowed(rawUrl, options) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new ApiError(400, "INVALID_NOTIFY_URL", `notify.url is not a valid URL: ${rawUrl}`);
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new ApiError(400, "INVALID_NOTIFY_URL", `notify.url must be http or https, got ${parsed.protocol}`);
+  }
+
+  const allowlist = options.notifyAllowlist.length ? options.notifyAllowlist : options.urlAllowlist;
+  if (allowlist.length && !isAllowedHost(parsed.hostname, allowlist)) {
+    throw new ApiError(
+      403,
+      "NOTIFY_URL_NOT_ALLOWED",
+      `notify.url host is not allowed: ${parsed.hostname}. Add it to NOTIFY_ALLOWLIST.`,
+    );
+  }
+
+  return parsed.toString();
+}
+
+function normalizeNotify(notify, options) {
+  if (!notify) {
+    return null;
+  }
+
+  const on = String(notify.on || "failure").toLowerCase();
+  if (!["failure", "always"].includes(on)) {
+    throw new ApiError(400, "INVALID_REQUEST", 'notify.on must be "failure" or "always"');
+  }
+
+  return {
+    url: assertNotifyUrlAllowed(notify.url, options),
+    on,
+    headers: notify.headers && typeof notify.headers === "object" ? notify.headers : undefined,
+  };
 }
 
 const SCRIPT_EXTENSION_PATTERN = /\.(spec|test|pw)\.(js|mjs|cjs|ts|mts|cts)$/i;
@@ -1123,7 +1247,9 @@ class RunManager {
     this.registry = options.registry;
     this.environments = new NamedJsonStore(options.environmentsDir, "environment");
     this.datasets = new NamedJsonStore(options.datasetsDir, "dataset");
+    this.schedules = new NamedJsonStore(options.schedulesDir, "schedule");
     this.secrets = new SecretResolver(options);
+    this.scheduleTimer = null;
     this.runs = new Map();
     this.queue = [];
     this.pendingWrites = new Map();
@@ -1173,6 +1299,9 @@ class RunManager {
       request: run.request,
       script: run.script,
       environment: run.environment,
+      schedule: run.schedule,
+      notify: run.notify,
+      notification: run.notification,
       datasetRow: run.datasetRow,
       network: run.network,
       paths: run.paths,
@@ -1355,6 +1484,9 @@ class RunManager {
       request: run.request,
       script: run.script ?? null,
       environment: run.environment ?? null,
+      schedule: run.schedule ?? null,
+      notify: run.notify ?? null,
+      notification: run.notification ?? null,
       datasetRow: run.datasetRow ?? null,
       network: run.network ?? null,
       paths: run.paths,
@@ -1596,6 +1728,7 @@ class RunManager {
     // Real values go to the child process; the record keeps the masked copy.
     const { resolved: resolvedVariables, safe: safeVariables, sensitiveValues } = await this.secrets
       .resolveVariables(request.variables || {});
+    const notify = normalizeNotify(request.notify, this.options);
     const policy = narrowAllowlist(this.options.urlAllowlist, request.urlAllowlist);
     const runId = createId("run");
     const runDir = this.runDir(runId);
@@ -1613,6 +1746,9 @@ class RunManager {
       resolvedVariables,
       sensitiveValues,
       environment: meta.environment ? { name: meta.environment.name, baseURL: meta.environment.baseURL } : null,
+      schedule: meta.schedule ?? null,
+      notify,
+      notification: null,
       datasetRow: request.datasetRow ?? null,
       script: pinnedScript,
       status: "queued",
@@ -1863,6 +1999,7 @@ class RunManager {
         }
         run.summary = await this.buildSummary(run);
         run.tests = await this.extractTestResults(run);
+        await this.deliverNotification(run);
         run.artifacts = (await collectFilesWithMetadata(run.paths.runDir))
           .filter((file) => isRunEvidence(file.relativePath));
         await this.persist(run);
@@ -1879,6 +2016,183 @@ class RunManager {
   }
 
   // Playwright's JSON report is deeply nested; flatten it once at completion so
+  // "실패 알림" and "결과 콜백": one outbound POST when the run ends. One attempt
+  // with a timeout, and the outcome is recorded on the run so a silent failure
+  // to notify is still visible.
+  async deliverNotification(run) {
+    if (!run.notify) {
+      return;
+    }
+    if (run.notify.on === "failure" && run.status === "completed") {
+      return;
+    }
+
+    const payload = {
+      event: "run.finished",
+      service: this.options.serviceName,
+      runId: run.runId,
+      scriptKey: run.scriptKey,
+      status: run.status,
+      exitCode: run.exitCode,
+      startedAt: run.startedAt,
+      endedAt: run.endedAt,
+      attempt: run.attempt ?? 1,
+      schedule: run.schedule ?? null,
+      environment: run.environment?.name ?? null,
+      datasetRow: run.datasetRow ?? null,
+      summary: run.summary ?? null,
+      // The redacted copy: a notification must not be the thing that leaks a
+      // credential to a third-party endpoint.
+      request: run.request,
+      failedTests: (run.tests || [])
+        .filter((test) => test.status === "failed")
+        .map((test) => ({ title: test.title, project: test.project, error: test.error })),
+    };
+
+    const startedAt = monotonicNow();
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.options.notifyTimeoutMs);
+      timer.unref?.();
+      const response = await fetch(run.notify.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(run.notify.headers || {}) },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      run.notification = {
+        url: run.notify.url,
+        attemptedAt: toIso(),
+        durationMs: elapsedMs(startedAt),
+        status: response.status,
+        delivered: response.ok,
+      };
+      if (!response.ok) {
+        console.error(`[run] notification for ${run.runId} returned ${response.status}`);
+      }
+    } catch (error) {
+      run.notification = {
+        url: run.notify.url,
+        attemptedAt: toIso(),
+        durationMs: elapsedMs(startedAt),
+        delivered: false,
+        error: error.name === "AbortError" ? `timed out after ${this.options.notifyTimeoutMs}ms` : error.message,
+      };
+      console.error(`[run] notification for ${run.runId} failed: ${run.notification.error}`);
+    }
+  }
+
+  // ---- schedules ----------------------------------------------------------
+
+  async saveSchedule(name, document) {
+    const stored = { ...document };
+    delete stored.name;
+    if (!stored.request?.scriptKey) {
+      throw new ApiError(400, "INVALID_REQUEST", "request.scriptKey is required");
+    }
+
+    parseCron(stored.cron);
+    if (stored.notify) {
+      normalizeNotify(stored.notify, this.options);
+    }
+    // Fail at save time rather than at 2am.
+    this.registry.get(stored.request.scriptKey);
+    if (stored.request.environment) {
+      await this.environments.get(stored.request.environment);
+    }
+    if (stored.request.dataset) {
+      await this.datasets.get(stored.request.dataset);
+    }
+
+    return this.schedules.save(name, { ...stored, enabled: stored.enabled !== false });
+  }
+
+  // Fires the schedule's request now, with optional overrides — which is how a
+  // deploy pipeline triggers the scenarios that gate a release.
+  async triggerSchedule(name, overrides = {}) {
+    const schedule = await this.schedules.get(name);
+    const merged = {
+      ...schedule.request,
+      ...overrides,
+      variables: { ...(schedule.request.variables || {}), ...(overrides.variables || {}) },
+      notify: overrides.notify ?? schedule.notify,
+    };
+
+    const { request, environment } = await this.composeRequest(merged);
+    const expanded = await this.expandDataset(request);
+    const meta = { environment, schedule: schedule.name };
+    const runs = [];
+    for (const entry of expanded) {
+      runs.push(await this.createRun(entry, meta));
+    }
+
+    await this.schedules.save(schedule.name, { ...schedule, lastTriggeredAt: toIso() });
+
+    return request.dataset
+      ? { schedule: schedule.name, dataset: request.dataset, rowCount: runs.length, runs }
+      : { schedule: schedule.name, ...runs[0] };
+  }
+
+  startScheduler() {
+    if (this.options.scheduleTickMs <= 0) {
+      return;
+    }
+
+    this.scheduleTimer = setInterval(() => {
+      this.tickSchedules().catch((error) => console.error("[schedule] tick failed", error));
+    }, this.options.scheduleTickMs);
+    this.scheduleTimer.unref?.();
+  }
+
+  stopScheduler() {
+    clearInterval(this.scheduleTimer);
+    this.scheduleTimer = null;
+  }
+
+  async tickSchedules() {
+    const now = new Date();
+    // Minute granularity: the tick runs more often than that, so the fired
+    // minute is recorded to stop a schedule firing twice for the same minute.
+    const minuteKey = toIso(new Date(
+      now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes(), 0, 0,
+    ));
+    const schedules = await this.schedules.list().catch(() => []);
+
+    for (const schedule of schedules) {
+      if (schedule.enabled === false || schedule.lastFiredMinute === minuteKey) {
+        continue;
+      }
+
+      let fields;
+      try {
+        fields = parseCron(schedule.cron);
+      } catch (error) {
+        console.error(`[schedule] ${schedule.name} has an invalid cron: ${error.message}`);
+        continue;
+      }
+
+      if (!cronMatches(fields, now)) {
+        continue;
+      }
+
+      // Recorded before running, so a crash mid-run cannot re-fire the minute.
+      await this.schedules.save(schedule.name, { ...schedule, lastFiredMinute: minuteKey });
+      try {
+        const result = await this.triggerSchedule(schedule.name);
+        console.log(`[schedule] ${schedule.name} fired: ${result.runId || `${result.rowCount} runs`}`);
+      } catch (error) {
+        const message = toApiError(error).message;
+        console.error(`[schedule] ${schedule.name} could not run: ${message}`);
+        await this.schedules.save(schedule.name, {
+          ...schedule,
+          lastFiredMinute: minuteKey,
+          lastError: { at: toIso(), message },
+        });
+      }
+    }
+  }
+
   // stored history can be queried without re-parsing the whole report.
   async extractTestResults(run) {
     if (!run.paths?.runDir) {
@@ -5968,6 +6282,16 @@ function buildOpenApiSpec(req) {
             environment: { type: "string", example: "staging", description: "Apply a stored environment; explicit fields here win" },
             dataset: { type: "string", example: "orders", description: "Queue one run per dataset row" },
             datasetRow: { type: "integer", description: "Zero-based row index; omit to queue every row" },
+            notify: {
+              type: "object",
+              required: ["url"],
+              description: "POST the result when the run ends. The host must pass NOTIFY_ALLOWLIST (or URL_ALLOWLIST).",
+              properties: {
+                url: { type: "string", example: "https://ci.example.com/hooks/playwright" },
+                on: { type: "string", enum: ["failure", "always"], default: "failure" },
+                headers: { type: "object", additionalProperties: { type: "string" } },
+              },
+            },
             urlAllowlist: {
               type: "array",
               items: { type: "string" },
@@ -6573,6 +6897,52 @@ function buildOpenApiSpec(req) {
       [`${api}/datasets`]: {
         get: operation({ tag: "Runs", summary: "List datasets with row counts and columns" }),
       },
+      [`${api}/schedules`]: {
+        get: operation({ tag: "Runs", summary: "List schedules" }),
+      },
+      [`${api}/schedules/{name}`]: {
+        get: operation({ tag: "Runs", summary: "Get one schedule", parameters: [pathParam("name")] }),
+        put: operation({
+          tag: "Runs",
+          summary: "Create or replace a schedule; cron, script, environment and dataset are validated now",
+          parameters: [pathParam("name")],
+          body: {
+            type: "object",
+            required: ["cron", "request"],
+            properties: {
+              cron: { type: "string", example: "0 2 * * *", description: "minute hour dayOfMonth month dayOfWeek, in the server's local timezone" },
+              enabled: { type: "boolean", default: true },
+              request: { $ref: "#/components/schemas/CreateRunRequest" },
+              notify: {
+                type: "object",
+                required: ["url"],
+                properties: {
+                  url: { type: "string" },
+                  on: { type: "string", enum: ["failure", "always"], default: "failure" },
+                  headers: { type: "object", additionalProperties: { type: "string" } },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Stored schedule" }, 400: { description: "Invalid cron, or an unknown script, environment or dataset" } },
+        }),
+        delete: operation({ tag: "Runs", summary: "Delete a schedule", parameters: [pathParam("name")] }),
+      },
+      [`${api}/schedules/{name}/trigger`]: {
+        post: operation({
+          tag: "Runs",
+          summary: "Run a schedule now — what a deploy pipeline calls to gate a release",
+          parameters: [pathParam("name")],
+          body: {
+            type: "object",
+            properties: {
+              variables: { type: "object", additionalProperties: true, description: "Merged over the stored request, e.g. the build id" },
+              notify: { type: "object", additionalProperties: true },
+            },
+          },
+          responses: { 201: { description: "Queued run, or a list when the schedule uses a dataset" } },
+        }),
+      },
       [`${api}/datasets/{name}`]: {
         get: operation({ tag: "Runs", summary: "Get one dataset including its rows", parameters: [pathParam("name")] }),
         put: operation({
@@ -6852,6 +7222,7 @@ const runManager = new RunManager({
 });
 await loadUiAssets();
 await runManager.restore();
+runManager.startScheduler();
 const sessionManager = new SessionManager(config);
 const scriptAssistant = new ScriptAssistant({
   ...config,
@@ -6997,6 +7368,7 @@ app.get("/health", asyncRoute(async (req, res) => {
     runCount: runManager.runs.size,
     activeRunCount: runManager.countActiveRuns(),
     queuedRunCount: runManager.countQueuedRuns(),
+    scheduleCount: (await runManager.schedules.list().catch(() => [])).length,
     sessionCount: sessionManager.sessions.size,
     mcpSessionCount: mcpSessions.size,
     limits: {
@@ -7013,6 +7385,7 @@ app.get("/health", asyncRoute(async (req, res) => {
       authRequired: Boolean(config.apiToken),
       failureArtifacts: config.captureFailureArtifacts,
       persistentRunHistory: true,
+      scheduler: config.scheduleTickMs > 0,
       urlAllowlist: config.urlAllowlist,
       urlAllowlistCoverage: config.urlAllowlist.length
         ? ["sessions", "runs"]
@@ -7159,6 +7532,28 @@ app.put(`${config.apiBasePath}/environments/:name`, asyncRoute(async (req, res) 
 
 app.delete(`${config.apiBasePath}/environments/:name`, asyncRoute(async (req, res) => {
   ok(res, await runManager.environments.remove(req.params.name));
+}));
+
+app.get(`${config.apiBasePath}/schedules`, asyncRoute(async (req, res) => {
+  ok(res, { schedules: await runManager.schedules.list() });
+}));
+
+app.get(`${config.apiBasePath}/schedules/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.schedules.get(req.params.name));
+}));
+
+app.put(`${config.apiBasePath}/schedules/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.saveSchedule(req.params.name, req.body || {}));
+}));
+
+app.delete(`${config.apiBasePath}/schedules/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.schedules.remove(req.params.name));
+}));
+
+// What a deploy pipeline calls: run this schedule's scenarios now, optionally
+// passing the build it is gating.
+app.post(`${config.apiBasePath}/schedules/:name/trigger`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.triggerSchedule(req.params.name, req.body || {}), 201);
 }));
 
 app.get(`${config.apiBasePath}/datasets`, asyncRoute(async (req, res) => {
@@ -7623,6 +8018,16 @@ const mcpTools = [
         environment: { type: "string", description: "Name of an environment whose baseURL, project, storage state, allowlist and variables to apply. Anything set explicitly here wins." },
         dataset: { type: "string", description: "Name of a dataset. Queues one run per row unless datasetRow selects one." },
         datasetRow: { type: "integer", description: "Zero-based row index; omit to queue every row." },
+        notify: {
+          type: "object",
+          description: "POST the result to a URL when the run ends. The payload carries the redacted request, never resolved secrets.",
+          properties: {
+            url: { type: "string" },
+            on: { type: "string", enum: ["failure", "always"], default: "failure" },
+            headers: { type: "object", additionalProperties: { type: "string" } },
+          },
+          required: ["url"],
+        },
         urlAllowlist: {
           type: "array",
           items: { type: "string" },
@@ -7712,6 +8117,62 @@ const mcpTools = [
     "Delete an environment.",
     { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
     async (args) => runManager.environments.remove(args.name),
+  ),
+  defineTool(
+    "schedule_list",
+    "List schedules with their cron expression, last fired minute and last error.",
+    { type: "object", properties: {} },
+    async () => ({ schedules: await runManager.schedules.list() }),
+  ),
+  defineTool(
+    "schedule_get",
+    "Get one schedule.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.schedules.get(args.name),
+  ),
+  defineTool(
+    "schedule_save",
+    "Create or replace a schedule. The cron expression, the script, the environment and the dataset are all validated now rather than at the scheduled time. Cron is evaluated in the server's local timezone.",
+    {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        cron: { type: "string", description: "5 fields: minute hour dayOfMonth month dayOfWeek. Supports *, n, a,b, a-b and */n" },
+        enabled: { type: "boolean", default: true },
+        request: { type: "object", additionalProperties: true, description: "A run request: scriptKey, environment, dataset, variables, ..." },
+        notify: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            on: { type: "string", enum: ["failure", "always"], default: "failure" },
+            headers: { type: "object", additionalProperties: { type: "string" } },
+          },
+          required: ["url"],
+        },
+      },
+      required: ["name", "cron", "request"],
+    },
+    async (args) => runManager.saveSchedule(args.name, args),
+  ),
+  defineTool(
+    "schedule_delete",
+    "Delete a schedule.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.schedules.remove(args.name),
+  ),
+  defineTool(
+    "schedule_trigger",
+    "Run a schedule's scenarios now, regardless of its cron. This is what a deploy pipeline calls to gate a release; `variables` here are merged over the stored request so the build under test can be identified.",
+    {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        variables: { type: "object", additionalProperties: true },
+        notify: { type: "object", additionalProperties: true },
+      },
+      required: ["name"],
+    },
+    async (args) => runManager.triggerSchedule(args.name, args),
   ),
   defineTool(
     "dataset_list",
@@ -8194,6 +8655,7 @@ async function shutdown(signal) {
   });
   // Spawned Playwright runs are children of this process; leaving them behind
   // orphaned browsers on every container restart.
+  runManager.stopScheduler();
   await runManager.killAll();
   await sessionManager.shutdown();
   process.exit(0);

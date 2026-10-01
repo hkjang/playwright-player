@@ -432,6 +432,278 @@ async function runRestartChecks() {
 // A credential passed in `variables` used to be written into run.json and
 // returned by the API, permanently. These need their own instance so SECRETS_DIR
 // and the stores point somewhere disposable.
+// Cron is hand-rolled here because no scheduling dependency is available, so the
+// parser is checked directly rather than only through a live schedule — waiting
+// for wall-clock minutes cannot cover 29 cases.
+function checkCronParsing() {
+  const fixtures = [
+    ["* * * * *", "2026-10-01T13:05:00", true],
+    ["0 2 * * *", "2026-10-01T02:00:00", true],
+    ["0 2 * * *", "2026-10-01T02:01:00", false],
+    ["0 2 * * *", "2026-10-01T03:00:00", false],
+    ["*/15 * * * *", "2026-10-01T13:30:00", true],
+    ["*/15 * * * *", "2026-10-01T13:31:00", false],
+    ["30 9 * * 1-5", "2026-10-01T09:30:00", true],
+    ["30 9 * * 1-5", "2026-10-03T09:30:00", false],
+    ["0 0 1 * *", "2026-10-01T00:00:00", true],
+    ["0 0 1 * *", "2026-10-02T00:00:00", false],
+    ["0,30 * * * *", "2026-10-01T13:30:00", true],
+    ["0,30 * * * *", "2026-10-01T13:15:00", false],
+    ["0 9-17/4 * * *", "2026-10-01T13:00:00", true],
+    ["0 9-17/4 * * *", "2026-10-01T14:00:00", false],
+    // Both day fields restricted: either may match, as standard cron does.
+    ["0 0 1 * 0", "2026-10-01T00:00:00", true],
+    ["0 0 1 * 0", "2026-10-04T00:00:00", true],
+    ["0 0 1 * 0", "2026-10-02T00:00:00", false],
+  ];
+  const invalid = ["", "* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "0 0 0 * *", "0 0 * 13 *", "*/0 * * * *", "a * * * *", "5-1 * * * *"];
+  return { fixtures, invalid };
+}
+
+async function runScheduleChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-sched-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "ok.spec.js"),
+    'import { test, expect } from "@playwright/test";\n\ntest("passes", async () => { expect(1).toBe(1); });\n',
+    "utf8",
+  );
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "bad.spec.js"),
+    'import { test, expect } from "@playwright/test";\n\ntest("fails", async () => { expect(1).toBe(2); });\n',
+    "utf8",
+  );
+
+  // A stub webhook receiver, so the callback is checked against something that
+  // actually records what arrived.
+  const received = [];
+  const hook = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      try {
+        received.push(JSON.parse(body || "{}"));
+      } catch {
+        received.push({ unparseable: body });
+      }
+      res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
+    });
+  });
+  await new Promise((resolve) => hook.listen(0, "127.0.0.1", resolve));
+  const hookUrl = `http://127.0.0.1:${hook.address().port}/hook`;
+
+  const schedPort = port + 6;
+  const schedUrl = `http://127.0.0.1:${schedPort}`;
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(schedPort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: scriptsDir,
+      RUNS_DIR: path.join(dataDir, "runs"),
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      ENVIRONMENTS_DIR: path.join(dataDir, "environments"),
+      DATASETS_DIR: path.join(dataDir, "datasets"),
+      SCHEDULES_DIR: path.join(dataDir, "schedules"),
+      SCHEDULE_TICK_MS: "3000",
+      NOTIFY_ALLOWLIST: "127.0.0.1",
+    },
+  });
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${schedUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  const waitFor = async (runId, timeoutMs = 180_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const { payload } = await api("GET", `/api/runs/${runId}`);
+      if (["completed", "failed", "cancelled", "interrupted"].includes(payload.data.status)) {
+        return payload.data;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`run ${runId} never finished`);
+  };
+
+  try {
+    await waitForHealth(schedUrl);
+
+    await check("the cron parser accepts and rejects the right expressions", async () => {
+      const { fixtures, invalid } = checkCronParsing();
+      // Exercised through the API: saving validates the expression, so a
+      // rejected save means the parser rejected it.
+      for (const expression of invalid) {
+        const response = await api("PUT", "/api/schedules/probe", {
+          cron: expression,
+          request: { scriptKey: "ok" },
+        });
+        assert(response.status === 400, `accepted invalid cron ${JSON.stringify(expression)}`);
+        assert(response.payload.error.code === "INVALID_CRON", `${expression}: ${response.payload.error.code}`);
+      }
+      for (const [expression] of fixtures) {
+        const response = await api("PUT", "/api/schedules/probe", {
+          cron: expression,
+          request: { scriptKey: "ok", project: "chromium" },
+          enabled: false,
+        });
+        assert(response.status === 200, `rejected valid cron ${expression}: ${JSON.stringify(response.payload.error)}`);
+      }
+      await api("DELETE", "/api/schedules/probe");
+    });
+
+    await check("a schedule is validated when saved, not at the scheduled time", async () => {
+      const unknownScript = await api("PUT", "/api/schedules/bad1", { cron: "0 2 * * *", request: { scriptKey: "nope" } });
+      assert(unknownScript.status === 404 || unknownScript.status === 400, `got ${unknownScript.status}`);
+      assert(unknownScript.payload.error.code === "SCRIPT_NOT_FOUND", unknownScript.payload.error.code);
+
+      const unknownEnv = await api("PUT", "/api/schedules/bad2", {
+        cron: "0 2 * * *",
+        request: { scriptKey: "ok", environment: "nope" },
+      });
+      assert(unknownEnv.payload.error.code === "ENVIRONMENT_NOT_FOUND", unknownEnv.payload.error.code);
+
+      const noScript = await api("PUT", "/api/schedules/bad3", { cron: "0 2 * * *", request: {} });
+      assert(noScript.status === 400, `got ${noScript.status}`);
+    });
+
+    await check("a notify URL cannot be used to reach an arbitrary host", async () => {
+      // Without this the server is an SSRF proxy for anything it can route to.
+      const blocked = await api("PUT", "/api/schedules/ssrf", {
+        cron: "0 2 * * *",
+        request: { scriptKey: "ok" },
+        notify: { url: "http://169.254.169.254/latest/meta-data/" },
+      });
+      assert(blocked.status === 403, `expected 403, got ${blocked.status}`);
+      assert(blocked.payload.error.code === "NOTIFY_URL_NOT_ALLOWED", blocked.payload.error.code);
+
+      const scheme = await api("PUT", "/api/schedules/ssrf", {
+        cron: "0 2 * * *",
+        request: { scriptKey: "ok" },
+        notify: { url: "file:///etc/passwd" },
+      });
+      assert(scheme.status === 400, `expected 400, got ${scheme.status}`);
+      assert(scheme.payload.error.code === "INVALID_NOTIFY_URL", scheme.payload.error.code);
+    });
+
+    await check("triggering a schedule runs it now and calls back with the failure", async () => {
+      received.length = 0;
+      const saved = await api("PUT", "/api/schedules/gate", {
+        cron: "0 2 * * *",
+        request: { scriptKey: "bad", project: "chromium" },
+        notify: { url: hookUrl, on: "always" },
+      });
+      assert(saved.status === 200, `save returned ${saved.status}: ${JSON.stringify(saved.payload.error)}`);
+
+      const triggered = await api("POST", "/api/schedules/gate/trigger", { variables: { buildId: "build-42" } });
+      assert(triggered.status === 201, `trigger returned ${triggered.status}`);
+      assert(triggered.payload.data.schedule === "gate", "the run does not record its schedule");
+      assert(triggered.payload.data.request.variables.buildId === "build-42", "the override was not merged");
+
+      const finished = await waitFor(triggered.payload.data.runId);
+      assert(finished.status === "failed", `expected failed, got ${finished.status}`);
+
+      for (let attempt = 0; attempt < 30 && !received.length; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      assert(received.length === 1, `${received.length} callbacks received`);
+      const payload = received[0];
+      assert(payload.event === "run.finished", payload.event);
+      assert(payload.status === "failed", payload.status);
+      assert(payload.schedule === "gate", payload.schedule);
+      assert(payload.request.variables.buildId === "build-42", "the callback lost the build id");
+      assert(payload.failedTests.length > 0, "the callback did not name the failing tests");
+
+      // The delivery outcome has to be visible, or a silently failing hook looks
+      // like a passing pipeline.
+      const stored = await api("GET", `/api/runs/${triggered.payload.data.runId}`);
+      assert(stored.payload.data.notification?.delivered === true, JSON.stringify(stored.payload.data.notification));
+      assert(stored.payload.data.notification.status === 200, JSON.stringify(stored.payload.data.notification));
+    });
+
+    await check("on: failure stays quiet when the run passes", async () => {
+      received.length = 0;
+      const created = await api("POST", "/api/runs", {
+        scriptKey: "ok",
+        project: "chromium",
+        notify: { url: hookUrl, on: "failure" },
+      });
+      const finished = await waitFor(created.payload.data.runId);
+      assert(finished.status === "completed", `run ${finished.status}`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      assert(received.length === 0, `a passing run sent ${received.length} callbacks`);
+      assert(finished.notification === null, JSON.stringify(finished.notification));
+    });
+
+    await check("an undeliverable callback is recorded rather than swallowed", async () => {
+      // A port nothing is listening on: the run still finishes, and the failure
+      // to notify is on the record.
+      const created = await api("POST", "/api/runs", {
+        scriptKey: "ok",
+        project: "chromium",
+        notify: { url: "http://127.0.0.1:9/nope", on: "always" },
+      });
+      const finished = await waitFor(created.payload.data.runId);
+      assert(finished.status === "completed", `run ${finished.status}`);
+      assert(finished.notification?.delivered === false, JSON.stringify(finished.notification));
+      assert(finished.notification.error, "no error recorded for the failed delivery");
+    });
+
+    await check("the scheduler fires on its cron and only once per minute", async () => {
+      const before = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      const saved = await api("PUT", "/api/schedules/everyminute", {
+        cron: "* * * * *",
+        request: { scriptKey: "ok", project: "chromium" },
+      });
+      assert(saved.status === 200, `save returned ${saved.status}`);
+
+      // Minute granularity, so this has to wait out a wall-clock minute.
+      let after = before;
+      for (let attempt = 0; attempt < 90 && after === before; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        after = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      }
+      assert(after > before, "the schedule never fired");
+
+      const schedule = await api("GET", "/api/schedules/everyminute");
+      assert(schedule.payload.data.lastFiredMinute, "the fired minute was not recorded");
+
+      // The tick runs every 3s here, so without the guard the same minute would
+      // fire repeatedly.
+      const settled = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      await new Promise((resolve) => setTimeout(resolve, 12000));
+      const later = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      assert(later === settled, `fired again within the same minute: ${settled} -> ${later}`);
+
+      await api("PUT", "/api/schedules/everyminute", {
+        cron: "* * * * *",
+        enabled: false,
+        request: { scriptKey: "ok", project: "chromium" },
+      });
+      const disabled = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      await new Promise((resolve) => setTimeout(resolve, 12000));
+      const stillDisabled = (await api("GET", "/api/runs?limit=200")).payload.data.total;
+      assert(stillDisabled === disabled, "a disabled schedule fired");
+    });
+  } catch (error) {
+    record("schedule and callback checks", "fail", error.message);
+  } finally {
+    proc.kill("SIGKILL");
+    await new Promise((resolve) => proc.on("exit", resolve));
+    await new Promise((resolve) => hook.close(resolve));
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
 async function runEnvironmentChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-env-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -1741,6 +2013,9 @@ async function run() {
     }
     assert(missing.length === 0, `undocumented: ${missing.join(", ")}`);
   });
+
+  // ---- schedules and callbacks ---------------------------------------------
+  await runScheduleChecks();
 
   // ---- environments, datasets and secrets -----------------------------------
   await runEnvironmentChecks();

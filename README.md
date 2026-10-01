@@ -21,6 +21,7 @@
 - API 응답·다운로드 파일 내용·처리번호까지 확인하는 업무 결과 검증
 - 실행 목록과 단계별 타임라인을 보여주는 `/runs` 화면
 - 환경·계정·데이터셋 분리와 비밀정보 참조
+- cron 예약 실행, 배포 파이프라인 트리거, 실패 알림 콜백
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -126,6 +127,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 - `DELETE /api/runs/{runId}`
 - `POST /api/runs/{runId}/cancel`
 - `GET /api/queue`
+- `GET /api/schedules`, `GET|PUT|DELETE /api/schedules/{name}`
+- `POST /api/schedules/{name}/trigger`
 - `GET /api/environments`, `GET|PUT|DELETE /api/environments/{name}`
 - `GET /api/datasets`, `GET|PUT|DELETE /api/datasets/{name}`
 - `POST /api/runs/{runId}/retry`
@@ -198,6 +201,7 @@ MCP endpoint 는 `/mcp` 입니다.
 
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
+- `schedule_list`, `schedule_get`, `schedule_save`, `schedule_delete`, `schedule_trigger`
 - `environment_list`, `environment_get`, `environment_save`, `environment_delete`
 - `dataset_list`, `dataset_get`, `dataset_save`, `dataset_delete`
 - `run_create`, `run_list`, `run_queue`, `run_get`, `run_cancel`, `run_retry`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
@@ -236,6 +240,10 @@ MCP endpoint 는 `/mcp` 입니다.
 | `SECRETS_DIR` | `./secrets` | `{{secret.NAME}}` 참조가 읽는 디렉터리. API 로 노출되지 않습니다 |
 | `REDACT_VARIABLE_PATTERN` | `(pass\|secret\|token\|credential\|pwd\|api[-_]?key)` | 이 패턴에 걸리는 변수 **이름**의 값은 저장 시 `***` 로 마스킹됩니다 |
 | `MAX_DATASET_ROWS` | `200` | 한 데이터셋이 큐에 넣을 수 있는 행 수 상한 |
+| `SCHEDULES_DIR` | `./data/schedules` | 예약 정의 저장 위치 |
+| `SCHEDULE_TICK_MS` | `30000` | 예약 확인 주기. `0` 이면 스케줄러를 끕니다 |
+| `NOTIFY_ALLOWLIST` | 없음 | 알림 URL 로 허용할 host. 비어 있으면 `URL_ALLOWLIST` 를 따릅니다 |
+| `NOTIFY_TIMEOUT_MS` | `10000` | 알림 POST 타임아웃 |
 | `MAX_DOWNLOAD_BYTES` | `67108864` | 캡처할 다운로드 파일 크기 상한 |
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
@@ -305,6 +313,71 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 ### 실행 시간 상한
 
 `RUN_TIMEOUT_MS`(기본 30분)를 넘긴 실행은 `SIGKILL` 로 종료되고 `failed` 로 기록됩니다. 대기열이 있는 구조에서 멈춘 실행이 슬롯을 영구히 점유하지 못하게 하기 위한 것입니다. `interruptedReason` 에 사유가 남습니다.
+
+## 예약 실행과 배포 연동
+
+### 예약
+
+```
+PUT /api/schedules/nightly-smoke
+{
+  "cron": "0 2 * * *",
+  "request": { "scriptKey": "smoke", "environment": "staging", "dataset": "orders" },
+  "notify": { "url": "https://ci.example.com/hooks/playwright", "on": "failure" }
+}
+```
+
+cron 은 5필드(`분 시 일 월 요일`)이고 `*`, `n`, `a,b`, `a-b`, `*/n`, `a-b/n` 을 지원합니다. 두 날짜 필드가 모두 제한된 경우 둘 중 하나만 맞아도 발동하는 표준 cron 동작을 따릅니다.
+
+**서버의 로컬 시간대**로 평가됩니다. 컨테이너의 `TZ` 환경변수로 맞추세요.
+
+cron 표현식, 스크립트, 환경, 데이터셋을 **저장 시점에** 검증합니다 — 새벽 2시에 처음 실패하면 안 되기 때문입니다.
+
+```
+"0 2 * *"      → 400 INVALID_CRON   cron needs 5 fields
+"60 * * * *"   → 400 INVALID_CRON   minute: "60" is not a range within 0-59
+없는 scriptKey → 404 SCRIPT_NOT_FOUND
+없는 environment → 404 ENVIRONMENT_NOT_FOUND
+```
+
+`enabled: false` 면 건너뜁니다. 발동한 분을 실행 **전에** 기록하므로, 실행 중 서버가 죽어도 같은 분이 재발동하지 않습니다.
+
+> **놓친 예약은 따라잡지 않습니다.** 서버가 꺼져 있던 동안의 예약 시각은 지나간 것으로 둡니다. 새벽 2시 점검이 오전 9시에 뒤늦게 도는 것이 더 위험하다고 판단했습니다.
+
+### 배포 연동
+
+```
+POST /api/schedules/nightly-smoke/trigger
+{ "variables": { "buildId": "build-42" } }
+```
+
+cron 과 무관하게 즉시 실행합니다. 배포 파이프라인이 릴리즈를 게이팅할 때 호출하는 지점이고, `variables` 는 저장된 요청 위에 병합되므로 검증 대상 빌드를 식별할 수 있습니다. 데이터셋을 쓰는 예약이면 행마다 실행이 만들어집니다.
+
+### 결과 콜백
+
+`notify` 는 예약뿐 아니라 개별 실행 요청에도 쓸 수 있습니다.
+
+```jsonc
+{ "scriptKey": "smoke", "notify": { "url": "https://...", "on": "failure" } }
+// on: "failure"(기본) 또는 "always"
+```
+
+실행이 끝나면 한 번 POST 합니다.
+
+```json
+{
+  "event": "run.finished", "runId": "run_...", "status": "failed",
+  "schedule": "nightly-smoke", "environment": "staging", "datasetRow": 0,
+  "request": { "...": "마스킹된 사본" },
+  "failedTests": [{ "title": "...", "project": "chromium", "error": "..." }]
+}
+```
+
+payload 의 `request` 는 **마스킹된 사본**입니다 — 알림이 자격증명을 외부로 유출하는 경로가 되면 안 됩니다.
+
+전달 결과는 실행 레코드의 `notification` 에 남습니다(`delivered`, `status`, `error`). 훅이 조용히 죽으면 파이프라인은 통과한 것처럼 보이므로, 전달 실패도 확인할 수 있어야 합니다.
+
+**알림 URL 은 서버가 외부로 보내는 요청입니다.** 제한하지 않으면 이 서버를 내부망 프록시(SSRF)로 쓸 수 있으므로, `NOTIFY_ALLOWLIST`(없으면 `URL_ALLOWLIST`)로 호스트를 제한하고 http/https 만 허용합니다.
 
 ## 환경·계정·데이터셋
 
@@ -586,6 +659,7 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 - `401 UNAUTHORIZED`
 - `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`, `403 SCRIPTS_DIR_NOT_WRITABLE`
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
+- `400 INVALID_CRON`, `400 INVALID_NOTIFY_URL`, `403 NOTIFY_URL_NOT_ALLOWED`
 - `400 SECRET_NOT_FOUND`, `400 DATASET_ROW_NOT_FOUND`, `400 DATASET_EMPTY`, `400 INVALID_NAME`
 - `400 AMBIGUOUS_LOCATOR` — locator 가 여러 요소에 매칭됩니다. `first`/`last`/`nth` 를 붙이거나 더 구체적인 locator 를 쓰세요
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
