@@ -29,7 +29,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.7.1",
+  serviceVersion: process.env.SERVICE_VERSION || "0.8.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -68,6 +68,9 @@ const config = {
   commandOutputLimitBytes: parseInteger(process.env.COMMAND_OUTPUT_LIMIT_BYTES, 256 * 1024),
   runEnvPassthrough: parseCsv(process.env.RUN_ENV_PASSTHROUGH),
   maxRetainedArtifacts: parseInteger(process.env.MAX_RETAINED_ARTIFACTS, 2000),
+  maxDownloadBytes: parseInteger(process.env.MAX_DOWNLOAD_BYTES, 64 * 1024 * 1024),
+  maxApiResponseBodyBytes: parseInteger(process.env.MAX_API_RESPONSE_BODY_BYTES, 256 * 1024),
+  apiRequestTimeoutMs: parseInteger(process.env.API_REQUEST_TIMEOUT_MS, 30 * 1000),
   captureFailureArtifacts: parseBoolean(process.env.CAPTURE_FAILURE_ARTIFACTS, true),
   purgeSessionArtifactsOnClose: parseBoolean(process.env.PURGE_SESSION_ARTIFACTS_ON_CLOSE, false),
   apiToken: process.env.API_TOKEN || "",
@@ -2603,6 +2606,172 @@ function buildEvaluateExpression(expression, arg) {
 })(${serializedArg})`;
 }
 
+const ALLOWED_API_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]);
+
+// Reads a dotted path out of a parsed JSON body, so a caller can assert on
+// `data.order.referenceNumber` without pulling the whole document back.
+// A reference number read off the page has to be usable by a later step, and in
+// an `execute` batch the caller does not see intermediate results until the whole
+// batch returns. `{{name}}` is substituted from values captured by earlier steps.
+function substituteCaptured(value, captured, seen = new Set()) {
+  if (typeof value === "string") {
+    return value.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (match, name) => {
+      if (!(name in captured)) {
+        throw new ApiError(
+          400,
+          "UNKNOWN_CAPTURED_VALUE",
+          `${match} refers to a value no earlier step captured. Captured so far: ${Object.keys(captured).join(", ") || "(none)"}`,
+        );
+      }
+
+      const replacement = captured[name];
+      // Capturing right after a click often reads the element before the page
+      // has filled it in. Substituting "" silently produced things like
+      // "/api/orders/" and a confusing 404 instead of naming the real problem.
+      if (replacement === null || replacement === undefined || replacement === "") {
+        throw new ApiError(
+          422,
+          "EMPTY_CAPTURED_VALUE",
+          `${match} was captured empty. The step that captured it probably ran before the page produced the value — `
+          + "assert the expected state first (assertText or waitFor), then capture.",
+          { name, captured },
+        );
+      }
+
+      return String(replacement);
+    });
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => substituteCaptured(entry, captured, seen));
+  }
+
+  if (value && typeof value === "object") {
+    if (seen.has(value)) {
+      return value;
+    }
+    seen.add(value);
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, substituteCaptured(entry, captured, seen)]),
+    );
+  }
+
+  return value;
+}
+
+// What a step contributes to the captured-value bag.
+function pickCapturedValue(action, result, step) {
+  if (step.savePath) {
+    const source = action === "apiRequest" ? result?.json : result;
+    return readJsonPath(source, step.savePath);
+  }
+
+  switch (action) {
+    case "locatorQuery":
+      return result?.value ?? result?.count ?? result?.values;
+    case "apiRequest":
+      return result?.json ?? result?.text;
+    case "assertText":
+    case "assertUrl":
+      return result?.actual ?? result?.url;
+    default:
+      return result;
+  }
+}
+
+function readJsonPath(value, jsonPath) {
+  if (!jsonPath) {
+    return value;
+  }
+
+  let current = value;
+  for (const rawKey of String(jsonPath).split(".")) {
+    if (current === null || current === undefined) {
+      return undefined;
+    }
+    const key = rawKey.trim();
+    const index = Number(key);
+    current = Array.isArray(current) && Number.isInteger(index) ? current[index] : current[key];
+  }
+
+  return current;
+}
+
+// Assertions about the outcome rather than the screen: an HTTP status, a value
+// inside a JSON body, a captured reference number, or a downloaded file.
+function assertApiResponse(response, step) {
+  if (step.status !== undefined && Number(response.status) !== Number(step.status)) {
+    throw new ApiError(
+      422,
+      "API_ASSERTION_FAILED",
+      `expected HTTP ${step.status}, got ${response.status} ${response.statusText} for ${response.method} ${response.url}`,
+      { status: response.status, expected: Number(step.status) },
+    );
+  }
+  if (step.ok === true && !response.ok) {
+    throw new ApiError(
+      422,
+      "API_ASSERTION_FAILED",
+      `expected a 2xx response, got ${response.status} for ${response.method} ${response.url}`,
+      { status: response.status },
+    );
+  }
+
+  if (step.jsonPath !== undefined) {
+    if (response.json === undefined) {
+      throw new ApiError(422, "API_ASSERTION_FAILED", "response body is not JSON, so jsonPath cannot be read", {
+        bodyPreview: truncate(response.text, 300),
+      });
+    }
+
+    const actual = readJsonPath(response.json, step.jsonPath);
+    const expected = step.expected ?? step.value;
+    if (expected !== undefined) {
+      const matched = typeof expected === "string" || typeof actual === "string"
+        ? textMatches(actual, normalizePattern(expected), step.match || "equals")
+        : JSON.stringify(actual) === JSON.stringify(expected);
+      if (!matched) {
+        throw new ApiError(
+          422,
+          "API_ASSERTION_FAILED",
+          `${step.jsonPath} was ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)} (${step.match || "equals"})`,
+          { jsonPath: step.jsonPath, actual, expected },
+        );
+      }
+    } else if (actual === undefined || actual === null) {
+      throw new ApiError(422, "API_ASSERTION_FAILED", `${step.jsonPath} is missing from the response body`, {
+        jsonPath: step.jsonPath,
+        bodyPreview: truncate(response.text, 300),
+      });
+    }
+  }
+
+  if (step.bodyContains !== undefined && !String(response.text).includes(String(step.bodyContains))) {
+    throw new ApiError(422, "API_ASSERTION_FAILED", `response body does not contain ${JSON.stringify(step.bodyContains)}`, {
+      bodyPreview: truncate(response.text, 300),
+    });
+  }
+}
+
+function assertCapturedValue(step) {
+  const expected = step.expected ?? step.pattern;
+  if (expected === undefined) {
+    throw new ApiError(400, "INVALID_REQUEST", "assertValue needs expected (or pattern)");
+  }
+  if (step.value === undefined) {
+    throw new ApiError(400, "INVALID_REQUEST", "assertValue needs value, usually a {{captured}} reference");
+  }
+
+  if (!textMatches(step.value, normalizePattern(expected), step.match || "equals")) {
+    throw new ApiError(
+      422,
+      "VALUE_ASSERTION_FAILED",
+      `captured value was ${JSON.stringify(step.value)}, expected ${JSON.stringify(expected)} (${step.match || "equals"})`,
+      { actual: step.value, expected },
+    );
+  }
+}
+
 const DIALOG_ACTIONS = new Set(["accept", "dismiss", "ignore"]);
 
 function normalizeDialogPolicy(value, fallback) {
@@ -2725,6 +2894,7 @@ class SessionManager {
       contextIds: [...session.contexts.keys()],
       pageIds: [...session.pages.keys()],
       artifactCount: session.artifacts.size,
+      downloadCount: session.downloads.length,
       actionCount: session.actions.length,
     };
   }
@@ -3020,6 +3190,7 @@ class SessionManager {
       contexts: new Map(),
       pages: new Map(),
       artifacts: new Map(),
+      downloads: [],
       actions: [],
       actionSeq: 0,
       events: [],
@@ -3153,6 +3324,18 @@ class SessionManager {
       if (frame === page.mainFrame()) {
         pageRecord.lastUrl = frame.url();
       }
+    });
+    // acceptDownloads defaults to true, but with no listener Playwright kept the
+    // file in a temp directory and deleted it when the context closed, so a
+    // scenario that downloads a document had no way to check what it received.
+    page.on("download", (download) => {
+      this.captureDownload(session, pageRecord, download).catch((error) => {
+        this.logEvent(session, {
+          type: "download.error",
+          pageId: pageRecord.pageId,
+          message: error.message,
+        });
+      });
     });
     page.on("close", () => {
       session.pages.delete(pageRecord.pageId);
@@ -3352,6 +3535,173 @@ class SessionManager {
         ...(videoArtifact ? { video: videoArtifact } : {}),
       };
     });
+  }
+
+  async captureDownload(session, pageRecord, download) {
+    const suggestedFilename = download.suggestedFilename();
+    this.logEvent(session, {
+      type: "download.started",
+      pageId: pageRecord.pageId,
+      fileName: suggestedFilename,
+      url: download.url(),
+    });
+
+    // Resolves once the transfer finishes; null means it failed or was cancelled.
+    const downloadPath = await download.path();
+    if (!downloadPath) {
+      const failure = await download.failure();
+      this.logEvent(session, {
+        type: "download.failed",
+        pageId: pageRecord.pageId,
+        fileName: suggestedFilename,
+        message: failure || "download did not complete",
+      });
+      return null;
+    }
+
+    const stats = await statOrNull(downloadPath);
+    if (stats && stats.size > this.options.maxDownloadBytes) {
+      this.logEvent(session, {
+        type: "download.skipped",
+        pageId: pageRecord.pageId,
+        fileName: suggestedFilename,
+        message: `exceeds MAX_DOWNLOAD_BYTES (${stats.size} > ${this.options.maxDownloadBytes})`,
+      });
+      return null;
+    }
+
+    const artifact = await this.saveArtifact(session, {
+      contextId: pageRecord.contextId,
+      pageId: pageRecord.pageId,
+      type: "download",
+      extension: (path.extname(suggestedFilename).replace(".", "") || "bin").toLowerCase(),
+      buffer: await fsPromises.readFile(downloadPath),
+      metadata: {
+        suggestedFilename,
+        url: download.url(),
+      },
+    });
+
+    const record = {
+      downloadId: artifact.artifactId,
+      fileName: suggestedFilename,
+      url: download.url(),
+      sizeBytes: artifact.sizeBytes,
+      pageId: pageRecord.pageId,
+      contextId: pageRecord.contextId,
+      completedAt: toIso(),
+      artifact,
+    };
+    session.downloads.push(record);
+    if (session.downloads.length > this.options.maxActionLogEntries) {
+      session.downloads.splice(0, session.downloads.length - this.options.maxActionLogEntries);
+    }
+
+    this.logEvent(session, {
+      type: "download.completed",
+      pageId: pageRecord.pageId,
+      fileName: suggestedFilename,
+      downloadId: record.downloadId,
+      sizeBytes: record.sizeBytes,
+    });
+    console.log(`[session] download captured ${suggestedFilename} ${record.sizeBytes}B`);
+    return record;
+  }
+
+  // Waits for a download to arrive, then checks the file itself - a click that
+  // "worked" but produced an empty or wrong file is not a completed task.
+  async assertDownload(session, step = {}) {
+    const timeoutMs = step.timeoutMs ?? 15_000;
+    const matches = (record) => {
+      if (step.fileName && !textMatches(record.fileName, normalizePattern(step.fileName), step.match || "contains")) {
+        return false;
+      }
+      return true;
+    };
+
+    const seenBefore = step.sinceIndex ?? 0;
+    let record = null;
+    await poll(
+      timeoutMs,
+      async () => {
+        record = session.downloads.slice(seenBefore).reverse().find(matches) || null;
+        return Boolean(record);
+      },
+      step.fileName
+        ? `no download matching ${JSON.stringify(step.fileName)} arrived within ${timeoutMs}ms`
+        : `no download arrived within ${timeoutMs}ms`,
+    );
+
+    if (step.minBytes !== undefined && record.sizeBytes < Number(step.minBytes)) {
+      throw new ApiError(
+        422,
+        "DOWNLOAD_ASSERTION_FAILED",
+        `${record.fileName} is ${record.sizeBytes} bytes, expected at least ${step.minBytes}`,
+        { downloadId: record.downloadId, sizeBytes: record.sizeBytes },
+      );
+    }
+
+    let text;
+    if (step.contains !== undefined || step.jsonPath !== undefined) {
+      const buffer = await fsPromises.readFile(record.artifact.absolutePath);
+      text = buffer.subarray(0, this.options.maxApiResponseBodyBytes).toString("utf8");
+    }
+
+    if (step.contains !== undefined && !text.includes(String(step.contains))) {
+      throw new ApiError(
+        422,
+        "DOWNLOAD_ASSERTION_FAILED",
+        `${record.fileName} does not contain ${JSON.stringify(step.contains)}`,
+        { downloadId: record.downloadId, preview: truncate(text, 300) },
+      );
+    }
+
+    if (step.jsonPath !== undefined) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new ApiError(422, "DOWNLOAD_ASSERTION_FAILED", `${record.fileName} is not JSON`, {
+          downloadId: record.downloadId,
+          preview: truncate(text, 300),
+        });
+      }
+      const actual = readJsonPath(parsed, step.jsonPath);
+      const expected = step.expected ?? step.value;
+      if (expected !== undefined && !textMatches(actual, normalizePattern(expected), step.match || "equals")) {
+        throw new ApiError(
+          422,
+          "DOWNLOAD_ASSERTION_FAILED",
+          `${step.jsonPath} in ${record.fileName} was ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`,
+          { downloadId: record.downloadId, actual, expected },
+        );
+      }
+    }
+
+    return {
+      downloadId: record.downloadId,
+      fileName: record.fileName,
+      sizeBytes: record.sizeBytes,
+      url: record.url,
+      downloadPath: record.artifact.downloadPath,
+      success: true,
+    };
+  }
+
+  listDownloads(sessionId) {
+    const session = this.getSession(sessionId);
+    return {
+      sessionId,
+      downloads: session.downloads.map((record) => ({
+        downloadId: record.downloadId,
+        fileName: record.fileName,
+        url: record.url,
+        sizeBytes: record.sizeBytes,
+        pageId: record.pageId,
+        completedAt: record.completedAt,
+        downloadPath: record.artifact.downloadPath,
+      })),
+    };
   }
 
   async collectVideoArtifact(session, pageRecord) {
@@ -3662,6 +4012,120 @@ class SessionManager {
         permissions: request.permissions || [],
         origin: request.origin,
       };
+    });
+  }
+
+  // "The button turned green" is not the same as "the record exists". This issues
+  // a request through the context's own APIRequestContext, so it carries the
+  // session's cookies and headers and can confirm the business outcome the UI
+  // claims to have produced.
+  async apiRequest(sessionId, contextId, request = {}, lockedSession = null) {
+    return this.runLocked(sessionId, lockedSession, async (session) => {
+      const contextRecord = this.getContextRecord(session, contextId);
+      const method = String(request.method || "GET").toUpperCase();
+      if (!ALLOWED_API_METHODS.has(method)) {
+        throw new ApiError(400, "INVALID_REQUEST", `method must be one of ${[...ALLOWED_API_METHODS].join(", ")}`);
+      }
+      if (!request.url) {
+        throw new ApiError(400, "INVALID_REQUEST", "url is required");
+      }
+
+      // Resolve against the context baseURL so a relative path works, then apply
+      // the same allowlist the browser is held to.
+      let url;
+      try {
+        url = new URL(request.url, contextRecord.options?.baseURL || undefined).toString();
+      } catch {
+        throw new ApiError(400, "INVALID_URL", `url could not be resolved: ${request.url}`);
+      }
+      this.assertAllowedUrl(url);
+
+      const startedAt = monotonicNow();
+      const startedAtWall = Date.now();
+      const fromEventSeq = (session.eventSeq ?? 0) + 1;
+      let response;
+      try {
+        response = await contextRecord.context.request.fetch(url, cleanObject({
+          method,
+          headers: request.headers,
+          params: request.params,
+          data: request.data,
+          form: request.form,
+          timeout: request.timeoutMs ?? this.options.apiRequestTimeoutMs,
+          ignoreHTTPSErrors: request.ignoreHTTPSErrors,
+          maxRedirects: request.maxRedirects,
+        }));
+      } catch (error) {
+        const elapsed = elapsedMs(startedAt);
+        this.logAction(session, {
+          type: "api.request",
+          status: "error",
+          contextId,
+          startedAt: toIso(startedAtWall),
+          durationMs: elapsed,
+          fromEventSeq,
+          toEventSeq: session.eventSeq ?? 0,
+          input: { method, url },
+          error: error.message,
+        });
+        throw toApiError(error, {
+          statusCode: /Timeout/i.test(error.message) ? 408 : 502,
+          code: /Timeout/i.test(error.message) ? "TIMEOUT" : "API_REQUEST_FAILED",
+          details: { sessionId, contextId, method, url },
+        });
+      }
+
+      const elapsed = elapsedMs(startedAt);
+      const bodyBuffer = await response.body().catch(() => Buffer.alloc(0));
+      const truncated = bodyBuffer.length > this.options.maxApiResponseBodyBytes;
+      const text = bodyBuffer.subarray(0, this.options.maxApiResponseBodyBytes).toString("utf8");
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = undefined;
+      }
+
+      // Keep the full body as evidence even when the inline copy is truncated.
+      const artifact = await this.saveArtifact(session, {
+        contextId,
+        type: "api-response",
+        extension: json !== undefined ? "json" : "txt",
+        buffer: bodyBuffer,
+        metadata: { method, url, status: response.status() },
+      });
+
+      const result = {
+        method,
+        url,
+        status: response.status(),
+        statusText: response.statusText(),
+        ok: response.ok(),
+        headers: response.headers(),
+        durationMs: elapsed,
+        bodyBytes: bodyBuffer.length,
+        truncated,
+        text,
+        json,
+        artifact,
+      };
+
+      this.logAction(session, {
+        type: "api.request",
+        status: response.ok() ? "ok" : "error",
+        contextId,
+        startedAt: toIso(startedAtWall),
+        durationMs: elapsed,
+        fromEventSeq,
+        toEventSeq: session.eventSeq ?? 0,
+        url,
+        input: { method, url },
+        output: summarize({ status: result.status, bodyBytes: result.bodyBytes }),
+        artifactIds: [artifact.artifactId],
+        error: response.ok() ? undefined : `HTTP ${response.status()} ${response.statusText()}`,
+      });
+
+      return result;
     });
   }
 
@@ -4417,6 +4881,22 @@ class SessionManager {
 
   async runStepLocked(session, pageId, step) {
     switch (step.action) {
+      case "apiRequest": {
+        // Default to the page's own context so the request carries its cookies.
+        const contextId = step.contextId || this.getPageRecord(session, pageId).contextId;
+        return this.apiRequest(session.sessionId, contextId, step, session);
+      }
+      case "assertApiResponse": {
+        const contextId = step.contextId || this.getPageRecord(session, pageId).contextId;
+        const response = await this.apiRequest(session.sessionId, contextId, step, session);
+        assertApiResponse(response, step);
+        return response;
+      }
+      case "assertValue":
+        assertCapturedValue(step);
+        return { value: step.value, success: true };
+      case "assertDownload":
+        return this.assertDownload(session, step);
       case "goto":
       case "reload":
       case "goBack":
@@ -4460,10 +4940,25 @@ class SessionManager {
 
     return this.withLock(sessionId, async (session) => {
       this.getPageRecord(session, request.pageId);
+      const captured = { ...(request.variables || {}) };
       const results = [];
-      for (const [index, step] of request.steps.entries()) {
+      for (const [index, rawStep] of request.steps.entries()) {
+        // Declared outside the try so the catch can still name the step that
+        // failed; substitution itself can throw on an unknown {{reference}}.
+        let step = rawStep;
         try {
-          results.push({ index, action: step.action, status: "ok", result: await this.runStepLocked(session, request.pageId, step) });
+          step = substituteCaptured(rawStep, captured);
+          const result = await this.runStepLocked(session, request.pageId, step);
+          if (step.saveAs) {
+            captured[step.saveAs] = pickCapturedValue(step.action, result, step);
+          }
+          results.push(cleanObject({
+            index,
+            action: step.action,
+            status: "ok",
+            saveAs: step.saveAs,
+            result,
+          }));
         } catch (error) {
           const apiError = toApiError(error);
           results.push({
@@ -4484,6 +4979,7 @@ class SessionManager {
         pageId: request.pageId,
         stepCount: request.steps.length,
         failedCount: results.filter((entry) => entry.status === "error").length,
+        captured,
         results,
       };
     });
@@ -5831,6 +6327,38 @@ function buildOpenApiSpec(req) {
       },
       [`${api}/sessions/{sessionId}/actions`]: {
         get: operation({ tag: "Sessions", summary: "List the raw action and browser event logs", parameters: sessionParams }),
+      },
+      [`${api}/sessions/{sessionId}/downloads`]: {
+        get: operation({
+          tag: "Sessions",
+          summary: "List files the session downloaded, captured as artifacts",
+          parameters: sessionParams,
+        }),
+      },
+      [`${api}/sessions/{sessionId}/contexts/{contextId}/request`]: {
+        post: operation({
+          tag: "Sessions",
+          summary: "Issue an HTTP request through the context, carrying its cookies — use it to confirm the outcome a UI action claims",
+          parameters: contextParams,
+          body: {
+            type: "object",
+            required: ["url"],
+            properties: {
+              method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], default: "GET" },
+              url: { type: "string", description: "Absolute, or relative to the context baseURL" },
+              headers: { type: "object", additionalProperties: { type: "string" } },
+              params: { type: "object", additionalProperties: true },
+              data: { description: "Request body; an object is sent as JSON" },
+              form: { type: "object", additionalProperties: true },
+              timeoutMs: { type: "integer" },
+            },
+          },
+          responses: {
+            200: { description: "status, headers, body text, parsed json when applicable, and the full body stored as an artifact" },
+            403: { description: "The URL is not in URL_ALLOWLIST" },
+            408: { description: "The request timed out" },
+          },
+        }),
       },
       [`${api}/sessions/{sessionId}/timeline`]: {
         get: operation({
@@ -7307,6 +7835,14 @@ app.get(`${config.apiBasePath}/sessions/:sessionId/actions`, asyncRoute(async (r
   ok(res, await sessionManager.listActions(req.params.sessionId));
 }));
 
+app.get(`${config.apiBasePath}/sessions/:sessionId/downloads`, asyncRoute(async (req, res) => {
+  ok(res, sessionManager.listDownloads(req.params.sessionId));
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/contexts/:contextId/request`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.apiRequest(req.params.sessionId, req.params.contextId, req.body || {}));
+}));
+
 app.get(`${config.apiBasePath}/sessions/:sessionId/timeline`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.buildTimeline(req.params.sessionId, {
     limit: req.query.limit,
@@ -7511,6 +8047,8 @@ const STEP_SCHEMA = {
         "goto", "reload", "goBack", "goForward",
         "click", "fill", "press", "hover", "drag", "selectOption", "evaluate", "locatorQuery",
         "assertVisible", "assertText", "assertUrl", "assertCount",
+        // Outcome checks: a green button is not a completed task.
+        "apiRequest", "assertApiResponse", "assertValue", "assertDownload",
         "waitFor", "screenshot",
       ],
     },
@@ -7532,6 +8070,22 @@ const STEP_SCHEMA = {
     sleepMs: { type: "integer" },
     fullPage: { type: "boolean" },
     timeoutMs: { type: "integer" },
+    // Outcome verification
+    method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], description: "apiRequest / assertApiResponse" },
+    headers: { type: "object", additionalProperties: { type: "string" } },
+    params: { type: "object", additionalProperties: true },
+    data: { description: "Request body; an object is sent as JSON" },
+    contextId: { type: "string", description: "Defaults to the page's own context" },
+    status: { type: "integer", description: "assertApiResponse: expected HTTP status" },
+    ok: { type: "boolean", description: "assertApiResponse: require a 2xx" },
+    jsonPath: { type: "string", example: "data.order.referenceNumber", description: "Dotted path into the JSON body" },
+    bodyContains: { type: "string" },
+    fileName: { type: "string", description: "assertDownload: name to wait for" },
+    minBytes: { type: "integer", description: "assertDownload: reject an empty or truncated file" },
+    contains: { type: "string", description: "assertDownload: text the file must contain" },
+    // Capture and reuse
+    saveAs: { type: "string", description: "Store this step's value under a name; later steps can use {{name}}" },
+    savePath: { type: "string", description: "Dotted path to pluck from the result before saving" },
   },
   required: ["action"],
 };
@@ -7719,13 +8273,14 @@ const mcpTools = [
   defineTool("session_trace", "Start or stop Playwright tracing for a context.", { type: "object", properties: { sessionId: { type: "string" }, action: { type: "string" }, contextId: { type: "string" }, title: { type: "string" } }, required: ["sessionId", "action", "contextId"] }, async (args) => args.action === "start" ? sessionManager.startTrace(args.sessionId, args) : sessionManager.stopTrace(args.sessionId, args)),
   defineTool(
     "session_execute",
-    "Execute a batch of page steps. The whole batch holds the session lock, so no other call can interleave between steps.",
+    "Execute a batch of page steps. The whole batch holds the session lock, so no other call can interleave between steps. A step can capture a value with saveAs and later steps reference it as {{name}}, which is how a reference number read off the page gets checked against the API in one call.",
     {
       type: "object",
       properties: {
         sessionId: { type: "string" },
         pageId: { type: "string" },
         steps: { type: "array", items: STEP_SCHEMA, minItems: 1 },
+        variables: { type: "object", additionalProperties: true, description: "Seed values available as {{name}} from the first step" },
         continueOnError: { type: "boolean", default: false, description: "Keep running later steps after one fails." },
       },
       required: ["sessionId", "pageId", "steps"],
@@ -7763,6 +8318,32 @@ const mcpTools = [
   defineTool("context_route_remove", "Remove a route handler.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" }, routeId: { type: "string" } }, required: ["sessionId", "contextId", "routeId"] }, async (args) => sessionManager.removeRoute(args.sessionId, args.contextId, args.routeId)),
   defineTool("context_cookies", "Get or set cookies in a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" }, mode: { type: "string" }, cookies: { type: "array" }, urls: { type: "array" } }, required: ["sessionId", "contextId", "mode"] }, async (args) => args.mode === "set" ? sessionManager.setCookies(args.sessionId, args.contextId, args) : sessionManager.getCookies(args.sessionId, args.contextId, args)),
   defineTool("context_permissions", "Grant permissions in a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" }, permissions: { type: "array" }, origin: { type: "string" } }, required: ["sessionId", "contextId", "permissions"] }, async (args) => sessionManager.grantPermissions(args.sessionId, args.contextId, args)),
+  defineTool(
+    "context_request",
+    "Issue an HTTP request through the context, carrying its cookies and headers. Use it to confirm the business outcome a UI action claims to have produced - that the record exists, the status changed, the reference number resolves - rather than trusting the screen.",
+    {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        contextId: { type: "string" },
+        method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], default: "GET" },
+        url: { type: "string", description: "Absolute, or relative to the context baseURL" },
+        headers: { type: "object", additionalProperties: { type: "string" } },
+        params: { type: "object", additionalProperties: true, description: "Query string parameters" },
+        data: { description: "Request body; an object is sent as JSON" },
+        form: { type: "object", additionalProperties: true, description: "Send as application/x-www-form-urlencoded" },
+        timeoutMs: { type: "integer" },
+      },
+      required: ["sessionId", "contextId", "url"],
+    },
+    async (args) => sessionManager.apiRequest(args.sessionId, args.contextId, args),
+  ),
+  defineTool(
+    "session_downloads",
+    "List files the session downloaded. Downloads are captured as artifacts, so the file can be fetched and its contents checked.",
+    { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] },
+    async (args) => sessionManager.listDownloads(args.sessionId),
+  ),
   defineTool("context_headers", "Set default extra HTTP headers for a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" }, headers: { type: "object" } }, required: ["sessionId", "contextId", "headers"] }, async (args) => sessionManager.setHeaders(args.sessionId, args.contextId, args)),
   defineTool("page_create", "Create a new page in a context.", { type: "object", properties: { sessionId: { type: "string" }, contextId: { type: "string" } }, required: ["sessionId", "contextId"] }, async (args) => sessionManager.createPage(args.sessionId, args.contextId)),
   defineTool("page_get", "Get one page.", { type: "object", properties: { sessionId: { type: "string" }, pageId: { type: "string" } }, required: ["sessionId", "pageId"] }, async (args) => sessionManager.getPage(args.sessionId, args.pageId)),

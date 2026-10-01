@@ -18,6 +18,7 @@
 - LLM 보조 API: `assist/capabilities`, `assist/examples`, `assist/plan`, `assist/scaffold`
 - 실제 DOM 검증을 포함한 페이지 구조 분석 `page_inspect`
 - 단계별 소요시간·콘솔/네트워크 오류·증적을 연결한 실행 타임라인
+- API 응답·다운로드 파일 내용·처리번호까지 확인하는 업무 결과 검증
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -163,6 +164,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/{sessionId}/timeline`
+- `GET /api/sessions/{sessionId}/downloads`
+- `POST /api/sessions/{sessionId}/contexts/{contextId}/request`
 - `GET /api/sessions/{sessionId}`
 - `DELETE /api/sessions/{sessionId}`
 - `POST /api/sessions/{sessionId}/keepalive`
@@ -192,11 +195,11 @@ MCP endpoint 는 `/mcp` 입니다.
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
 - `run_create`, `run_list`, `run_queue`, `run_get`, `run_cancel`, `run_retry`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
-- `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`, `session_timeline`
+- `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`, `session_timeline`, `session_downloads`
 - `context_create`, `context_get`, `context_delete`
 - `context_storage_export`, `context_storage_import`
 - `context_route_add`, `context_route_remove`
-- `context_cookies`, `context_permissions`, `context_headers`
+- `context_cookies`, `context_permissions`, `context_headers`, `context_request`
 - `page_create`, `page_get`, `page_inspect`, `page_delete`
 - `page_navigate`, `page_action`, `page_assert`, `page_wait_for`
 - `page_screenshot`, `page_pdf`
@@ -222,6 +225,9 @@ MCP endpoint 는 `/mcp` 입니다.
 | `VALIDATION_TIMEOUT_MS` | `60000` | `scripts/validate` 실행 상한 |
 | `COMMAND_OUTPUT_LIMIT_BYTES` | `262144` | 외부 명령 출력 캡처 상한 |
 | `MAX_RETAINED_ARTIFACTS` | `2000` | 세션과 별개로 보관하는 증적 메타데이터 개수 |
+| `MAX_DOWNLOAD_BYTES` | `67108864` | 캡처할 다운로드 파일 크기 상한 |
+| `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
+| `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
 | `MAX_SESSIONS` | `10` | 동시 브라우저 세션 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED` |
 | `MAX_CONTEXTS_PER_SESSION` | `5` | 세션당 컨텍스트 상한 |
@@ -349,6 +355,60 @@ GET /api/runs/{runId}/logs?limit=500     → 메모리 창을 벗어나면 디�
 GET /api/runs/{runId}/artifacts/{relativePath}
 ```
 
+## 업무 결과 검증
+
+화면 문구만 보는 검증은 "클릭이 성공했다"까지만 말해줍니다. 신청이 실제로 접수됐는지, 처리번호가 조회되는지, 받은 파일 내용이 맞는지는 다른 수단이 필요합니다.
+
+### 세션 쿠키로 후속 조회
+
+```
+POST /api/sessions/{sessionId}/contexts/{contextId}/request
+```
+
+컨텍스트의 `APIRequestContext` 를 사용하므로 **브라우저 세션의 쿠키·헤더를 그대로 사용**합니다. 로그인 상태에서 클릭한 결과를 같은 자격으로 조회할 수 있습니다. `url` 은 컨텍스트 `baseURL` 기준 상대 경로도 됩니다. `URL_ALLOWLIST` 가 동일하게 적용되고, 응답 본문은 증적 아티팩트로 보관됩니다.
+
+### 다운로드
+
+다운로드는 아티팩트로 저장됩니다. `GET /api/sessions/{sessionId}/downloads` 로 목록을, `downloadPath` 로 파일을 받습니다. `MAX_DOWNLOAD_BYTES`(기본 64MB)를 넘으면 건너뛰고 타임라인에 기록합니다.
+
+### 한 번의 호출로 업무 완료까지
+
+`execute` 단계에서 `saveAs` 로 값을 캡처하고 이후 단계에서 `{{name}}` 으로 참조합니다. 배치 안에서는 클라이언트가 중간 결과를 볼 수 없으므로, 화면에서 읽은 처리번호를 API 조회에 쓰려면 이 방식이 필요합니다.
+
+```jsonc
+{
+  "pageId": "page_...",
+  "steps": [
+    { "action": "click", "locator": { "testId": "submit" } },
+    { "action": "assertText", "locator": { "testId": "status" }, "expected": "접수 완료" },
+    // 화면에서 처리번호를 캡처 — 반드시 위 단언으로 상태를 확인한 뒤에
+    { "action": "locatorQuery", "locator": { "testId": "reference" },
+      "operation": "textContent", "saveAs": "ref" },
+    { "action": "assertValue", "value": "{{ref}}", "expected": "/^ORD-\\d+$/" },
+    // 업무 시스템에 실제로 들어갔는지 확인
+    { "action": "assertApiResponse", "url": "/api/orders/{{ref}}",
+      "status": 200, "jsonPath": "data.order.status", "expected": "ACCEPTED" },
+    { "action": "click", "locator": { "testId": "receipt" } },
+    // 받은 파일의 내용까지 확인
+    { "action": "assertDownload", "fileName": "{{ref}}", "minBytes": 10,
+      "jsonPath": "data.order.reference", "expected": "{{ref}}" }
+  ]
+}
+```
+
+### 새 단계 동작
+
+| 동작 | 확인 대상 |
+| --- | --- |
+| `apiRequest` | 요청을 보내고 응답을 반환합니다(단언 없음) |
+| `assertApiResponse` | `status`, `ok`, `jsonPath` + `expected`, `bodyContains` |
+| `assertValue` | 캡처한 값. 처리번호 형식 확인 등 |
+| `assertDownload` | 도착 여부, `fileName`, `minBytes`, `contains`, `jsonPath` + `expected` |
+
+`saveAs` 는 단계 결과에서 값을 꺼내 저장하고, `savePath` 로 JSON 내부 경로를 지정할 수 있습니다. 실패는 `422` 와 함께 `failedStepIndex` 로 어느 단계가 깨졌는지 알려줍니다.
+
+**캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
+
 ## 실행 타임라인
 
 ### 스크립트 실행
@@ -450,6 +510,7 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 - `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`, `403 SCRIPTS_DIR_NOT_WRITABLE`
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
+- `422 API_ASSERTION_FAILED`, `422 DOWNLOAD_ASSERTION_FAILED`, `422 VALUE_ASSERTION_FAILED`, `422 EMPTY_CAPTURED_VALUE`
 - `409 SESSION_DISCONNECTED`, `409 TRACE_NOT_STARTED`, `409 SCRIPT_ALREADY_EXISTS`
 - `429 SESSION_LIMIT_EXCEEDED`, `429 RUN_QUEUE_FULL`
 

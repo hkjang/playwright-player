@@ -9,6 +9,7 @@
 // failure is a real failure. Set SMOKE_REQUIRE_BROWSER=1 (release verification)
 // to turn even the missing-browser case into a failure.
 import { spawn } from "node:child_process";
+import http from "node:http";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -169,6 +170,67 @@ let stopping = false;
 // The point of persisting runs is surviving a restart, so this starts a server,
 // produces history, kills it without a graceful shutdown, starts a new process
 // against the same RUNS_DIR, and queries what came back.
+// Stands in for a business system: submitting creates a record with a reference
+// number that can be fetched back, and a receipt that can be downloaded. The
+// outcome assertions are meaningless unless they are checked against something
+// that can actually be right or wrong.
+function startBusinessStub() {
+  const records = new Map();
+  let seq = 1000;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://stub");
+    if (url.pathname === "/") {
+      res.writeHead(200, { "content-type": "text/html" }).end(`<!doctype html><body>
+        <button data-testid="submit">Submit</button>
+        <div data-testid="status">idle</div>
+        <div data-testid="reference"></div>
+        <a data-testid="receipt" style="display:none">receipt</a>
+        <script>
+          document.querySelector('[data-testid=submit]').onclick = async () => {
+            const r = await (await fetch('/api/orders', { method: 'POST' })).json();
+            document.querySelector('[data-testid=reference]').textContent = r.reference;
+            document.querySelector('[data-testid=status]').textContent = 'Submitted';
+            const a = document.querySelector('[data-testid=receipt]');
+            a.href = '/api/orders/' + r.reference + '/receipt';
+            a.download = r.reference + '.json';
+            a.style.display = '';
+          };
+        </script></body>`);
+      return;
+    }
+    if (url.pathname === "/api/orders" && req.method === "POST") {
+      const reference = `ORD-${++seq}`;
+      records.set(reference, { reference, status: "ACCEPTED", amount: 42 });
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ reference }));
+      return;
+    }
+    const match = url.pathname.match(/^\/api\/orders\/([^/]+)(\/receipt)?$/);
+    if (match) {
+      const record = records.get(match[1]);
+      if (!record) {
+        res.writeHead(404, { "content-type": "application/json" }).end('{"error":"not found"}');
+        return;
+      }
+      const headers = { "content-type": "application/json" };
+      if (match[2]) {
+        headers["content-disposition"] = `attachment; filename="${record.reference}.json"`;
+      }
+      res.writeHead(200, headers).end(JSON.stringify({ data: { order: record } }));
+      return;
+    }
+    res.writeHead(404).end("not found");
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        stop: () => new Promise((done) => server.close(done)),
+      });
+    });
+  });
+}
+
 async function runRestartChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-restart-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -364,6 +426,169 @@ async function runRestartChecks() {
 // Retention used to drop any run that was not "running", which after the queue
 // landed also matched "queued" - a waiting run could be deleted out from under
 // the queue.
+// "The button turned green" is not "the task completed". These exercise the
+// assertions that look past the screen: the API, a captured reference number,
+// and the downloaded file.
+async function runOutcomeChecks() {
+  let stub;
+  let sessionId;
+  try {
+    stub = await startBusinessStub();
+  } catch (error) {
+    record("outcome verification checks", "fail", error.message);
+    return;
+  }
+
+  try {
+    const session = await call("POST", "/api/sessions", {});
+    if (session.status !== 201) {
+      const message = session.payload?.error?.message || `HTTP ${session.status}`;
+      if (/Executable doesn't exist|playwright install/i.test(message) && !requireBrowser) {
+        record("outcome verification checks", "skip", "no Playwright browser installed");
+        return;
+      }
+      record("outcome verification checks", "fail", message.split("\n")[0]);
+      return;
+    }
+
+    sessionId = session.payload.data.sessionId;
+    const contextId = (await call("POST", `/api/sessions/${sessionId}/contexts`, { baseURL: stub.baseUrl }))
+      .payload.data.contextId;
+    const pageId = (await call("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {}))
+      .payload.data.pageId;
+
+    const submitSteps = [
+      { action: "goto", url: `${stub.baseUrl}/` },
+      { action: "click", locator: { testId: "submit" } },
+      { action: "assertText", locator: { testId: "status" }, expected: "Submitted", timeoutMs: 5000 },
+      { action: "locatorQuery", locator: { testId: "reference" }, operation: "textContent", saveAs: "ref" },
+    ];
+
+    await check("one batch can submit, capture the reference, and verify it against the API", async () => {
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          ...submitSteps,
+          { action: "assertValue", value: "{{ref}}", expected: "/^ORD-\\d+$/", match: "equals" },
+          { action: "assertApiResponse", url: "/api/orders/{{ref}}", status: 200, jsonPath: "data.order.status", expected: "ACCEPTED" },
+        ],
+      });
+      assert(status === 200, `execute returned ${status}: ${JSON.stringify(payload.error)}`);
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+      assert(/^ORD-\d+$/.test(payload.data.captured.ref), `captured ${JSON.stringify(payload.data.captured)}`);
+
+      const apiStep = payload.data.results.find((entry) => entry.action === "assertApiResponse");
+      assert(apiStep.result.status === 200, `api step status ${apiStep.result.status}`);
+      // The request goes through the context, so it carries its cookies.
+      assert(apiStep.result.artifact?.artifactId, "the response body was not kept as evidence");
+    });
+
+    await check("a download is captured and its contents checked", async () => {
+      const { payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          ...submitSteps,
+          { action: "click", locator: { testId: "receipt" } },
+          {
+            action: "assertDownload",
+            fileName: "{{ref}}",
+            minBytes: 10,
+            jsonPath: "data.order.reference",
+            expected: "{{ref}}",
+            timeoutMs: 15000,
+          },
+        ],
+      });
+      assert(payload.data.failedCount === 0, JSON.stringify(payload.data.results));
+      const downloadStep = payload.data.results.find((entry) => entry.action === "assertDownload");
+      assert(downloadStep.result.sizeBytes > 10, `download was ${downloadStep.result.sizeBytes} bytes`);
+
+      // Downloads used to be accepted and then discarded with no way to reach them.
+      const listed = await call("GET", `/api/sessions/${sessionId}/downloads`);
+      assert(listed.payload.data.downloads.length > 0, "the download was not recorded");
+      const entry = listed.payload.data.downloads.at(-1);
+      assert(entry.downloadPath, "no download path");
+      const fetched = await fetch(`${baseUrl}${entry.downloadPath}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert(fetched.ok, `fetching the download returned ${fetched.status}`);
+      const body = await fetched.json();
+      assert(body.data.order.reference === payload.data.captured.ref, "the downloaded file is not the expected one");
+    });
+
+    // Every one of these must fail. An assertion that cannot fail is worse than
+    // no assertion, and the first version of this feature threw a ReferenceError
+    // on the error path, which only a negative case exposes.
+    const mustFail = [
+      ["a wrong jsonPath value", { action: "assertApiResponse", url: "/api/orders/{{ref}}", jsonPath: "data.order.status", expected: "REJECTED" }, "API_ASSERTION_FAILED"],
+      ["a record that does not exist", { action: "assertApiResponse", url: "/api/orders/NOPE", status: 200 }, "API_ASSERTION_FAILED"],
+      ["an absent jsonPath", { action: "assertApiResponse", url: "/api/orders/{{ref}}", jsonPath: "data.order.missingField" }, "API_ASSERTION_FAILED"],
+      ["a captured value mismatch", { action: "assertValue", value: "{{ref}}", expected: "ORD-does-not-exist" }, "VALUE_ASSERTION_FAILED"],
+      ["a download smaller than required", { action: "assertDownload", minBytes: 1000000, timeoutMs: 3000 }, "DOWNLOAD_ASSERTION_FAILED"],
+      ["a download missing expected text", { action: "assertDownload", contains: "TOTALLY-ABSENT", timeoutMs: 3000 }, "DOWNLOAD_ASSERTION_FAILED"],
+      ["an unsupported method", { action: "apiRequest", method: "TRACE", url: "/api/orders/{{ref}}" }, "INVALID_REQUEST"],
+    ];
+
+    for (const [label, step, expectedCode] of mustFail) {
+      await check(`outcome assertions reject ${label}`, async () => {
+        const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+          pageId,
+          steps: [...submitSteps, { action: "click", locator: { testId: "receipt" } }, step],
+        });
+        assert(status >= 400, `the assertion passed when it should have failed (HTTP ${status})`);
+        assert(payload.error.code === expectedCode,
+          `expected ${expectedCode}, got ${payload.error.code}: ${payload.error.message}`);
+        // The failure has to name which step broke, not just that something did.
+        assert(payload.error.details?.failedStepIndex !== undefined, "no failedStepIndex in the error details");
+      });
+    }
+
+    await check("capturing a value before the page produces it is reported, not substituted as empty", async () => {
+      // Without the guard this substituted "" and produced a confusing 404 from
+      // "/api/orders/" instead of naming the real problem.
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [
+          { action: "goto", url: `${stub.baseUrl}/` },
+          { action: "click", locator: { testId: "submit" } },
+          { action: "locatorQuery", locator: { testId: "reference" }, operation: "textContent", saveAs: "ref" },
+          { action: "assertApiResponse", url: "/api/orders/{{ref}}", status: 200 },
+        ],
+      });
+      assert(status === 422, `expected 422, got ${status}`);
+      assert(payload.error.code === "EMPTY_CAPTURED_VALUE", payload.error.code);
+    });
+
+    await check("an unknown {{reference}} is rejected before anything runs", async () => {
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId,
+        steps: [{ action: "assertValue", value: "{{neverCaptured}}", expected: "x" }],
+      });
+      assert(status === 400, `expected 400, got ${status}`);
+      assert(payload.error.code === "UNKNOWN_CAPTURED_VALUE", payload.error.code);
+    });
+
+    await check("a context request is reachable on its own and kept as evidence", async () => {
+      const { status, payload } = await call("POST", `/api/sessions/${sessionId}/contexts/${contextId}/request`, {
+        method: "POST",
+        url: "/api/orders",
+      });
+      assert(status === 200, `request returned ${status}`);
+      assert(payload.data.ok === true, `response not ok: ${payload.data.status}`);
+      assert(payload.data.json?.reference, `no reference in ${payload.data.text}`);
+      assert(payload.data.durationMs >= 0, `durationMs was ${payload.data.durationMs}`);
+      assert(payload.data.artifact?.downloadPath, "the response body was not stored");
+    });
+  } catch (error) {
+    record("outcome verification checks", "fail", error.message);
+  } finally {
+    if (sessionId) {
+      await call("DELETE", `/api/sessions/${sessionId}`);
+    }
+    await stub.stop();
+  }
+}
+
 async function runRetentionChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-retain-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -1269,6 +1494,9 @@ async function run() {
     }
     assert(missing.length === 0, `undocumented: ${missing.join(", ")}`);
   });
+
+  // ---- outcome verification ------------------------------------------------
+  await runOutcomeChecks();
 
   // ---- restart recovery and retention (need their own server instances) ----
   await runRestartChecks();
