@@ -33,6 +33,14 @@ if [ "$(id -u)" = "0" ]; then
     echo "note: $scripts_dir is not writable by $APP_USER (uid $APP_UID); reading scripts works, uploading them will not." >&2
   fi
 
+  # Secrets are only ever read, and the directory is meant to be mounted
+  # read-only, so chowning it would fight the mount. Just say so if the app
+  # cannot read it, because {{secret.NAME}} would then fail at run time.
+  secrets_dir="${SECRETS_DIR:-/app/secrets}"
+  if [ -d "$secrets_dir" ] && ! su "$APP_USER" -s /bin/sh -c "test -r '$secrets_dir'"; then
+    echo "warning: $secrets_dir is not readable by $APP_USER (uid $APP_UID); {{secret.NAME}} references will fail." >&2
+  fi
+
   # runuser, not setpriv: dropping privileges with setpriv made Chromium die at
   # launch with a crashpad error and SIGTRAP, which broke every browser session
   # in the container while script runs kept working. runuser keeps one root

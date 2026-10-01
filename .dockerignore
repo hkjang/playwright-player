@@ -5,3 +5,7 @@ data/runs
 .git
 .gitignore
 README.local.md
+# never bake secret values into the image
+secrets
+data/environments
+data/datasets

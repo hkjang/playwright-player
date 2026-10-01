@@ -42,6 +42,8 @@ docker run -d --name ppcheck --init --ipc=host -p 3000:3000 \
 | `docker stop` 이 10초 안에 끝나고 graceful shutdown 로그가 남는지 | 신호 전달. 권한 축소 방식을 바꾸면 깨질 수 있습니다 |
 | 내장 페이지 5개(`/`, `/playground`, `/runs`, `/demo/test-page`, `/docs`)와 `/ui/*` 자산이 200 인지 | 페이지는 `public/` 에서 읽습니다. 이미지에 디렉터리를 넣지 않으면 `500 UI_TEMPLATE_MISSING` 이 납니다 |
 | 렌더된 페이지에 `{{` 가 남아 있지 않은지 | 치환되지 않은 플레이스홀더는 빈 화면이나 깨진 스크립트로 나타납니다 |
+| 이미지에 `secrets/` 내용이 들어가지 않았는지 (`ls -A /app/secrets` → 0) | 비밀값이 이미지에 구워지면 이미지를 받은 모든 곳에 유출됩니다 |
+| `{{secret.NAME}}` 를 쓰는 실행의 로그에 값이 아니라 `***` 가 남는지 | 스크러빙이 꺼지면 조용히 평문이 저장됩니다 |
 
 ## 4. 패키징
 

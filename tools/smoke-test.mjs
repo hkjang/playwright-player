@@ -429,6 +429,253 @@ async function runRestartChecks() {
 // "The button turned green" is not "the task completed". These exercise the
 // assertions that look past the screen: the API, a captured reference number,
 // and the downloaded file.
+// A credential passed in `variables` used to be written into run.json and
+// returned by the API, permanently. These need their own instance so SECRETS_DIR
+// and the stores point somewhere disposable.
+async function runEnvironmentChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-env-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  const secretsDir = path.join(dataDir, "secrets");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+  await fsPromises.mkdir(secretsDir, { recursive: true });
+  const SECRET = "hunter2-from-the-secret-store";
+  await fsPromises.writeFile(path.join(secretsDir, "customer-password"), SECRET, "utf8");
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "echo.spec.js"),
+    [
+      'import { test, expect } from "@playwright/test";',
+      "",
+      'const variables = JSON.parse(process.env.PW_PLAYER_VARIABLES_JSON || "{}");',
+      "",
+      'test("sees what it was given", async () => {',
+      '  console.log("VARS=" + JSON.stringify(variables));',
+      "  expect(variables.username).toBeTruthy();",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const envPort = port + 5;
+  const envUrl = `http://127.0.0.1:${envPort}`;
+  const runsDir = path.join(dataDir, "runs");
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(envPort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: scriptsDir,
+      RUNS_DIR: runsDir,
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      ENVIRONMENTS_DIR: path.join(dataDir, "environments"),
+      DATASETS_DIR: path.join(dataDir, "datasets"),
+      SECRETS_DIR: secretsDir,
+    },
+  });
+
+  const api = async (method, urlPath, body) => {
+    const response = await fetch(`${envUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+
+  const waitFor = async (runId, timeoutMs = 180_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const { payload } = await api("GET", `/api/runs/${runId}`);
+      if (["completed", "failed", "cancelled", "interrupted"].includes(payload.data.status)) {
+        return payload.data;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`run ${runId} never finished`);
+  };
+
+  const grepTree = async (dir, needle) => {
+    const hits = [];
+    const walk = async (current) => {
+      const entries = await fsPromises.readdir(current, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (entry.isFile()) {
+          const body = await fsPromises.readFile(full, "utf8").catch(() => "");
+          if (body.includes(needle)) {
+            hits.push(path.relative(dir, full));
+          }
+        }
+      }
+    };
+    await walk(dir);
+    return hits;
+  };
+
+  try {
+    await waitForHealth(envUrl);
+
+    await check("an environment supplies baseURL, project and variables", async () => {
+      const saved = await api("PUT", "/api/environments/staging", {
+        baseURL: "https://stg.example.com",
+        project: "chromium",
+        variables: { locale: "ko-KR", username: "operator", password: "{{secret.customer-password}}" },
+      });
+      assert(saved.status === 200, `save returned ${saved.status}`);
+
+      const listed = await api("GET", "/api/environments");
+      assert(listed.payload.data.environments.some((entry) => entry.name === "staging"), "not listed");
+
+      const created = await api("POST", "/api/runs", { scriptKey: "echo", environment: "staging" });
+      assert(created.status === 201, `run create returned ${created.status}`);
+      assert(created.payload.data.request.baseURL === "https://stg.example.com", "baseURL was not applied");
+      assert(created.payload.data.environment?.name === "staging", "the run does not record its environment");
+
+      const finished = await waitFor(created.payload.data.runId);
+      const logs = await api("GET", `/api/runs/${created.payload.data.runId}/logs`);
+      const text = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+      assert(finished.status === "completed", `run ${finished.status}: ${text.slice(0, 300)}`);
+      // The environment's variables have to reach the script.
+      assert(/"locale":"ko-KR"/.test(text), `variables not delivered: ${text.slice(0, 300)}`);
+      await api("DELETE", `/api/runs/${created.payload.data.runId}`);
+    });
+
+    await check("an explicit field wins over the environment", async () => {
+      const created = await api("POST", "/api/runs", {
+        scriptKey: "echo",
+        environment: "staging",
+        baseURL: "https://override.example.com",
+        variables: { locale: "en-US" },
+      });
+      assert(created.payload.data.request.baseURL === "https://override.example.com", "baseURL was not overridden");
+      await api("POST", `/api/runs/${created.payload.data.runId}/cancel`);
+      await waitFor(created.payload.data.runId);
+      const finished = await api("GET", `/api/runs/${created.payload.data.runId}`);
+      assert(finished.payload.data.request.variables.locale === "en-US", "the request variable was not preferred");
+      await api("DELETE", `/api/runs/${created.payload.data.runId}`);
+    });
+
+    await check("a secret reference never reaches the record, the API, or the log", async () => {
+      const created = await api("POST", "/api/runs", { scriptKey: "echo", environment: "staging" });
+      const runId = created.payload.data.runId;
+      const finished = await waitFor(runId);
+      assert(finished.status === "completed", `run ${finished.status}`);
+
+      // The reference is kept; the value is not.
+      assert(finished.request.variables.password === "{{secret.customer-password}}",
+        `stored ${finished.request.variables.password}`);
+
+      const asJson = JSON.stringify(finished);
+      assert(!asJson.includes(SECRET), "the API response contains the secret value");
+
+      const listed = await api("GET", "/api/runs?limit=50");
+      assert(!JSON.stringify(listed.payload).includes(SECRET), "the run list contains the secret value");
+
+      // The script prints the value, so the captured log has to be scrubbed.
+      const logs = await api("GET", `/api/runs/${runId}/logs`);
+      const text = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+      assert(/"password":"\*\*\*"/.test(text), `the log was not scrubbed: ${text.slice(0, 300)}`);
+      assert(!text.includes(SECRET), "the log contains the secret value");
+
+      const onDisk = await grepTree(path.join(runsDir, runId), SECRET);
+      // Playwright writes its own report; that limitation is documented.
+      const unexpected = onDisk.filter((file) => !file.startsWith("report.json") && !file.startsWith("html-report"));
+      assert(unexpected.length === 0, `the secret reached ${unexpected.join(", ")}`);
+
+      await api("DELETE", `/api/runs/${runId}`);
+    });
+
+    await check("a literal credential is masked by variable name", async () => {
+      const created = await api("POST", "/api/runs", {
+        scriptKey: "echo",
+        variables: { username: "operator", password: "literal-password-value" },
+      });
+      await api("POST", `/api/runs/${created.payload.data.runId}/cancel`);
+      await waitFor(created.payload.data.runId);
+      const stored = await api("GET", `/api/runs/${created.payload.data.runId}`);
+      assert(stored.payload.data.request.variables.password === "***",
+        `stored ${stored.payload.data.request.variables.password}`);
+      assert(stored.payload.data.request.variables.username === "operator", "a harmless name was masked");
+      await api("DELETE", `/api/runs/${created.payload.data.runId}`);
+    });
+
+    await check("a missing secret is reported instead of running with a blank", async () => {
+      const { status, payload } = await api("POST", "/api/runs", {
+        scriptKey: "echo",
+        variables: { username: "x", password: "{{secret.not-provisioned}}" },
+      });
+      assert(status === 400, `expected 400, got ${status}`);
+      assert(payload.error.code === "SECRET_NOT_FOUND", payload.error.code);
+      assert(payload.error.message.includes("not-provisioned"), payload.error.message);
+    });
+
+    await check("a dataset queues one run per row, each with its own values", async () => {
+      await api("PUT", "/api/datasets/orders", {
+        rows: [{ sku: "ABC-1", qty: "1" }, { sku: "ABC-2", qty: "5" }, { sku: "ABC-3", qty: "9" }],
+      });
+      const listed = await api("GET", "/api/datasets");
+      const entry = listed.payload.data.datasets.find((item) => item.name === "orders");
+      assert(entry.rowCount === 3, `rowCount ${entry.rowCount}`);
+      assert(entry.columns.includes("sku"), JSON.stringify(entry.columns));
+      // The listing must not carry the rows themselves.
+      assert(entry.rows === undefined, "the dataset listing returned its rows");
+
+      const created = await api("POST", "/api/runs", { scriptKey: "echo", environment: "staging", dataset: "orders" });
+      assert(created.status === 201, `returned ${created.status}`);
+      assert(created.payload.data.rowCount === 3, `queued ${created.payload.data.rowCount} runs`);
+
+      const runIds = created.payload.data.runs.map((run) => run.runId);
+      assert(new Set(runIds).size === 3, "duplicate run ids");
+      const rows = created.payload.data.runs.map((run) => run.request.variables.sku);
+      assert(new Set(rows).size === 3, `rows not distinct: ${rows.join(", ")}`);
+
+      for (const runId of runIds) {
+        const finished = await waitFor(runId);
+        assert(finished.status === "completed", `row run ${finished.status}`);
+        assert(finished.datasetRow !== null, "the run does not record which row it came from");
+      }
+      for (const runId of runIds) {
+        await api("DELETE", `/api/runs/${runId}`);
+      }
+    });
+
+    await check("one dataset row can be selected, and a bad index is rejected", async () => {
+      const single = await api("POST", "/api/runs", { scriptKey: "echo", dataset: "orders", datasetRow: 1, variables: { username: "x" } });
+      assert(single.payload.data.rowCount === 1, `queued ${single.payload.data.rowCount}`);
+      assert(single.payload.data.runs[0].request.variables.sku === "ABC-2", "the wrong row was used");
+      await api("POST", `/api/runs/${single.payload.data.runs[0].runId}/cancel`);
+      await waitFor(single.payload.data.runs[0].runId);
+      await api("DELETE", `/api/runs/${single.payload.data.runs[0].runId}`);
+
+      const bad = await api("POST", "/api/runs", { scriptKey: "echo", dataset: "orders", datasetRow: 99 });
+      assert(bad.status === 400, `expected 400, got ${bad.status}`);
+      assert(bad.payload.error.code === "DATASET_ROW_NOT_FOUND", bad.payload.error.code);
+    });
+
+    await check("environment and dataset names cannot escape their directory", async () => {
+      for (const [label, response] of [
+        ["environment", await api("PUT", "/api/environments/..%2F..%2Fpwned", { baseURL: "http://x" })],
+        ["dataset", await api("PUT", "/api/datasets/..%2F..%2Fpwned", { rows: [{ a: "1" }] })],
+      ]) {
+        assert(response.status === 400, `${label} traversal returned ${response.status}`);
+        assert(["INVALID_NAME", "PATH_OUTSIDE_ROOT"].includes(response.payload.error.code),
+          `${label}: ${response.payload.error.code}`);
+      }
+    });
+  } catch (error) {
+    record("environment and dataset checks", "fail", error.message);
+  } finally {
+    proc.kill("SIGKILL");
+    await new Promise((resolve) => proc.on("exit", resolve));
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
 async function runOutcomeChecks() {
   let stub;
   let sessionId;
@@ -1494,6 +1741,9 @@ async function run() {
     }
     assert(missing.length === 0, `undocumented: ${missing.join(", ")}`);
   });
+
+  // ---- environments, datasets and secrets -----------------------------------
+  await runEnvironmentChecks();
 
   // ---- outcome verification ------------------------------------------------
   await runOutcomeChecks();

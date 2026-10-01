@@ -20,6 +20,7 @@
 - 단계별 소요시간·콘솔/네트워크 오류·증적을 연결한 실행 타임라인
 - API 응답·다운로드 파일 내용·처리번호까지 확인하는 업무 결과 검증
 - 실행 목록과 단계별 타임라인을 보여주는 `/runs` 화면
+- 환경·계정·데이터셋 분리와 비밀정보 참조
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -125,6 +126,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 - `DELETE /api/runs/{runId}`
 - `POST /api/runs/{runId}/cancel`
 - `GET /api/queue`
+- `GET /api/environments`, `GET|PUT|DELETE /api/environments/{name}`
+- `GET /api/datasets`, `GET|PUT|DELETE /api/datasets/{name}`
 - `POST /api/runs/{runId}/retry`
 - `GET /api/runs/{runId}/artifacts`
 - `GET /api/runs/{runId}/artifacts/{relativePath}`
@@ -195,6 +198,8 @@ MCP endpoint 는 `/mcp` 입니다.
 
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
+- `environment_list`, `environment_get`, `environment_save`, `environment_delete`
+- `dataset_list`, `dataset_get`, `dataset_save`, `dataset_delete`
 - `run_create`, `run_list`, `run_queue`, `run_get`, `run_cancel`, `run_retry`, `run_delete`, `run_artifacts`, `run_report`, `run_logs`
 - `session_list`, `session_create`, `session_get`, `session_delete`, `session_keepalive`, `session_timeline`, `session_downloads`
 - `context_create`, `context_get`, `context_delete`
@@ -226,6 +231,11 @@ MCP endpoint 는 `/mcp` 입니다.
 | `VALIDATION_TIMEOUT_MS` | `60000` | `scripts/validate` 실행 상한 |
 | `COMMAND_OUTPUT_LIMIT_BYTES` | `262144` | 외부 명령 출력 캡처 상한 |
 | `MAX_RETAINED_ARTIFACTS` | `2000` | 세션과 별개로 보관하는 증적 메타데이터 개수 |
+| `ENVIRONMENTS_DIR` | `./data/environments` | 환경 정의 저장 위치 |
+| `DATASETS_DIR` | `./data/datasets` | 데이터셋 저장 위치 |
+| `SECRETS_DIR` | `./secrets` | `{{secret.NAME}}` 참조가 읽는 디렉터리. API 로 노출되지 않습니다 |
+| `REDACT_VARIABLE_PATTERN` | `(pass\|secret\|token\|credential\|pwd\|api[-_]?key)` | 이 패턴에 걸리는 변수 **이름**의 값은 저장 시 `***` 로 마스킹됩니다 |
+| `MAX_DATASET_ROWS` | `200` | 한 데이터셋이 큐에 넣을 수 있는 행 수 상한 |
 | `MAX_DOWNLOAD_BYTES` | `67108864` | 캡처할 다운로드 파일 크기 상한 |
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
@@ -295,6 +305,60 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 ### 실행 시간 상한
 
 `RUN_TIMEOUT_MS`(기본 30분)를 넘긴 실행은 `SIGKILL` 로 종료되고 `failed` 로 기록됩니다. 대기열이 있는 구조에서 멈춘 실행이 슬롯을 영구히 점유하지 못하게 하기 위한 것입니다. `interruptedReason` 에 사유가 남습니다.
+
+## 환경·계정·데이터셋
+
+같은 시나리오를 여러 환경과 여러 입력으로 재사용하기 위한 것입니다. 이전에는 `baseURL`·`storageStateRef`·`variables` 를 호출자가 매번 조립해야 했습니다.
+
+### 환경
+
+```
+PUT /api/environments/staging
+{
+  "baseURL": "https://stg.example.com",
+  "project": "chromium",
+  "storageStateRef": "auth/customer.json",
+  "urlAllowlist": ["*.stg.example.com"],
+  "variables": { "locale": "ko-KR", "username": "operator", "password": "{{secret.customer-password}}" }
+}
+```
+
+```
+POST /api/runs { "scriptKey": "checkout/guest-order", "environment": "staging" }
+```
+
+요청에 명시한 값이 환경 값을 덮고, `variables` 는 키 단위로 병합됩니다. 실행 레코드에 어떤 환경으로 돌았는지 남습니다.
+
+### 비밀정보
+
+**`variables` 에 리터럴로 넣은 값은 실행 레코드에 저장됩니다.** 자격증명은 `{{secret.NAME}}` 참조를 쓰세요.
+
+| 저장 위치 | 우선순위 |
+| --- | --- |
+| `SECRETS_DIR/<name>` 파일 내용 | 먼저 (재시작 없이 교체 가능) |
+| `PW_PLAYER_SECRET_<NAME>` 환경변수 | 파일이 없을 때 |
+
+참조는 실행 시점에 해석되어 **자식 프로세스 환경에만** 전달되고, 레코드와 API 응답에는 참조 문자열만 남습니다. 값이 없으면 빈 값으로 실행하지 않고 `400 SECRET_NOT_FOUND` 로 거부합니다.
+
+참조가 아닌 리터럴은 비밀인지 알 수 없으므로, 변수 **이름**이 `REDACT_VARIABLE_PATTERN`(기본 `pass|secret|token|credential|pwd|api_key`)에 걸리면 저장 시 `***` 로 마스킹합니다. 실행은 진짜 값을 받습니다.
+
+서버가 캡처한 실행 로그에서도 해당 값을 `***` 로 치환합니다.
+
+> **한계**: `report.json`, trace, video, 스크린샷은 Playwright 가 직접 생성하므로 서버가 손댈 수 없습니다. 스크립트가 비밀을 출력하거나 화면에 노출하면 그 산출물에는 남습니다. 스크립트가 비밀을 출력하지 않는 것이 근본 해결입니다.
+
+### 데이터셋
+
+```
+PUT /api/datasets/orders
+{ "rows": [ { "sku": "ABC-1", "qty": "1" }, { "sku": "ABC-2", "qty": "5" } ] }
+```
+
+```
+POST /api/runs { "scriptKey": "checkout/guest-order", "environment": "staging", "dataset": "orders" }
+→ 201 { "dataset": "orders", "rowCount": 2, "runs": [ ... ] }
+```
+
+행마다 실행 하나가 대기열에 들어갑니다. 행 값이 가장 구체적인 입력이므로 환경·요청 변수를 덮습니다. `datasetRow` 로 한 행만 고를 수 있고, 목록 조회(`GET /api/datasets`)는 행 내용 대신 행 수와 컬럼만 돌려줍니다.
 
 ## 실행 이력과 대기열
 
@@ -522,6 +586,7 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 - `401 UNAUTHORIZED`
 - `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`, `403 SCRIPTS_DIR_NOT_WRITABLE`
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
+- `400 SECRET_NOT_FOUND`, `400 DATASET_ROW_NOT_FOUND`, `400 DATASET_EMPTY`, `400 INVALID_NAME`
 - `400 AMBIGUOUS_LOCATOR` — locator 가 여러 요소에 매칭됩니다. `first`/`last`/`nth` 를 붙이거나 더 구체적인 locator 를 쓰세요
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
 - `422 API_ASSERTION_FAILED`, `422 DOWNLOAD_ASSERTION_FAILED`, `422 VALUE_ASSERTION_FAILED`, `422 EMPTY_CAPTURED_VALUE`

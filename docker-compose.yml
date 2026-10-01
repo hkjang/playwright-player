@@ -21,3 +21,6 @@ services:
       - ./scripts:/app/scripts
       - ./storage-states:/app/storage-states
       - ./data:/app/data
+      # Secret values for {{secret.NAME}} references. Read-only: the server only
+      # ever reads them, and they must not be committed or baked into the image.
+      - ./secrets:/app/secrets:ro

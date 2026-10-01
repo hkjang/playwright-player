@@ -15,3 +15,7 @@ data/*.headers
 src/shared/ids.js
 *.log
 .env
+# secret values for {{secret.NAME}} references — never commit these
+secrets/
+data/environments/
+data/datasets/

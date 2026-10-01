@@ -30,7 +30,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.10.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.11.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -40,6 +40,9 @@ const config = {
   artifactsDir: path.resolve(process.env.ARTIFACTS_DIR || path.join(rootDir, "data", "artifacts")),
   storageStateDir: path.resolve(process.env.STORAGE_STATE_DIR || path.join(rootDir, "storage-states")),
   routeFixturesDir: path.resolve(process.env.ROUTE_FIXTURES_DIR || process.env.SCRIPTS_DIR || path.join(rootDir, "scripts")),
+  environmentsDir: path.resolve(process.env.ENVIRONMENTS_DIR || path.join(rootDir, "data", "environments")),
+  datasetsDir: path.resolve(process.env.DATASETS_DIR || path.join(rootDir, "data", "datasets")),
+  secretsDir: path.resolve(process.env.SECRETS_DIR || path.join(rootDir, "secrets")),
   bodyLimit: process.env.BODY_LIMIT || "5mb",
   defaultBrowserType: process.env.DEFAULT_BROWSER_TYPE || "chromium",
   defaultHeadless: parseBoolean(process.env.DEFAULT_HEADLESS, true),
@@ -69,6 +72,10 @@ const config = {
   commandOutputLimitBytes: parseInteger(process.env.COMMAND_OUTPUT_LIMIT_BYTES, 256 * 1024),
   runEnvPassthrough: parseCsv(process.env.RUN_ENV_PASSTHROUGH),
   maxRetainedArtifacts: parseInteger(process.env.MAX_RETAINED_ARTIFACTS, 2000),
+  // Variable names matching this are stored as "***". A run still receives the
+  // real value; only what is written to disk and returned by the API is masked.
+  redactVariablePattern: process.env.REDACT_VARIABLE_PATTERN || "(pass|secret|token|credential|pwd|api[-_]?key)",
+  maxDatasetRows: parseInteger(process.env.MAX_DATASET_ROWS, 200),
   maxDownloadBytes: parseInteger(process.env.MAX_DOWNLOAD_BYTES, 64 * 1024 * 1024),
   maxApiResponseBodyBytes: parseInteger(process.env.MAX_API_RESPONSE_BODY_BYTES, 256 * 1024),
   apiRequestTimeoutMs: parseInteger(process.env.API_REQUEST_TIMEOUT_MS, 30 * 1000),
@@ -246,6 +253,75 @@ function sha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// Environments and datasets are both "named JSON documents in a directory", so
+// they share one tiny store rather than growing two near-identical CRUD paths.
+class NamedJsonStore {
+  constructor(dirPath, label) {
+    this.dirPath = dirPath;
+    this.label = label;
+  }
+
+  resolve(name) {
+    const cleaned = String(name ?? "").trim();
+    if (!cleaned || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(cleaned)) {
+      throw new ApiError(
+        400,
+        "INVALID_NAME",
+        `${this.label} name must start alphanumeric and contain only letters, digits, dot, dash or underscore`,
+      );
+    }
+
+    return { name: cleaned, filePath: resolveWithin(this.dirPath, `${cleaned}.json`, `${this.label} name`) };
+  }
+
+  async list() {
+    await ensureDir(this.dirPath);
+    const entries = await fsPromises.readdir(this.dirPath, { withFileTypes: true }).catch(() => []);
+    const names = entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => entry.name.replace(/\.json$/, ""))
+      .sort();
+
+    const out = [];
+    for (const name of names) {
+      const document = await readJsonFile(path.join(this.dirPath, `${name}.json`));
+      if (document) {
+        out.push({ name, ...document });
+      }
+    }
+
+    return out;
+  }
+
+  async get(name) {
+    const { name: cleaned, filePath } = this.resolve(name);
+    const document = await readJsonFile(filePath);
+    if (!document) {
+      throw new ApiError(404, `${this.label.toUpperCase()}_NOT_FOUND`, `${this.label} not found: ${cleaned}`);
+    }
+
+    return { name: cleaned, ...document };
+  }
+
+  async save(name, document) {
+    const { name: cleaned, filePath } = this.resolve(name);
+    await ensureDir(this.dirPath);
+    const stored = { ...document };
+    delete stored.name;
+    await writeJsonAtomic(filePath, { ...stored, updatedAt: toIso() });
+    return this.get(cleaned);
+  }
+
+  async remove(name) {
+    const { name: cleaned, filePath } = this.resolve(name);
+    if (!(await fileExists(filePath))) {
+      throw new ApiError(404, `${this.label.toUpperCase()}_NOT_FOUND`, `${this.label} not found: ${cleaned}`);
+    }
+    await fsPromises.unlink(filePath);
+    return { deleted: cleaned };
+  }
+}
+
 async function removeDir(dirPath) {
   await fsPromises.rm(dirPath, { recursive: true, force: true }).catch(() => undefined);
 }
@@ -323,6 +399,115 @@ function narrowAllowlist(globalAllowlist, requested) {
   }
 
   return { allowlist: allowlist.length ? allowlist : globalAllowlist, rejected };
+}
+
+const REDACTED = "***";
+const SECRET_REFERENCE_PATTERN = /\{\{\s*secret\.([A-Za-z0-9_.-]+)\s*\}\}/g;
+
+// A password passed in `variables` used to be written into run.json and returned
+// by GET /api/runs — permanently, and readable by anyone with API access or the
+// mounted volume. Two defences: a `{{secret.NAME}}` reference whose value never
+// enters the record at all, and name-based masking for literal values.
+class SecretResolver {
+  constructor(options) {
+    this.secretsDir = options.secretsDir;
+    this.namePattern = new RegExp(options.redactVariablePattern, "i");
+    this.cache = new Map();
+  }
+
+  isSensitiveName(name) {
+    return this.namePattern.test(String(name));
+  }
+
+  async readSecret(name) {
+    if (this.cache.has(name)) {
+      return this.cache.get(name);
+    }
+
+    // A file wins over the environment so an operator can rotate without a
+    // restart; the env form exists for deployments that inject secrets that way.
+    let value = null;
+    try {
+      const filePath = resolveWithin(this.secretsDir, name, "secret name");
+      value = (await fsPromises.readFile(filePath, "utf8")).replace(/\r?\n$/, "");
+    } catch {
+      const envKey = `PW_PLAYER_SECRET_${String(name).toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+      value = process.env[envKey] ?? null;
+    }
+
+    this.cache.set(name, value);
+    return value;
+  }
+
+  // Returns the values a run actually receives, a copy safe to persist, and the
+  // literal strings to scrub from anything the run prints.
+  async resolveVariables(variables = {}) {
+    const resolved = {};
+    const safe = {};
+    const sensitiveValues = new Set();
+    const missing = [];
+
+    for (const [key, raw] of Object.entries(variables)) {
+      if (typeof raw !== "string") {
+        resolved[key] = raw;
+        safe[key] = this.isSensitiveName(key) ? REDACTED : raw;
+        continue;
+      }
+
+
+      let usedSecret = false;
+      let value = raw;
+      const references = [...raw.matchAll(SECRET_REFERENCE_PATTERN)];
+      for (const [match, secretName] of references) {
+        const secret = await this.readSecret(secretName);
+        if (secret === null) {
+          missing.push(secretName);
+          continue;
+        }
+        usedSecret = true;
+        value = value.split(match).join(secret);
+      }
+
+      resolved[key] = value;
+      // A referenced secret is never stored, even if the name looks harmless:
+      // the reference itself is the useful thing to keep.
+      safe[key] = usedSecret ? raw : (this.isSensitiveName(key) ? REDACTED : raw);
+      // Short values would mask far too much of the output to be worth it.
+      if ((usedSecret || this.isSensitiveName(key)) && value && value.length >= 6) {
+        sensitiveValues.add(value);
+      }
+    }
+
+    if (missing.length) {
+      throw new ApiError(
+        400,
+        "SECRET_NOT_FOUND",
+        `No value for secret(s): ${[...new Set(missing)].join(", ")}. `
+        + `Put the value in ${this.secretsDir}/<name> or set PW_PLAYER_SECRET_<NAME>.`,
+      );
+    }
+
+    return { resolved, safe, sensitiveValues: [...sensitiveValues] };
+  }
+}
+
+// A script that prints a credential would otherwise have it written into
+// logs.jsonl and served by the log API. This masks the values the server itself
+// handed to the run. It cannot reach Playwright's own report, trace or video —
+// those are written by Playwright, so a script must still not print secrets.
+function scrubSensitive(text, sensitiveValues) {
+  if (!sensitiveValues?.length) {
+    return text;
+  }
+
+  let out = text;
+  for (const value of sensitiveValues) {
+    if (value) {
+      out = out.split(value).join(REDACTED);
+    }
+  }
+
+  return out;
 }
 
 const SCRIPT_EXTENSION_PATTERN = /\.(spec|test|pw)\.(js|mjs|cjs|ts|mts|cts)$/i;
@@ -936,6 +1121,9 @@ class RunManager {
   constructor(options) {
     this.options = options;
     this.registry = options.registry;
+    this.environments = new NamedJsonStore(options.environmentsDir, "environment");
+    this.datasets = new NamedJsonStore(options.datasetsDir, "dataset");
+    this.secrets = new SecretResolver(options);
     this.runs = new Map();
     this.queue = [];
     this.pendingWrites = new Map();
@@ -984,6 +1172,8 @@ class RunManager {
       interruptedReason: run.interruptedReason,
       request: run.request,
       script: run.script,
+      environment: run.environment,
+      datasetRow: run.datasetRow,
       network: run.network,
       paths: run.paths,
       summary: run.summary,
@@ -997,6 +1187,9 @@ class RunManager {
   fromRecord(record) {
     return {
       ...record,
+      // Deliberately absent from the record. A requeued run re-resolves them.
+      resolvedVariables: null,
+      sensitiveValues: [],
       logs: [],
       logCount: record.logCount ?? 0,
       artifacts: [],
@@ -1075,6 +1268,19 @@ class RunManager {
 
       const wasQueued = run.status === "queued";
       if (wasQueued || this.options.requeueInterruptedRuns) {
+        // Secret values were never stored, so resolve them again from source.
+        try {
+          const restored = await this.secrets.resolveVariables(run.request?.variables || {});
+          run.resolvedVariables = restored.resolved;
+          run.sensitiveValues = restored.sensitiveValues;
+        } catch (error) {
+          run.status = "failed";
+          run.endedAt = toIso();
+          run.interruptedReason = `could not restore variables: ${error.message}`;
+          await this.persist(run);
+          continue;
+        }
+
         run.status = "queued";
         run.queuedAt = run.queuedAt || toIso();
         run.pid = null;
@@ -1148,6 +1354,8 @@ class RunManager {
       interruptedReason: run.interruptedReason ?? null,
       request: run.request,
       script: run.script ?? null,
+      environment: run.environment ?? null,
+      datasetRow: run.datasetRow ?? null,
       network: run.network ?? null,
       paths: run.paths,
       logCount: run.logCount ?? run.logs.length,
@@ -1160,7 +1368,11 @@ class RunManager {
   appendLog(run, stream, chunk) {
     const message = chunk.toString("utf8");
     const lines = message.split(/\r?\n/).filter(Boolean);
-    const entries = lines.map((line) => ({ ts: toIso(), stream, line: truncate(line, 4000) }));
+    const entries = lines.map((line) => ({
+      ts: toIso(),
+      stream,
+      line: truncate(scrubSensitive(line, run.sensitiveValues), 4000),
+    }));
     if (!entries.length) {
       return;
     }
@@ -1297,6 +1509,65 @@ class RunManager {
   // The slot has to be taken in the same synchronous turn as the check.
   // Checking first and registering the run after several awaits let concurrent
   // requests all pass the check and blow past the limit.
+  // An environment supplies the parts that vary by deployment, so the same
+  // scenario can be pointed at dev, staging or production without the caller
+  // reassembling baseURL, storage state and variables every time. Anything the
+  // request states explicitly wins; variables merge key by key.
+  async composeRequest(request) {
+    if (!request.environment) {
+      return { request, environment: null };
+    }
+
+    const environment = await this.environments.get(request.environment);
+    const composed = {
+      ...request,
+      baseURL: request.baseURL ?? environment.baseURL,
+      project: request.project ?? environment.project,
+      storageStateRef: request.storageStateRef ?? environment.storageStateRef,
+      urlAllowlist: request.urlAllowlist ?? environment.urlAllowlist,
+      variables: { ...(environment.variables || {}), ...(request.variables || {}) },
+    };
+
+    return { request: composed, environment };
+  }
+
+  // A dataset turns one request into one run per row, which is the point of
+  // keeping input data separate: the same scenario, many inputs.
+  async expandDataset(request) {
+    if (!request.dataset) {
+      return [request];
+    }
+
+    const dataset = await this.datasets.get(request.dataset);
+    const rows = Array.isArray(dataset.rows) ? dataset.rows : [];
+    if (!rows.length) {
+      throw new ApiError(400, "DATASET_EMPTY", `Dataset ${dataset.name} has no rows`);
+    }
+    if (rows.length > this.options.maxDatasetRows) {
+      throw new ApiError(
+        400,
+        "DATASET_TOO_LARGE",
+        `Dataset ${dataset.name} has ${rows.length} rows; MAX_DATASET_ROWS is ${this.options.maxDatasetRows}`,
+      );
+    }
+
+    const selected = request.datasetRow === undefined || request.datasetRow === null
+      ? rows.map((row, index) => ({ row, index }))
+      : [{ row: rows[Number(request.datasetRow)], index: Number(request.datasetRow) }];
+
+    if (selected.some((entry) => !entry.row || typeof entry.row !== "object")) {
+      throw new ApiError(400, "DATASET_ROW_NOT_FOUND", `Dataset ${dataset.name} has no row ${request.datasetRow}`);
+    }
+
+    return selected.map(({ row, index }) => ({
+      ...request,
+      datasetRow: index,
+      // Row values are the most specific input, so they win over both the
+      // environment and the request's own variables.
+      variables: { ...(request.variables || {}), ...row },
+    }));
+  }
+
   // Exceeding the concurrency limit used to be a 429. A request that is valid
   // now waits its turn instead of being thrown away; only a full queue rejects.
   async createRun(request, meta = {}) {
@@ -1322,6 +1593,9 @@ class RunManager {
       );
     }
 
+    // Real values go to the child process; the record keeps the masked copy.
+    const { resolved: resolvedVariables, safe: safeVariables, sensitiveValues } = await this.secrets
+      .resolveVariables(request.variables || {});
     const policy = narrowAllowlist(this.options.urlAllowlist, request.urlAllowlist);
     const runId = createId("run");
     const runDir = this.runDir(runId);
@@ -1334,7 +1608,12 @@ class RunManager {
     const run = {
       runId,
       scriptKey: request.scriptKey,
-      request,
+      // Never persist the request as given: it may carry a literal credential.
+      request: { ...request, variables: safeVariables },
+      resolvedVariables,
+      sensitiveValues,
+      environment: meta.environment ? { name: meta.environment.name, baseURL: meta.environment.baseURL } : null,
+      datasetRow: request.datasetRow ?? null,
       script: pinnedScript,
       status: "queued",
       network: {
@@ -1402,9 +1681,11 @@ class RunManager {
       throw new ApiError(409, "RUN_NOT_FINISHED", `Run ${runId} is ${original.status}; cancel it before retrying`);
     }
 
-    return this.createRun(original.request, {
+    const { request, environment } = await this.composeRequest(original.request);
+    return this.createRun(request, {
       attempt: (original.attempt ?? 1) + 1,
       retryOf: original.retryOf ?? runId,
+      environment,
     });
   }
 
@@ -1496,7 +1777,9 @@ class RunManager {
       PW_PLAYER_VIDEO: request.video || "retain-on-failure",
       PW_PLAYER_SCREENSHOT: request.screenshot || "only-on-failure",
       PW_PLAYER_STORAGE_STATE: request.storageStateRef ? this.resolveStorageState(request.storageStateRef) : "",
-      PW_PLAYER_VARIABLES_JSON: JSON.stringify(request.variables || {}),
+      // The resolved values live only here and in the child process, never in
+      // run.json or any API response.
+      PW_PLAYER_VARIABLES_JSON: JSON.stringify(run.resolvedVariables || {}),
       PW_PLAYER_TIMEOUT_MS: String(request.timeoutMs || 30_000),
     });
 
@@ -5682,6 +5965,9 @@ function buildOpenApiSpec(req) {
             storageStateRef: { type: "string", example: "auth/customer.json" },
             shard: { type: "string", example: "1/3" },
             priority: { type: "integer", default: 0, description: "Higher priority runs ahead of what is already queued" },
+            environment: { type: "string", example: "staging", description: "Apply a stored environment; explicit fields here win" },
+            dataset: { type: "string", example: "orders", description: "Queue one run per dataset row" },
+            datasetRow: { type: "integer", description: "Zero-based row index; omit to queue every row" },
             urlAllowlist: {
               type: "array",
               items: { type: "string" },
@@ -6258,6 +6544,57 @@ function buildOpenApiSpec(req) {
           responses: { 200: { description: "Binary file download" }, 404: { description: "Artifact not found" } },
         },
       },
+      [`${api}/environments`]: {
+        get: operation({ tag: "Runs", summary: "List environments" }),
+      },
+      [`${api}/environments/{name}`]: {
+        get: operation({ tag: "Runs", summary: "Get one environment", parameters: [pathParam("name")] }),
+        put: operation({
+          tag: "Runs",
+          summary: "Create or replace an environment",
+          parameters: [pathParam("name")],
+          body: {
+            type: "object",
+            properties: {
+              baseURL: { type: "string", example: "https://stg.example.com" },
+              project: { type: "string", enum: ["chromium", "firefox", "webkit"] },
+              storageStateRef: { type: "string", example: "auth/customer.json" },
+              urlAllowlist: { type: "array", items: { type: "string" } },
+              variables: {
+                type: "object",
+                additionalProperties: true,
+                description: "Use \"{{secret.NAME}}\" for credentials; a reference is never stored in a run record",
+              },
+            },
+          },
+        }),
+        delete: operation({ tag: "Runs", summary: "Delete an environment", parameters: [pathParam("name")] }),
+      },
+      [`${api}/datasets`]: {
+        get: operation({ tag: "Runs", summary: "List datasets with row counts and columns" }),
+      },
+      [`${api}/datasets/{name}`]: {
+        get: operation({ tag: "Runs", summary: "Get one dataset including its rows", parameters: [pathParam("name")] }),
+        put: operation({
+          tag: "Runs",
+          summary: "Create or replace a dataset",
+          parameters: [pathParam("name")],
+          body: {
+            type: "object",
+            required: ["rows"],
+            properties: {
+              rows: {
+                type: "array",
+                minItems: 1,
+                items: { type: "object", additionalProperties: true },
+                example: [{ sku: "ABC-1", qty: "1" }, { sku: "ABC-2", qty: "5" }],
+              },
+            },
+          },
+          responses: { 200: { description: "Stored dataset" }, 400: { description: "rows must be a non-empty array of objects" } },
+        }),
+        delete: operation({ tag: "Runs", summary: "Delete a dataset", parameters: [pathParam("name")] }),
+      },
       [`${api}/queue`]: {
         get: operation({
           tag: "Runs",
@@ -6789,8 +7126,71 @@ app.get(`${config.apiBasePath}/queue`, asyncRoute(async (req, res) => {
   ok(res, runManager.describeQueue());
 }));
 
+// A dataset turns one request into one run per row, so this answers with a list
+// when one is used and with a single run otherwise.
 app.post(`${config.apiBasePath}/runs`, asyncRoute(async (req, res) => {
-  ok(res, await runManager.createRun(req.body || {}), 201);
+  const { request, environment } = await runManager.composeRequest(req.body || {});
+  const expanded = await runManager.expandDataset(request);
+
+  if (!request.dataset) {
+    ok(res, await runManager.createRun(expanded[0], { environment }), 201);
+    return;
+  }
+
+  const runs = [];
+  for (const entry of expanded) {
+    runs.push(await runManager.createRun(entry, { environment }));
+  }
+
+  ok(res, { dataset: request.dataset, rowCount: runs.length, runs }, 201);
+}));
+
+app.get(`${config.apiBasePath}/environments`, asyncRoute(async (req, res) => {
+  ok(res, { environments: await runManager.environments.list() });
+}));
+
+app.get(`${config.apiBasePath}/environments/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.environments.get(req.params.name));
+}));
+
+app.put(`${config.apiBasePath}/environments/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.environments.save(req.params.name, req.body || {}));
+}));
+
+app.delete(`${config.apiBasePath}/environments/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.environments.remove(req.params.name));
+}));
+
+app.get(`${config.apiBasePath}/datasets`, asyncRoute(async (req, res) => {
+  const datasets = await runManager.datasets.list();
+  ok(res, {
+    // Rows can be large; the listing reports the shape, not the contents.
+    datasets: datasets.map((dataset) => ({
+      name: dataset.name,
+      rowCount: Array.isArray(dataset.rows) ? dataset.rows.length : 0,
+      columns: Array.isArray(dataset.rows) && dataset.rows[0] ? Object.keys(dataset.rows[0]) : [],
+      updatedAt: dataset.updatedAt,
+    })),
+  });
+}));
+
+app.get(`${config.apiBasePath}/datasets/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.datasets.get(req.params.name));
+}));
+
+app.put(`${config.apiBasePath}/datasets/:name`, asyncRoute(async (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.rows) || !body.rows.length) {
+    throw new ApiError(400, "INVALID_REQUEST", "rows must be a non-empty array of objects");
+  }
+  if (body.rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))) {
+    throw new ApiError(400, "INVALID_REQUEST", "every dataset row must be an object of variable values");
+  }
+  ok(res, await runManager.datasets.save(req.params.name, body));
+}));
+
+app.delete(`${config.apiBasePath}/datasets/:name`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.datasets.remove(req.params.name));
 }));
 
 app.get(`${config.apiBasePath}/runs/:runId`, asyncRoute(async (req, res) => {
@@ -7220,6 +7620,9 @@ const mcpTools = [
         shard: { type: "string", example: "1/3" },
         timeoutMs: { type: "integer" },
         priority: { type: "integer", default: 0, description: "Higher runs first" },
+        environment: { type: "string", description: "Name of an environment whose baseURL, project, storage state, allowlist and variables to apply. Anything set explicitly here wins." },
+        dataset: { type: "string", description: "Name of a dataset. Queues one run per row unless datasetRow selects one." },
+        datasetRow: { type: "integer", description: "Zero-based row index; omit to queue every row." },
         urlAllowlist: {
           type: "array",
           items: { type: "string" },
@@ -7229,7 +7632,19 @@ const mcpTools = [
       },
       required: ["scriptKey"],
     },
-    async (args) => runManager.createRun(args),
+    async (args) => {
+      const { request, environment } = await runManager.composeRequest(args);
+      const expanded = await runManager.expandDataset(request);
+      if (!request.dataset) {
+        return runManager.createRun(expanded[0], { environment });
+      }
+
+      const runs = [];
+      for (const entry of expanded) {
+        runs.push(await runManager.createRun(entry, { environment }));
+      }
+      return { dataset: request.dataset, rowCount: runs.length, runs };
+    },
   ),
   defineTool("run_get", "Get one Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.serializeRun(runManager.getRun(args.runId))),
   defineTool("run_cancel", "Cancel a running Playwright run.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.cancelRun(args.runId)),
@@ -7262,6 +7677,82 @@ const mcpTools = [
       },
     },
     async (args) => runManager.listRuns(args),
+  ),
+  defineTool(
+    "environment_list",
+    "List environments. An environment supplies baseURL, project, storage state, allowlist and variables so the same script can be pointed at dev, staging or production without reassembling them.",
+    { type: "object", properties: {} },
+    async () => ({ environments: await runManager.environments.list() }),
+  ),
+  defineTool(
+    "environment_get",
+    "Get one environment.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.environments.get(args.name),
+  ),
+  defineTool(
+    "environment_save",
+    "Create or replace an environment. Put credentials in `variables` as \"{{secret.NAME}}\" rather than literals: a reference is never written to a run record, a literal is.",
+    {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        baseURL: { type: "string" },
+        project: { type: "string", enum: ["chromium", "firefox", "webkit"] },
+        storageStateRef: { type: "string" },
+        urlAllowlist: { type: "array", items: { type: "string" } },
+        variables: { type: "object", additionalProperties: true },
+      },
+      required: ["name"],
+    },
+    async (args) => runManager.environments.save(args.name, args),
+  ),
+  defineTool(
+    "environment_delete",
+    "Delete an environment.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.environments.remove(args.name),
+  ),
+  defineTool(
+    "dataset_list",
+    "List datasets with their row counts and columns, without returning the rows.",
+    { type: "object", properties: {} },
+    async () => {
+      const datasets = await runManager.datasets.list();
+      return {
+        datasets: datasets.map((dataset) => ({
+          name: dataset.name,
+          rowCount: Array.isArray(dataset.rows) ? dataset.rows.length : 0,
+          columns: Array.isArray(dataset.rows) && dataset.rows[0] ? Object.keys(dataset.rows[0]) : [],
+          updatedAt: dataset.updatedAt,
+        })),
+      };
+    },
+  ),
+  defineTool(
+    "dataset_get",
+    "Get one dataset including its rows.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.datasets.get(args.name),
+  ),
+  defineTool(
+    "dataset_save",
+    "Create or replace a dataset. Each row is an object of variable values, merged over the environment's and the request's own variables.",
+    {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        rows: { type: "array", items: { type: "object", additionalProperties: true }, minItems: 1 },
+      },
+      required: ["name", "rows"],
+    },
+    async (args) => runManager.datasets.save(args.name, { rows: args.rows }),
+  ),
+  defineTool(
+    "dataset_delete",
+    "Delete a dataset.",
+    { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    async (args) => runManager.datasets.remove(args.name),
   ),
   defineTool(
     "run_queue",
