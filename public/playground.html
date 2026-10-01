@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="{{config.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{copy.title}}</title>
+  <link rel="stylesheet" href="{{config.uiAssetsPath}}/playground.css">
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="hero-header">
+        <div>
+          <h1>{{copy.heroTitle}}</h1>
+          <p>{{copy.heroBody}}</p>
+        </div>
+        {{raw.languageSwitcher}}
+      </div>
+      <nav>
+        <a href="{{config.docsPath}}">{{copy.openSwagger}}</a>
+        <a class="secondary" href="{{config.demoPath}}" target="_blank" rel="noreferrer">{{copy.openDemo}}</a>
+        <a class="secondary" href="{{config.openApiPath}}" target="_blank" rel="noreferrer">{{copy.openOpenApi}}</a>
+      </nav>
+    </section>
+
+    <section class="layout">
+      <div>
+        <section class="panel">
+          <h2>{{copy.quickCallsTitle}}</h2>
+          <p>{{copy.quickCallsBody}}</p>
+          <label>{{copy.apiTokenLabel}}
+            <input id="apiToken" type="password" autocomplete="off" placeholder="{{copy.apiTokenPlaceholder}}">
+          </label>
+          <div class="row">
+            <button type="button" id="healthBtn">{{copy.healthButton}}</button>
+            <button type="button" id="syncScriptsBtn" class="secondary">{{copy.syncScriptsButton}}</button>
+            <button type="button" id="loadScriptsBtn" class="secondary">{{copy.loadScriptsButton}}</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>{{copy.createRunTitle}}</h2>
+          <p>{{copy.createRunBody}}</p>
+          <div class="grid2">
+            <label>{{copy.scriptLabel}}<select id="scriptKey"></select></label>
+            <label>{{copy.projectLabel}}<input id="project" value="chromium"></label>
+            <label>{{copy.envLabel}}<input id="envName" value="local"></label>
+            <label>{{copy.baseUrlLabel}}<input id="baseUrl" value=""></label>
+            <label>{{copy.grepLabel}}<input id="grep" placeholder="@smoke"></label>
+            <label>{{copy.storageStateLabel}}<input id="storageStateRef" placeholder="auth/customer.json"></label>
+          </div>
+          <label>{{copy.variablesLabel}}
+            <textarea id="variablesJson">{{copy.defaultVariablesJson}}</textarea>
+          </label>
+          <div class="row">
+            <button type="button" id="createRunBtn">{{copy.createRunButton}}</button>
+            <button type="button" id="listRunsBtn" class="secondary">{{copy.listRunsButton}}</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>{{copy.sessionFlowTitle}}</h2>
+          <p>{{copy.sessionFlowBody}}</p>
+          <div class="grid2">
+            <label>{{copy.sessionIdLabel}}<input id="sessionId" readonly placeholder="{{copy.sessionIdLabel}}"></label>
+            <label>{{copy.contextIdLabel}}<input id="contextId" readonly placeholder="{{copy.contextIdLabel}}"></label>
+            <label>{{copy.pageIdLabel}}<input id="pageId" readonly placeholder="{{copy.pageIdLabel}}"></label>
+            <label>{{copy.messageLabel}}<input id="messageText" value="{{copy.defaultMessage}}"></label>
+          </div>
+          <div class="row">
+            <button type="button" id="createSessionBtn">{{copy.createSessionButton}}</button>
+            <button type="button" id="createContextBtn" class="secondary">{{copy.createContextButton}}</button>
+            <button type="button" id="createPageBtn" class="secondary">{{copy.createPageButton}}</button>
+          </div>
+          <div class="row">
+            <button type="button" id="gotoDemoBtn">{{copy.gotoDemoButton}}</button>
+            <button type="button" id="clickPrimaryBtn" class="secondary">{{copy.clickPrimaryButton}}</button>
+            <button type="button" id="sendMessageBtn" class="secondary">{{copy.sendMessageButton}}</button>
+            <button type="button" id="takeScreenshotBtn">{{copy.takeScreenshotButton}}</button>
+            <button type="button" id="closeSessionBtn" class="warn">{{copy.closeSessionButton}}</button>
+          </div>
+        </section>
+      </div>
+
+      <div>
+        <section class="panel">
+          <h2>{{copy.currentStatusTitle}}</h2>
+          <p>{{copy.currentStatusBody}}</p>
+          <div id="statusBox" class="status">{{copy.ready}}</div>
+        </section>
+        <section class="panel">
+          <h2>{{copy.screenshotPreviewTitle}}</h2>
+          <p>{{copy.screenshotPreviewBody}}</p>
+          <div id="preview" class="preview">{{copy.noScreenshot}}</div>
+        </section>
+        <section class="panel">
+          <h2>Artifacts</h2>
+          <p>List and download artifacts (screenshots, videos, traces) from the current session.</p>
+          <button type="button" id="listArtifactsBtn" class="secondary">List Artifacts</button>
+          <div id="artifactList" style="margin-top:12px;"></div>
+        </section>
+        <section class="panel">
+          <h2>{{copy.jsonResultTitle}}</h2>
+          <p>{{copy.jsonResultBody}}</p>
+          <pre id="resultBox">{}</pre>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Server-provided values for playground.js, which is served statically
+    // and therefore cannot carry template placeholders itself.
+    window.__PW_PLAYER__ = { clientConfig: {{json.clientConfig}} };
+  </script>
+  <script src="{{config.uiAssetsPath}}/playground.js" defer></script>
+</body>
+</html>

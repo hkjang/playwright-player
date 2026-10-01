@@ -29,7 +29,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.8.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.9.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -5378,264 +5378,184 @@ function buildAssistExamples(language) {
   };
 }
 
+
+// The built-in pages used to be ~1200 lines of template strings inside this
+// file, which made every UI change a server.js change and put CSS next to
+// request handling. Markup, styles, scripts and copy now live under public/.
+const uiDir = path.join(rootDir, "public");
+const uiAssetsPath = "/ui";
+
+// Read once at boot: these are shipped with the image and do not change at
+// runtime, and a per-request read would hit the disk on every page view.
+const uiTemplates = new Map();
+const uiCopy = new Map();
+
+async function loadUiAssets() {
+  for (const name of ["home", "playground", "demo", "docs"]) {
+    uiTemplates.set(name, await fsPromises.readFile(path.join(uiDir, `${name}.html`), "utf8"));
+  }
+  for (const language of ["ko", "en"]) {
+    uiCopy.set(language, JSON.parse(await fsPromises.readFile(path.join(uiDir, "locales", `${language}.json`), "utf8")));
+  }
+}
+
+function readPath(source, dottedKey) {
+  return dottedKey.split(".").reduce((value, key) => (value === undefined || value === null ? value : value[key]), source);
+}
+
+// `{{copy.x}}` is HTML-escaped, `{{json.x}}` is script-safe JSON, `{{raw.x}}` is
+// inserted verbatim for fragments this file composes. An unknown key throws
+// rather than rendering blank, so a typo in a template is loud.
+function renderUiTemplate(name, scopes) {
+  const template = uiTemplates.get(name);
+  if (!template) {
+    throw new ApiError(500, "UI_TEMPLATE_MISSING", `No template for ${name}; is public/ present in the image?`);
+  }
+
+  return template.replace(/\{\{\s*(copy|config|json|raw)\.([A-Za-z0-9_.]+)\s*\}\}/g, (match, scope, key) => {
+    const value = readPath(scopes[scope], key);
+    if (value === undefined) {
+      throw new ApiError(500, "UI_TEMPLATE_KEY_MISSING", `${match} in ${name}.html has no value`);
+    }
+    if (scope === "json") {
+      return toInlineJson(value);
+    }
+    return scope === "raw" ? String(value) : escapeHtml(value);
+  });
+}
+
+// Locale strings carry the same placeholders, so paths and the service name stay
+// in one place instead of being duplicated per language.
 function getPageCopy(language) {
-  return language === "ko" ? {
-    home: {
-      title: `${config.serviceName} 홈`,
-      heroTitle: config.serviceName,
-      heroBody: "이 컨테이너는 상태 유지형 Playwright REST API, Streamable MCP endpoint, Swagger UI, 그리고 오프라인 브라우저 자동화를 위한 로컬 데모 페이지를 함께 제공합니다. 아래 링크에서 API를 살펴보거나 내장 테스트 페이지를 바로 검증할 수 있습니다.",
-      autoLanguageNote: "브라우저 언어에 맞춰 한국어와 영어를 자동 전환합니다.",
-      swaggerLabel: "Swagger UI",
-      swaggerDescription: "오프라인 친화적인 UI에서 REST API와 MCP를 탐색합니다.",
-      playgroundLabel: "API 플레이그라운드",
-      playgroundDescription: "세션 생성, API 호출, 스크린샷 미리보기를 브라우저에서 바로 실행합니다.",
-      demoLabel: "데모 테스트 페이지",
-      demoDescription: "안정적인 Playwright 자동화 검증을 위한 로컬 페이지입니다.",
-      openApiLabel: "OpenAPI JSON",
-      openApiDescription: "클라이언트 생성이나 문서 임포트에 사용할 원본 OpenAPI 문서입니다.",
-      healthLabel: "헬스 체크",
-      healthDescription: "서비스 상태와 카운터를 빠르게 확인합니다.",
-    },
-    playground: {
-      title: `${config.serviceName} 플레이그라운드`,
-      heroTitle: "API 플레이그라운드",
-      heroBody: "현재 컨테이너의 내장 REST API를 브라우저에서 바로 호출할 수 있습니다. 스크립트 목록 조회, run 생성, 세션 기반 브라우저 제어, 로컬 데모 페이지 이동, 스크린샷 미리보기까지 한 화면에서 확인합니다.",
-      openSwagger: "Swagger UI 열기",
-      openDemo: "데모 테스트 페이지 열기",
-      openOpenApi: "OpenAPI JSON 열기",
-      quickCallsTitle: "빠른 호출",
-      quickCallsBody: "연결 상태와 스크립트 레지스트리를 빠르게 확인합니다.",
-      createRunTitle: "Run 생성",
-      createRunBody: "현재 컨테이너에 등록된 스크립트를 기준으로 실행 요청을 보냅니다.",
-      sessionFlowTitle: "세션 플로우",
-      sessionFlowBody: "저수준 세션을 만들고 로컬 데모 페이지를 연 뒤, 클릭과 입력을 수행하고 스크린샷 아티팩트를 캡처합니다.",
-      currentStatusTitle: "현재 상태",
-      currentStatusBody: "가장 최근 API 호출 결과와 짧은 상태 요약을 표시합니다.",
-      screenshotPreviewTitle: "스크린샷 미리보기",
-      screenshotPreviewBody: "스크린샷 아티팩트가 생성되면 다운로드 경로를 통해 바로 미리봅니다.",
-      jsonResultTitle: "JSON 결과",
-      jsonResultBody: "오프라인 환경 디버깅에 유용하도록 응답 전체를 pretty JSON으로 표시합니다.",
-      healthButton: "GET /health",
-      syncScriptsButton: "POST /api/scripts/sync",
-      loadScriptsButton: "GET /api/scripts",
-      createRunButton: "POST /api/runs",
-      listRunsButton: "GET /api/runs",
-      createSessionButton: "세션 생성",
-      createContextButton: "컨텍스트 생성",
-      createPageButton: "페이지 생성",
-      gotoDemoButton: "데모 열기",
-      clickPrimaryButton: "기본 액션 클릭",
-      sendMessageButton: "메시지 보내기",
-      takeScreenshotButton: "스크린샷 촬영",
-      closeSessionButton: "세션 종료",
-      scriptLabel: "스크립트",
-      projectLabel: "프로젝트",
-      envLabel: "환경",
-      baseUrlLabel: "Base URL",
-      grepLabel: "Grep",
-      storageStateLabel: "Storage State Ref",
-      variablesLabel: "Variables JSON",
-      sessionIdLabel: "세션 ID",
-      contextIdLabel: "컨텍스트 ID",
-      pageIdLabel: "페이지 ID",
-      messageLabel: "채팅 메시지",
-      ready: "API 호출 준비 완료",
-      noScreenshot: "아직 스크린샷이 없습니다.",
-      noArtifacts: "아직 아티팩트가 없습니다.",
-      downloadLabel: "다운로드",
-      apiTokenLabel: "API 토큰",
-      apiTokenPlaceholder: "API_TOKEN 을 설정한 경우에만 입력",
-      authRequiredNotice: "이 서버는 API 토큰을 요구합니다. 위 API 토큰 칸을 먼저 채우세요.",
-      invalidVariablesJson: "variables JSON 형식이 올바르지 않습니다:",
-      noScripts: "등록된 스크립트가 없습니다",
-      runCreated: "Run 생성 완료:",
-      createSessionFirst: "먼저 세션을 생성하세요.",
-      createContextFirst: "먼저 컨텍스트를 생성하세요.",
-      createPageFirst: "먼저 페이지를 생성하세요.",
-      requestFailed: "요청이 실패했습니다",
-      completed: "완료",
-      failed: "실패",
-      screenshotAlt: "스크린샷 아티팩트 미리보기",
-      defaultMessage: "playground에서 보낸 메시지",
-      defaultVariables: {
-        locale: "ko-KR",
-        source: "playground",
-      },
-      demoPrimaryExpected: "기본 액션 클릭됨",
-      demoMessageSentExpected: "메시지 전송 완료",
-    },
-    demo: {
-      title: "Playwright Player 데모 페이지",
-      heroTitle: "Playwright Player 데모 페이지",
-      heroBody: "이 로컬 페이지는 오프라인 환경에서도 안정적으로 브라우저 자동화를 검증할 수 있도록 만들어졌습니다. 표시 문구는 언어에 따라 바뀌지만 핵심 컨트롤은 동일한 test id를 유지합니다.",
-      targetNote: "표시 문구는 한국어와 영어로 바뀌지만 test id는 고정됩니다.",
-      interactionTitle: "상호작용 타깃",
-      interactionBody: "아래 컨트롤을 저수준 세션 API와 함께 사용하세요.",
-      statusTitle: "상태",
-      statusReady: "준비 완료",
-      primaryAction: "기본 액션",
-      secondaryAction: "보조 액션",
-      nameLabel: "이름",
-      namePlaceholder: "작업자 이름",
-      roleLabel: "역할",
-      saveProfile: "프로필 저장",
-      profileUnsaved: "프로필이 아직 저장되지 않았습니다.",
-      counterAndChat: "카운터와 채팅",
-      counterTitle: "카운터",
-      incrementCounter: "카운터 증가",
-      reset: "초기화",
-      messageLabel: "메시지",
-      messagePlaceholder: "메시지를 입력하세요",
-      sendMessage: "메시지 보내기",
-      noMessages: "아직 보낸 메시지가 없습니다.",
-      systemLoaded: "시스템: 로컬 데모 페이지가 로드되었습니다.",
-      profileSaved: "프로필 저장 완료",
-      primaryClicked: "기본 액션 클릭됨",
-      secondaryClicked: "보조 액션 클릭됨",
-      counterUpdated: "카운터 업데이트됨",
-      counterReset: "카운터 초기화됨",
-      messageEmpty: "메시지가 비어 있습니다",
-      messageSent: "메시지 전송 완료",
-      youPrefix: "나",
-      botPrefix: "봇",
-      botEcho: "에코",
-      lastMessage: "마지막 메시지",
-      savedProfileFor: "프로필 저장:",
-      roleOptions: [
-        { value: "observer", label: "관찰자" },
-        { value: "operator", label: "운영자" },
-        { value: "admin", label: "관리자" },
-      ],
-    },
-  } : {
-    home: {
-      title: `${config.serviceName} Home`,
-      heroTitle: config.serviceName,
-      heroBody: "This container serves the stateful Playwright REST API, Streamable MCP endpoint, Swagger UI, and a local demo page for offline browser automation. Use the links below to inspect the API surface quickly or drive the built-in test page with screenshot capture.",
-      autoLanguageNote: "The UI follows the browser language automatically and supports Korean and English.",
-      swaggerLabel: "Swagger UI",
-      swaggerDescription: "Browse the REST and MCP API in an offline-friendly UI.",
-      playgroundLabel: "API Playground",
-      playgroundDescription: "Call the service interactively, create sessions, and capture screenshots.",
-      demoLabel: "Demo Test Page",
-      demoDescription: "Simple local page for stable Playwright automation checks.",
-      openApiLabel: "OpenAPI JSON",
-      openApiDescription: "Raw OpenAPI document for client generation or import.",
-      healthLabel: "Health",
-      healthDescription: "Quick service status and counters.",
-    },
-    playground: {
-      title: `${config.serviceName} Playground`,
-      heroTitle: "API Playground",
-      heroBody: "Use this page to call the built-in REST API against the current container, create a live browser session, navigate to the local demo page, and preview screenshot artifacts without leaving the browser.",
-      openSwagger: "Open Swagger UI",
-      openDemo: "Open Demo Test Page",
-      openOpenApi: "OpenAPI JSON",
-      quickCallsTitle: "Quick Calls",
-      quickCallsBody: "Basic endpoints for connectivity and script registry checks.",
-      createRunTitle: "Create Run",
-      createRunBody: "Submit a script execution request using the registered script list from this container.",
-      sessionFlowTitle: "Session Flow",
-      sessionFlowBody: "Create a low-level session, open the local demo page, click and type, then capture a screenshot artifact.",
-      currentStatusTitle: "Current Status",
-      currentStatusBody: "The latest API call result and a short human-readable summary are shown here.",
-      screenshotPreviewTitle: "Screenshot Preview",
-      screenshotPreviewBody: "When a screenshot artifact is created, it is shown below using the API download path.",
-      jsonResultTitle: "JSON Result",
-      jsonResultBody: "All responses are rendered as pretty JSON so the page is useful for debugging in air-gapped environments.",
-      healthButton: "GET /health",
-      syncScriptsButton: "POST /api/scripts/sync",
-      loadScriptsButton: "GET /api/scripts",
-      createRunButton: "POST /api/runs",
-      listRunsButton: "GET /api/runs",
-      createSessionButton: "Create Session",
-      createContextButton: "Create Context",
-      createPageButton: "Create Page",
-      gotoDemoButton: "Goto Demo",
-      clickPrimaryButton: "Click Primary",
-      sendMessageButton: "Send Message",
-      takeScreenshotButton: "Take Screenshot",
-      closeSessionButton: "Close Session",
-      scriptLabel: "Script",
-      projectLabel: "Project",
-      envLabel: "Environment",
-      baseUrlLabel: "Base URL",
-      grepLabel: "Grep",
-      storageStateLabel: "Storage State Ref",
-      variablesLabel: "Variables JSON",
-      sessionIdLabel: "Session ID",
-      contextIdLabel: "Context ID",
-      pageIdLabel: "Page ID",
-      messageLabel: "Chat Message",
-      ready: "Ready to call the API.",
-      noScreenshot: "No screenshot yet.",
-      noArtifacts: "No artifacts yet.",
-      downloadLabel: "Download",
-      apiTokenLabel: "API token",
-      apiTokenPlaceholder: "Only needed when API_TOKEN is set",
-      authRequiredNotice: "This server requires an API token. Fill in the API token field above first.",
-      invalidVariablesJson: "variables is not valid JSON:",
-      noScripts: "No scripts found",
-      runCreated: "Run created:",
-      createSessionFirst: "Create a session first.",
-      createContextFirst: "Create a context first.",
-      createPageFirst: "Create a page first.",
-      requestFailed: "Request failed",
-      completed: "completed",
-      failed: "failed",
-      screenshotAlt: "Screenshot artifact preview",
-      defaultMessage: "hello from playground",
-      defaultVariables: {
-        locale: "en-US",
-        source: "playground",
-      },
-      demoPrimaryExpected: "Primary clicked",
-      demoMessageSentExpected: "Message sent",
-    },
-    demo: {
-      title: "Playwright Player Demo Page",
-      heroTitle: "Playwright Player Demo Page",
-      heroBody: "This local page is designed for stable browser automation in offline environments. Visible copy changes with the browser language, while core controls keep stable test ids.",
-      targetNote: "Visible labels can change by locale, but the test ids stay stable.",
-      interactionTitle: "Interaction Targets",
-      interactionBody: "Use the controls below with the low-level session API.",
-      statusTitle: "Status",
-      statusReady: "Ready",
-      primaryAction: "Primary Action",
-      secondaryAction: "Secondary Action",
-      nameLabel: "Name",
-      namePlaceholder: "Operator name",
-      roleLabel: "Role",
-      saveProfile: "Save Profile",
-      profileUnsaved: "Profile is not saved yet.",
-      counterAndChat: "Counter And Chat",
-      counterTitle: "Counter",
-      incrementCounter: "Increment Counter",
-      reset: "Reset",
-      messageLabel: "Message",
-      messagePlaceholder: "Type a message",
-      sendMessage: "Send message",
-      noMessages: "No messages sent.",
-      systemLoaded: "System: local demo page loaded.",
-      profileSaved: "Profile saved",
-      primaryClicked: "Primary clicked",
-      secondaryClicked: "Secondary clicked",
-      counterUpdated: "Counter updated",
-      counterReset: "Counter reset",
-      messageEmpty: "Message is empty",
-      messageSent: "Message sent",
-      youPrefix: "You",
-      botPrefix: "Bot",
-      botEcho: "Echo",
-      lastMessage: "Last message",
-      savedProfileFor: "Saved profile for",
-      roleOptions: [
-        { value: "observer", label: "observer" },
-        { value: "operator", label: "operator" },
-        { value: "admin", label: "admin" },
-      ],
-    },
+  const copy = uiCopy.get(language) || uiCopy.get("en");
+  const replacements = {
+    "{{config.serviceName}}": config.serviceName,
+    "{{config.openApiPath}}": documentationPaths.openApi,
+    "{{config.docsPath}}": documentationPaths.docs,
+    "{{config.playgroundPath}}": documentationPaths.playground,
+    "{{config.swaggerAssetsPath}}": documentationPaths.swaggerAssets,
   };
+  const resolve = (value) => {
+    if (typeof value === "string") {
+      let out = value;
+      for (const [placeholder, actual] of Object.entries(replacements)) {
+        out = out.split(placeholder).join(actual);
+      }
+      return out;
+    }
+    if (Array.isArray(value)) {
+      return value.map(resolve);
+    }
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, resolve(entry)]));
+    }
+    return value;
+  };
+
+  return resolve(copy);
+}
+
+function uiConfig(language) {
+  return {
+    language,
+    serviceName: config.serviceName,
+    apiBasePath: config.apiBasePath,
+    uiAssetsPath,
+    openApiPath: documentationPaths.openApi,
+    swaggerAssetsPath: documentationPaths.swaggerAssets,
+    docsPath: appendLanguageParam(documentationPaths.docs, language),
+    playgroundPath: appendLanguageParam(documentationPaths.playground, language),
+    demoPath: appendLanguageParam("/demo/test-page", language),
+  };
+}
+
+function renderLanguageSwitcher(currentPath, language) {
+  const links = [
+    { code: "ko", label: "한국어" },
+    { code: "en", label: "English" },
+  ];
+
+  return `
+    <nav class="language-switcher" aria-label="Language">
+      ${links.map((entry) => `
+        <a href="${escapeHtml(appendLanguageParam(currentPath, entry.code))}" class="${entry.code === language ? "active" : ""}">
+          ${escapeHtml(entry.label)}
+        </a>
+      `).join("")}
+    </nav>
+  `;
+}
+
+function renderHomePage(req) {
+  const baseUrl = getBaseUrl(req);
+  const language = resolveRequestLanguage(req);
+  const copy = getPageCopy(language).home;
+  const entries = [
+    { href: appendLanguageParam(documentationPaths.docs, language), label: copy.swaggerLabel, description: copy.swaggerDescription },
+    { href: appendLanguageParam(documentationPaths.playground, language), label: copy.playgroundLabel, description: copy.playgroundDescription },
+    { href: appendLanguageParam("/demo/test-page", language), label: copy.demoLabel, description: copy.demoDescription },
+    { href: documentationPaths.openApi, label: copy.openApiLabel, description: copy.openApiDescription },
+    { href: "/health", label: copy.healthLabel, description: copy.healthDescription },
+  ];
+
+  return renderUiTemplate("home", {
+    copy,
+    config: uiConfig(language),
+    raw: {
+      languageSwitcher: renderLanguageSwitcher("/", language),
+      cards: entries.map((entry) => `
+    <a class="card" href="${escapeHtml(entry.href)}">
+      <strong>${escapeHtml(entry.label)}</strong>
+      <span>${escapeHtml(entry.description)}</span>
+      <code>${escapeHtml(baseUrl + entry.href)}</code>
+    </a>
+  `).join(""),
+    },
+  });
+}
+
+function renderSwaggerPage(req) {
+  const language = resolveRequestLanguage(req);
+  return renderUiTemplate("docs", {
+    copy: {},
+    config: uiConfig(language),
+    json: { openApiUrl: `${getBaseUrl(req)}${documentationPaths.openApi}` },
+    raw: {},
+  });
+}
+
+function renderPlaygroundPage(req) {
+  const language = resolveRequestLanguage(req);
+  const copy = getPageCopy(language).playground;
+  const clientConfig = {
+    ...uiConfig(language),
+    authRequired: Boolean(config.apiToken),
+    copy,
+  };
+
+  return renderUiTemplate("playground", {
+    copy: { ...copy, defaultVariablesJson: JSON.stringify(copy.defaultVariables, null, 2) },
+    config: clientConfig,
+    json: { clientConfig },
+    raw: { languageSwitcher: renderLanguageSwitcher(documentationPaths.playground, language) },
+  });
+}
+
+function renderDemoTestPage(req) {
+  const language = resolveRequestLanguage(req);
+  const copy = getPageCopy(language).demo;
+
+  return renderUiTemplate("demo", {
+    copy,
+    config: uiConfig(language),
+    json: { copy },
+    raw: {
+      languageSwitcher: renderLanguageSwitcher("/demo/test-page", language),
+      roleOptions: (copy.roleOptions || [])
+        .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+        .join(""),
+    },
+  });
 }
 
 function buildOpenApiSpec(req) {
@@ -6536,963 +6456,10 @@ function buildOpenApiSpec(req) {
   };
 }
 
-function renderSwaggerPage(req) {
-  const openApiUrl = `${getBaseUrl(req)}${documentationPaths.openApi}`;
-  const language = resolveRequestLanguage(req);
 
-  return `<!doctype html>
-<html lang="${escapeHtml(language)}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(config.serviceName)} Swagger UI</title>
-  <link rel="stylesheet" href="${documentationPaths.swaggerAssets}/swagger-ui.css">
-  <style>
-    html { box-sizing: border-box; overflow-y: scroll; }
-    *, *::before, *::after { box-sizing: inherit; }
-    body { margin: 0; background: #f8fafc; }
-    .topbar { display: none; }
-  </style>
-</head>
-<body>
-  <div id="swagger-ui"></div>
-  <script src="${documentationPaths.swaggerAssets}/swagger-ui-bundle.js"></script>
-  <script src="${documentationPaths.swaggerAssets}/swagger-ui-standalone-preset.js"></script>
-  <script>
-    window.ui = SwaggerUIBundle({
-      url: ${toInlineJson(openApiUrl)},
-      dom_id: '#swagger-ui',
-      deepLinking: true,
-      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-      layout: 'StandaloneLayout',
-      displayRequestDuration: true,
-      defaultModelsExpandDepth: 2,
-      defaultModelExpandDepth: 2,
-      tryItOutEnabled: true
-    });
-  </script>
-</body>
-</html>`;
-}
 
-function renderLanguageSwitcher(currentPath, language) {
-  const links = [
-    { code: "ko", label: "한국어" },
-    { code: "en", label: "English" },
-  ];
 
-  return `
-    <nav class="language-switcher" aria-label="Language">
-      ${links.map((entry) => `
-        <a href="${escapeHtml(appendLanguageParam(currentPath, entry.code))}" class="${entry.code === language ? "active" : ""}">
-          ${escapeHtml(entry.label)}
-        </a>
-      `).join("")}
-    </nav>
-  `;
-}
 
-function renderHomePage(req) {
-  const baseUrl = getBaseUrl(req);
-  const language = resolveRequestLanguage(req);
-  const copy = getPageCopy(language).home;
-  const entries = [
-    { href: appendLanguageParam(documentationPaths.docs, language), label: copy.swaggerLabel, description: copy.swaggerDescription },
-    { href: appendLanguageParam(documentationPaths.playground, language), label: copy.playgroundLabel, description: copy.playgroundDescription },
-    { href: appendLanguageParam("/demo/test-page", language), label: copy.demoLabel, description: copy.demoDescription },
-    { href: documentationPaths.openApi, label: copy.openApiLabel, description: copy.openApiDescription },
-    { href: "/health", label: copy.healthLabel, description: copy.healthDescription },
-  ];
-  const cards = entries.map((entry) => `
-    <a class="card" href="${escapeHtml(entry.href)}">
-      <strong>${escapeHtml(entry.label)}</strong>
-      <span>${escapeHtml(entry.description)}</span>
-      <code>${escapeHtml(baseUrl + entry.href)}</code>
-    </a>
-  `).join("");
-
-  return `<!doctype html>
-<html lang="${escapeHtml(language)}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(copy.title)}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --panel: rgba(255,255,255,0.92);
-      --ink: #1d2433;
-      --muted: #5b6476;
-      --line: rgba(29,36,51,0.12);
-      --accent: #0f766e;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.18), transparent 34%),
-        radial-gradient(circle at bottom right, rgba(239,68,68,0.14), transparent 36%),
-        linear-gradient(180deg, #f6f1e7 0%, #ece9e4 100%);
-      min-height: 100vh;
-    }
-    main {
-      width: min(1040px, calc(100vw - 32px));
-      margin: 0 auto;
-      padding: 28px 0 56px;
-    }
-    .hero {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      padding: 28px;
-      box-shadow: 0 18px 50px rgba(29,36,51,0.08);
-      backdrop-filter: blur(12px);
-    }
-    .hero-header {
-      display: flex;
-      gap: 16px;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-bottom: 14px;
-    }
-    .hero h1 {
-      margin: 0;
-      font-size: clamp(2rem, 4vw, 3.5rem);
-      letter-spacing: -0.04em;
-    }
-    .hero p {
-      margin: 0;
-      color: var(--muted);
-      max-width: 760px;
-      line-height: 1.65;
-      font-size: 1.05rem;
-    }
-    .note {
-      display: inline-flex;
-      margin-top: 16px;
-      padding: 8px 12px;
-      border-radius: 999px;
-      background: rgba(15,118,110,0.08);
-      border: 1px solid rgba(15,118,110,0.16);
-      color: var(--accent);
-      font-weight: 600;
-    }
-    .language-switcher {
-      display: inline-flex;
-      gap: 8px;
-      padding: 6px;
-      border-radius: 999px;
-      background: rgba(29,36,51,0.06);
-      border: 1px solid var(--line);
-    }
-    .language-switcher a {
-      text-decoration: none;
-      color: var(--ink);
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-weight: 600;
-    }
-    .language-switcher a.active {
-      background: var(--accent);
-      color: #fff;
-    }
-    .grid {
-      margin-top: 24px;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      display: grid;
-      gap: 8px;
-      padding: 18px;
-      text-decoration: none;
-      color: inherit;
-      background: rgba(255,255,255,0.86);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: 0 12px 34px rgba(29,36,51,0.06);
-    }
-    .card strong { font-size: 1.05rem; }
-    .card span { color: var(--muted); line-height: 1.55; min-height: 3.1em; }
-    .card code { color: var(--accent); word-break: break-all; font-size: .9rem; }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <div class="hero-header">
-        <h1>${escapeHtml(copy.heroTitle)}</h1>
-        ${renderLanguageSwitcher("/", language)}
-      </div>
-      <p>${escapeHtml(copy.heroBody)}</p>
-      <div class="note">${escapeHtml(copy.autoLanguageNote)}</div>
-    </section>
-    <section class="grid">${cards}</section>
-  </main>
-</body>
-</html>`;
-}
-
-function renderPlaygroundPage(req) {
-  const language = resolveRequestLanguage(req);
-  const copy = getPageCopy(language).playground;
-  const defaultVariables = JSON.stringify(copy.defaultVariables, null, 2);
-  const clientConfig = {
-    apiBasePath: config.apiBasePath,
-    docsPath: appendLanguageParam(documentationPaths.docs, language),
-    openApiPath: documentationPaths.openApi,
-    demoPath: appendLanguageParam("/demo/test-page", language),
-    language,
-    authRequired: Boolean(config.apiToken),
-    copy,
-  };
-
-  return `<!doctype html>
-<html lang="${escapeHtml(language)}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(copy.title)}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --panel: rgba(255,255,255,0.94);
-      --ink: #1f2937;
-      --muted: #667085;
-      --line: rgba(17,24,39,0.12);
-      --primary: #0f766e;
-      --accent: #c2410c;
-      --shadow: 0 18px 48px rgba(17,24,39,0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.15), transparent 28%),
-        radial-gradient(circle at top right, rgba(194,65,12,0.12), transparent 28%),
-        linear-gradient(180deg, #f5f2ec 0%, #ece6df 100%);
-      min-height: 100vh;
-    }
-    main { width: min(1180px, calc(100vw - 24px)); margin: 0 auto; padding: 20px 0 28px; display: grid; gap: 18px; }
-    .hero, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); }
-    .hero { padding: 24px; }
-    .hero-header { display: flex; gap: 16px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
-    .hero h1 { margin: 0 0 10px; font-size: clamp(1.9rem, 4vw, 3.2rem); letter-spacing: -0.05em; }
-    .hero p, .panel p { margin: 0 0 14px; color: var(--muted); line-height: 1.6; }
-    .hero nav, .row { display: flex; flex-wrap: wrap; gap: 10px; }
-    .layout { display: grid; grid-template-columns: 1.15fr .85fr; gap: 18px; }
-    .grid2 { display: grid; gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .panel { padding: 18px; }
-    a, button {
-      appearance: none;
-      border: 0;
-      border-radius: 999px;
-      background: var(--primary);
-      color: #fff;
-      padding: 10px 14px;
-      cursor: pointer;
-      font-weight: 600;
-      text-decoration: none;
-    }
-    button.secondary, a.secondary { background: #e5e7eb; color: #111827; }
-    button.warn { background: var(--accent); }
-    label { display: grid; gap: 6px; font-size: .94rem; font-weight: 600; }
-    input, select, textarea, pre {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      padding: 11px 12px;
-      font: inherit;
-    }
-    textarea { min-height: 110px; resize: vertical; }
-    .status {
-      border-radius: 14px;
-      padding: 12px 14px;
-      background: rgba(15,118,110,0.08);
-      color: #0f766e;
-      font-weight: 600;
-    }
-    .status.error { background: rgba(194,65,12,0.1); color: #9a3412; }
-    pre { margin: 0; min-height: 280px; overflow: auto; background: #0f172a; color: #dbeafe; line-height: 1.5; }
-    .preview {
-      border-radius: 18px;
-      overflow: hidden;
-      border: 1px solid var(--line);
-      min-height: 180px;
-      background: linear-gradient(135deg, rgba(15,118,110,0.1), rgba(194,65,12,0.08));
-      display: grid;
-      place-items: center;
-      color: var(--muted);
-    }
-    .preview img { display: block; max-width: 100%; height: auto; }
-    .language-switcher {
-      display: inline-flex;
-      gap: 8px;
-      padding: 6px;
-      border-radius: 999px;
-      background: rgba(17,24,39,0.06);
-      border: 1px solid var(--line);
-    }
-    .language-switcher a {
-      text-decoration: none;
-      color: var(--ink);
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-weight: 600;
-      background: transparent;
-    }
-    .language-switcher a.active {
-      background: var(--primary);
-      color: #fff;
-    }
-    @media (max-width: 980px) {
-      .layout, .grid2 { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <div class="hero-header">
-        <div>
-          <h1>${escapeHtml(copy.heroTitle)}</h1>
-          <p>${escapeHtml(copy.heroBody)}</p>
-        </div>
-        ${renderLanguageSwitcher(documentationPaths.playground, language)}
-      </div>
-      <nav>
-        <a href="${escapeHtml(clientConfig.docsPath)}">${escapeHtml(copy.openSwagger)}</a>
-        <a class="secondary" href="${escapeHtml(clientConfig.demoPath)}" target="_blank" rel="noreferrer">${escapeHtml(copy.openDemo)}</a>
-        <a class="secondary" href="${escapeHtml(clientConfig.openApiPath)}" target="_blank" rel="noreferrer">${escapeHtml(copy.openOpenApi)}</a>
-      </nav>
-    </section>
-
-    <section class="layout">
-      <div>
-        <section class="panel">
-          <h2>${escapeHtml(copy.quickCallsTitle)}</h2>
-          <p>${escapeHtml(copy.quickCallsBody)}</p>
-          <label>${escapeHtml(copy.apiTokenLabel)}
-            <input id="apiToken" type="password" autocomplete="off" placeholder="${escapeHtml(copy.apiTokenPlaceholder)}">
-          </label>
-          <div class="row">
-            <button type="button" id="healthBtn">${escapeHtml(copy.healthButton)}</button>
-            <button type="button" id="syncScriptsBtn" class="secondary">${escapeHtml(copy.syncScriptsButton)}</button>
-            <button type="button" id="loadScriptsBtn" class="secondary">${escapeHtml(copy.loadScriptsButton)}</button>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>${escapeHtml(copy.createRunTitle)}</h2>
-          <p>${escapeHtml(copy.createRunBody)}</p>
-          <div class="grid2">
-            <label>${escapeHtml(copy.scriptLabel)}<select id="scriptKey"></select></label>
-            <label>${escapeHtml(copy.projectLabel)}<input id="project" value="chromium"></label>
-            <label>${escapeHtml(copy.envLabel)}<input id="envName" value="local"></label>
-            <label>${escapeHtml(copy.baseUrlLabel)}<input id="baseUrl" value=""></label>
-            <label>${escapeHtml(copy.grepLabel)}<input id="grep" placeholder="@smoke"></label>
-            <label>${escapeHtml(copy.storageStateLabel)}<input id="storageStateRef" placeholder="auth/customer.json"></label>
-          </div>
-          <label>${escapeHtml(copy.variablesLabel)}
-            <textarea id="variablesJson">${escapeHtml(defaultVariables)}</textarea>
-          </label>
-          <div class="row">
-            <button type="button" id="createRunBtn">${escapeHtml(copy.createRunButton)}</button>
-            <button type="button" id="listRunsBtn" class="secondary">${escapeHtml(copy.listRunsButton)}</button>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>${escapeHtml(copy.sessionFlowTitle)}</h2>
-          <p>${escapeHtml(copy.sessionFlowBody)}</p>
-          <div class="grid2">
-            <label>${escapeHtml(copy.sessionIdLabel)}<input id="sessionId" readonly placeholder="${escapeHtml(copy.sessionIdLabel)}"></label>
-            <label>${escapeHtml(copy.contextIdLabel)}<input id="contextId" readonly placeholder="${escapeHtml(copy.contextIdLabel)}"></label>
-            <label>${escapeHtml(copy.pageIdLabel)}<input id="pageId" readonly placeholder="${escapeHtml(copy.pageIdLabel)}"></label>
-            <label>${escapeHtml(copy.messageLabel)}<input id="messageText" value="${escapeHtml(copy.defaultMessage)}"></label>
-          </div>
-          <div class="row">
-            <button type="button" id="createSessionBtn">${escapeHtml(copy.createSessionButton)}</button>
-            <button type="button" id="createContextBtn" class="secondary">${escapeHtml(copy.createContextButton)}</button>
-            <button type="button" id="createPageBtn" class="secondary">${escapeHtml(copy.createPageButton)}</button>
-          </div>
-          <div class="row">
-            <button type="button" id="gotoDemoBtn">${escapeHtml(copy.gotoDemoButton)}</button>
-            <button type="button" id="clickPrimaryBtn" class="secondary">${escapeHtml(copy.clickPrimaryButton)}</button>
-            <button type="button" id="sendMessageBtn" class="secondary">${escapeHtml(copy.sendMessageButton)}</button>
-            <button type="button" id="takeScreenshotBtn">${escapeHtml(copy.takeScreenshotButton)}</button>
-            <button type="button" id="closeSessionBtn" class="warn">${escapeHtml(copy.closeSessionButton)}</button>
-          </div>
-        </section>
-      </div>
-
-      <div>
-        <section class="panel">
-          <h2>${escapeHtml(copy.currentStatusTitle)}</h2>
-          <p>${escapeHtml(copy.currentStatusBody)}</p>
-          <div id="statusBox" class="status">${escapeHtml(copy.ready)}</div>
-        </section>
-        <section class="panel">
-          <h2>${escapeHtml(copy.screenshotPreviewTitle)}</h2>
-          <p>${escapeHtml(copy.screenshotPreviewBody)}</p>
-          <div id="preview" class="preview">${escapeHtml(copy.noScreenshot)}</div>
-        </section>
-        <section class="panel">
-          <h2>Artifacts</h2>
-          <p>List and download artifacts (screenshots, videos, traces) from the current session.</p>
-          <button type="button" id="listArtifactsBtn" class="secondary">List Artifacts</button>
-          <div id="artifactList" style="margin-top:12px;"></div>
-        </section>
-        <section class="panel">
-          <h2>${escapeHtml(copy.jsonResultTitle)}</h2>
-          <p>${escapeHtml(copy.jsonResultBody)}</p>
-          <pre id="resultBox">{}</pre>
-        </section>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const CONFIG = ${toInlineJson(clientConfig)};
-    const COPY = CONFIG.copy;
-    const state = { sessionId: '', contextId: '', pageId: '' };
-    const resultBox = document.getElementById('resultBox');
-    const preview = document.getElementById('preview');
-    const statusBox = document.getElementById('statusBox');
-    const scriptKeySelect = document.getElementById('scriptKey');
-    const sessionIdInput = document.getElementById('sessionId');
-    const contextIdInput = document.getElementById('contextId');
-    const pageIdInput = document.getElementById('pageId');
-
-    function setStatus(message, isError) {
-      statusBox.textContent = message;
-      statusBox.className = isError ? 'status error' : 'status';
-    }
-
-    function setResult(payload) {
-      resultBox.textContent = JSON.stringify(payload, null, 2);
-    }
-
-    function syncInputs() {
-      sessionIdInput.value = state.sessionId;
-      contextIdInput.value = state.contextId;
-      pageIdInput.value = state.pageId;
-    }
-
-    // <img src> and <a href> cannot carry an Authorization header, so with
-    // API_TOKEN set both have to go through fetch and a blob URL.
-    async function fetchArtifactBlob(downloadPath, inline) {
-      const url = downloadPath + (inline ? '?disposition=inline' : '');
-      const response = await fetch(url, { headers: authHeaders() });
-      if (!response.ok) {
-        throw new Error(COPY.requestFailed + ' (' + response.status + ')');
-      }
-      return URL.createObjectURL(await response.blob());
-    }
-
-    async function downloadArtifact(artifact) {
-      const objectUrl = await fetchArtifactBlob(artifact.downloadPath, false);
-      const anchor = document.createElement('a');
-      anchor.href = objectUrl;
-      anchor.download = artifact.fileName;
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 30000);
-    }
-
-    function showArtifact(artifact) {
-      if (!artifact || !artifact.downloadPath) {
-        preview.textContent = COPY.noScreenshot;
-        return;
-      }
-      preview.replaceChildren();
-      const image = document.createElement('img');
-      image.alt = COPY.screenshotAlt;
-      preview.append(image);
-      fetchArtifactBlob(artifact.downloadPath, true)
-        .then(function (objectUrl) { image.src = objectUrl; })
-        .catch(function (error) { preview.textContent = error.message; });
-    }
-
-    function authHeaders() {
-      const token = (document.getElementById('apiToken').value || '').trim();
-      return token ? { Authorization: 'Bearer ' + token } : {};
-    }
-
-    async function api(method, path, body) {
-      const response = await fetch(path, {
-        method,
-        headers: Object.assign({}, body ? { 'Content-Type': 'application/json' } : {}, authHeaders()),
-        body: body ? JSON.stringify(body) : undefined
-      });
-      const contentType = response.headers.get('content-type') || '';
-      const payload = contentType.includes('application/json') ? await response.json() : await response.text();
-      setResult(payload);
-      if (!response.ok) {
-        const message = payload && payload.error && payload.error.message ? payload.error.message : COPY.requestFailed;
-        setStatus(method + ' ' + path + ' ' + COPY.failed + ': ' + message, true);
-        throw new Error(message);
-      }
-      setStatus(method + ' ' + path + ' ' + COPY.completed, false);
-      return payload;
-    }
-
-    async function refreshScripts() {
-      const payload = await api('GET', CONFIG.apiBasePath + '/scripts');
-      const scripts = (payload.data && payload.data.scripts) || [];
-      scriptKeySelect.innerHTML = '';
-      if (!scripts.length) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = COPY.noScripts;
-        scriptKeySelect.append(option);
-        return;
-      }
-      scripts.forEach((script) => {
-        const option = document.createElement('option');
-        option.value = script.scriptKey;
-        option.textContent = script.scriptKey;
-        scriptKeySelect.append(option);
-      });
-    }
-
-    function requireValue(value, message) {
-      if (!value) {
-        throw new Error(message);
-      }
-    }
-
-    // Without this, an early throw (missing session id, invalid JSON) left the
-    // page looking like the click did nothing at all.
-    function onClick(id, handler) {
-      const element = document.getElementById(id);
-      if (!element) {
-        return;
-      }
-      element.addEventListener('click', async () => {
-        element.disabled = true;
-        try {
-          await handler();
-        } catch (error) {
-          setStatus(error.message || String(error), true);
-        } finally {
-          element.disabled = false;
-        }
-      });
-    }
-
-    onClick('healthBtn', async () => { await api('GET', '/health'); });
-    onClick('syncScriptsBtn', async () => {
-      await api('POST', CONFIG.apiBasePath + '/scripts/sync', {});
-      await refreshScripts();
-    });
-    onClick('loadScriptsBtn', async () => { await refreshScripts(); });
-    onClick('createRunBtn', async () => {
-      const variablesText = document.getElementById('variablesJson').value.trim();
-      let variables = {};
-      try {
-        variables = variablesText ? JSON.parse(variablesText) : {};
-      } catch (error) {
-        throw new Error(COPY.invalidVariablesJson + ' ' + error.message);
-      }
-      const payload = await api('POST', CONFIG.apiBasePath + '/runs', {
-        scriptKey: scriptKeySelect.value,
-        project: document.getElementById('project').value.trim() || undefined,
-        env: document.getElementById('envName').value.trim() || undefined,
-        baseURL: document.getElementById('baseUrl').value.trim() || undefined,
-        grep: document.getElementById('grep').value.trim() || undefined,
-        storageStateRef: document.getElementById('storageStateRef').value.trim() || undefined,
-        variables
-      });
-      if (payload && payload.data && payload.data.runId) {
-        setStatus(COPY.runCreated + ' ' + payload.data.runId, false);
-      }
-    });
-    onClick('listRunsBtn', async () => { await api('GET', CONFIG.apiBasePath + '/runs'); });
-    onClick('createSessionBtn', async () => {
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions', { browserType: 'chromium', headless: true });
-      state.sessionId = payload.data.sessionId;
-      state.contextId = '';
-      state.pageId = '';
-      syncInputs();
-    });
-    onClick('createContextBtn', async () => {
-      requireValue(state.sessionId, COPY.createSessionFirst);
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts', {
-        viewport: { width: 1440, height: 960 },
-        locale: CONFIG.language === 'ko' ? 'ko-KR' : 'en-US'
-      });
-      state.contextId = payload.data.contextId;
-      state.pageId = '';
-      syncInputs();
-    });
-    onClick('createPageBtn', async () => {
-      requireValue(state.contextId, COPY.createContextFirst);
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/contexts/' + state.contextId + '/pages', {});
-      state.pageId = payload.data.pageId;
-      syncInputs();
-    });
-    onClick('gotoDemoBtn', async () => {
-      requireValue(state.pageId, COPY.createPageFirst);
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/goto', {
-        url: window.location.origin + CONFIG.demoPath,
-        waitUntil: 'domcontentloaded'
-      });
-    });
-    onClick('clickPrimaryBtn', async () => {
-      requireValue(state.pageId, COPY.createPageFirst);
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
-        locator: { testId: 'primary-action' }
-      });
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/assert/text', {
-        locator: { testId: 'status' },
-        value: COPY.demoPrimaryExpected,
-        match: 'contains'
-      });
-    });
-    onClick('sendMessageBtn', async () => {
-      requireValue(state.pageId, COPY.createPageFirst);
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/fill', {
-        locator: { testId: 'message-input' },
-        value: document.getElementById('messageText').value
-      });
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/click', {
-        locator: { testId: 'send-message' }
-      });
-      await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/assert/text', {
-        locator: { testId: 'status' },
-        value: COPY.demoMessageSentExpected,
-        match: 'contains'
-      });
-    });
-    onClick('takeScreenshotBtn', async () => {
-      requireValue(state.pageId, COPY.createPageFirst);
-      const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/pages/' + state.pageId + '/screenshot', {
-        fullPage: true,
-        type: 'png'
-      });
-      showArtifact(payload && payload.data && payload.data.artifact);
-    });
-    onClick('closeSessionBtn', async () => {
-      requireValue(state.sessionId, COPY.createSessionFirst);
-      await api('DELETE', CONFIG.apiBasePath + '/sessions/' + state.sessionId);
-      state.sessionId = '';
-      state.contextId = '';
-      state.pageId = '';
-      syncInputs();
-      preview.textContent = COPY.noScreenshot;
-    });
-
-    onClick('listArtifactsBtn', async () => {
-      requireValue(state.sessionId, COPY.createSessionFirst);
-      const payload = await api('GET', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/artifacts');
-      const list = document.getElementById('artifactList');
-      const artifacts = payload && payload.data && payload.data.artifacts;
-      if (!artifacts || !artifacts.length) {
-        list.replaceChildren();
-        const empty = document.createElement('em');
-        empty.textContent = COPY.noArtifacts;
-        list.append(empty);
-        return;
-      }
-      list.replaceChildren();
-      artifacts.forEach(function(a) {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;padding:8px;border-radius:10px;background:rgba(15,118,110,0.06);';
-        const type = document.createElement('strong');
-        type.textContent = a.type || 'file';
-        const meta = document.createElement('span');
-        meta.style.cssText = 'color:#5f6b82;font-size:.9rem;';
-        meta.textContent = a.fileName + ' (' + Math.round((a.sizeBytes || 0) / 1024) + ' KB)';
-        const link = document.createElement('button');
-        link.type = 'button';
-        link.textContent = COPY.downloadLabel;
-        link.style.cssText = 'margin-left:auto;padding:6px 12px;border-radius:999px;background:#0f766e;color:#fff;border:0;font-size:.85rem;font-weight:600;cursor:pointer;';
-        link.addEventListener('click', function () {
-          downloadArtifact(a).catch(function (error) { setStatus(error.message, true); });
-        });
-        row.append(type, meta, link);
-        list.append(row);
-      });
-    });
-
-    syncInputs();
-    if (CONFIG.authRequired) {
-      setStatus(COPY.authRequiredNotice, false);
-    }
-    refreshScripts().catch((error) => setStatus(error.message, true));
-  </script>
-</body>
-</html>`;
-}
-
-function renderDemoTestPage(req) {
-  const language = resolveRequestLanguage(req);
-  const copy = getPageCopy(language).demo;
-  const roleOptions = Array.isArray(copy.roleOptions) && copy.roleOptions.length
-    ? copy.roleOptions
-    : [
-      { value: "observer", label: "observer" },
-      { value: "operator", label: "operator" },
-      { value: "admin", label: "admin" },
-    ];
-  const optionsMarkup = roleOptions.map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`).join("");
-
-  return `<!doctype html>
-<html lang="${escapeHtml(language)}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(copy.title)}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --panel: rgba(255,255,255,0.95);
-      --ink: #172033;
-      --muted: #5f6b82;
-      --line: rgba(23,32,51,0.12);
-      --teal: #0f766e;
-      --sand: #b45309;
-      --shadow: 0 20px 48px rgba(23,32,51,0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", "Pretendard Variable", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15,118,110,0.17), transparent 30%),
-        radial-gradient(circle at bottom right, rgba(180,83,9,0.12), transparent 34%),
-        linear-gradient(180deg, #f8f4ed 0%, #eee8df 100%);
-      min-height: 100vh;
-    }
-    main { width: min(1120px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 36px; display: grid; gap: 18px; }
-    .hero, .panel { border-radius: 26px; background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
-    .hero { padding: 26px; }
-    .hero-header { display: flex; gap: 16px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
-    .hero h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3.4rem); letter-spacing: -0.05em; }
-    .hero p, .muted { margin: 0; line-height: 1.65; color: var(--muted); }
-    .layout { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; }
-    .panel { padding: 20px; }
-    h2 { margin: 0 0 12px; font-size: 1.12rem; }
-    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    label { display: grid; gap: 6px; font-weight: 600; }
-    input, select, button { font: inherit; }
-    input, select {
-      width: 100%;
-      padding: 11px 12px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 10px 14px;
-      font-weight: 700;
-      cursor: pointer;
-      color: #fff;
-      background: var(--teal);
-    }
-    .ghost { background: #e5e7eb; color: #111827; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .status, .counter, .feed {
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: #fff;
-      padding: 14px 16px;
-    }
-    .status strong { display: block; margin-bottom: 6px; }
-    ul.feed {
-      list-style: none;
-      margin: 0;
-      display: grid;
-      gap: 10px;
-      max-height: 320px;
-      overflow: auto;
-    }
-    ul.feed li {
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(15,118,110,0.08);
-      border: 1px solid rgba(15,118,110,0.12);
-    }
-    ul.feed li.reply {
-      background: rgba(180,83,9,0.08);
-      border-color: rgba(180,83,9,0.14);
-    }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: rgba(23,32,51,0.07);
-      color: var(--muted);
-      font-size: .9rem;
-      margin: 8px 8px 0 0;
-    }
-    .language-switcher {
-      display: inline-flex;
-      gap: 8px;
-      padding: 6px;
-      border-radius: 999px;
-      background: rgba(23,32,51,0.06);
-      border: 1px solid var(--line);
-    }
-    .language-switcher a {
-      text-decoration: none;
-      color: var(--ink);
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-weight: 600;
-    }
-    .language-switcher a.active {
-      background: var(--teal);
-      color: #fff;
-    }
-    @media (max-width: 920px) {
-      .layout, .grid2 { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <div class="hero-header">
-        <div>
-          <h1>${escapeHtml(copy.heroTitle)}</h1>
-          <p>${escapeHtml(copy.heroBody)}</p>
-        </div>
-        ${renderLanguageSwitcher("/demo/test-page", language)}
-      </div>
-    </section>
-    <section class="layout">
-      <div class="panel">
-        <h2>${escapeHtml(copy.interactionTitle)}</h2>
-        <p class="muted">${escapeHtml(copy.interactionBody)}</p>
-        <p class="muted">${escapeHtml(copy.targetNote)}</p>
-        <div>
-          <span class="chip">data-testid="primary-action"</span>
-          <span class="chip">data-testid="status"</span>
-          <span class="chip">data-testid="message-input"</span>
-          <span class="chip">data-testid="send-message"</span>
-        </div>
-
-        <div class="status" data-testid="status-panel" style="margin-top: 16px;">
-          <strong>${escapeHtml(copy.statusTitle)}</strong>
-          <div id="statusText" data-testid="status">${escapeHtml(copy.statusReady)}</div>
-        </div>
-
-        <div class="row" style="margin-top: 14px;">
-          <button type="button" id="primaryAction" data-testid="primary-action">${escapeHtml(copy.primaryAction)}</button>
-          <button type="button" id="secondaryAction" class="ghost" data-testid="secondary-action">${escapeHtml(copy.secondaryAction)}</button>
-        </div>
-
-        <div class="grid2" style="margin-top: 18px;">
-          <label>${escapeHtml(copy.nameLabel)}<input id="nameInput" placeholder="${escapeHtml(copy.namePlaceholder)}" data-testid="name-input"></label>
-          <label>${escapeHtml(copy.roleLabel)}
-            <select id="roleSelect" data-testid="role-select">${optionsMarkup}</select>
-          </label>
-        </div>
-
-        <div class="row" style="margin-top: 14px;">
-          <button type="button" id="saveProfile" data-testid="save-profile">${escapeHtml(copy.saveProfile)}</button>
-          <div id="profileResult" data-testid="profile-result" class="muted">${escapeHtml(copy.profileUnsaved)}</div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>${escapeHtml(copy.counterAndChat)}</h2>
-        <div class="counter" data-testid="counter-card">
-          <strong>${escapeHtml(copy.counterTitle)}</strong>
-          <div id="counterValue" data-testid="counter-value">0</div>
-          <div class="row" style="margin-top: 12px;">
-            <button type="button" id="incrementCounter" data-testid="increment-counter">${escapeHtml(copy.incrementCounter)}</button>
-            <button type="button" id="resetCounter" class="ghost" data-testid="reset-counter">${escapeHtml(copy.reset)}</button>
-          </div>
-        </div>
-
-        <div style="margin-top: 18px;">
-          <label>${escapeHtml(copy.messageLabel)}<input id="messageInput" data-testid="message-input" placeholder="${escapeHtml(copy.messagePlaceholder)}" aria-label="${escapeHtml(copy.messageLabel)}"></label>
-          <div class="row" style="margin-top: 12px;">
-            <button type="button" id="sendMessage" data-testid="send-message">${escapeHtml(copy.sendMessage)}</button>
-            <div id="chatSummary" data-testid="chat-summary" class="muted">${escapeHtml(copy.noMessages)}</div>
-          </div>
-          <ul id="messageFeed" class="feed" data-testid="message-feed">
-            <li>${escapeHtml(copy.systemLoaded)}</li>
-          </ul>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const COPY = ${toInlineJson(copy)};
-    const statusText = document.getElementById('statusText');
-    const profileResult = document.getElementById('profileResult');
-    const counterValue = document.getElementById('counterValue');
-    const messageFeed = document.getElementById('messageFeed');
-    const chatSummary = document.getElementById('chatSummary');
-    const roleSelect = document.getElementById('roleSelect');
-
-    function appendMessage(text, className) {
-      const item = document.createElement('li');
-      if (className) {
-        item.className = className;
-      }
-      item.textContent = text;
-      messageFeed.append(item);
-      item.scrollIntoView({ block: 'nearest' });
-    }
-
-    document.getElementById('primaryAction').addEventListener('click', () => {
-      statusText.textContent = COPY.primaryClicked;
-    });
-    document.getElementById('secondaryAction').addEventListener('click', () => {
-      statusText.textContent = COPY.secondaryClicked;
-    });
-    document.getElementById('saveProfile').addEventListener('click', () => {
-      const name = document.getElementById('nameInput').value.trim() || 'anonymous';
-      const role = roleSelect.options[roleSelect.selectedIndex]?.textContent || roleSelect.value;
-      profileResult.textContent = COPY.savedProfileFor + ' ' + name + ' (' + role + ')';
-      statusText.textContent = COPY.profileSaved;
-    });
-    document.getElementById('incrementCounter').addEventListener('click', () => {
-      const next = Number(counterValue.textContent || '0') + 1;
-      counterValue.textContent = String(next);
-      statusText.textContent = COPY.counterUpdated;
-    });
-    document.getElementById('resetCounter').addEventListener('click', () => {
-      counterValue.textContent = '0';
-      statusText.textContent = COPY.counterReset;
-    });
-    document.getElementById('sendMessage').addEventListener('click', () => {
-      const input = document.getElementById('messageInput');
-      const value = input.value.trim();
-      if (!value) {
-        statusText.textContent = COPY.messageEmpty;
-        return;
-      }
-      appendMessage(COPY.youPrefix + ': ' + value, '');
-      appendMessage(COPY.botPrefix + ': ' + COPY.botEcho + ' -> ' + value, 'reply');
-      chatSummary.textContent = COPY.lastMessage + ': ' + value;
-      statusText.textContent = COPY.messageSent;
-      input.value = '';
-    });
-  </script>
-</body>
-</html>`;
-}
 
 const scriptRegistry = new ScriptRegistry(config);
 await scriptRegistry.refresh();
@@ -7500,6 +6467,7 @@ const runManager = new RunManager({
   ...config,
   registry: scriptRegistry,
 });
+await loadUiAssets();
 await runManager.restore();
 const sessionManager = new SessionManager(config);
 const scriptAssistant = new ScriptAssistant({
@@ -7534,6 +6502,7 @@ app.use((error, req, res, next) => {
 });
 
 app.use(documentationPaths.swaggerAssets, express.static(swaggerUiAssetDir));
+app.use(uiAssetsPath, express.static(path.join(uiDir, "assets"), { maxAge: "1h" }));
 
 const mcpSessions = new Map();
 

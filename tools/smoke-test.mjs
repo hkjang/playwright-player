@@ -1864,6 +1864,59 @@ async function run() {
         `slowest was ${JSON.stringify(payload.data.slowest[0])}`);
     });
 
+    // The built-in pages moved out of server.js into public/. "Returns 200" was
+    // the only coverage they ever had, which would not notice a page that renders
+    // but no longer works. This drives them with the server's own session API.
+    await check("the built-in pages still work after being served from public/", async () => {
+      for (const [label, pagePath] of [["home", "/?lang=en"], ["demo", "/demo/test-page?lang=ko"], ["playground", "/playground?lang=ko"]]) {
+        const response = await fetch(`${baseUrl}${pagePath}`);
+        assert(response.ok, `${label} returned ${response.status}`);
+        const body = await response.text();
+        assert(!body.includes("{{"), `${label} rendered an unsubstituted placeholder`);
+        assert(!/UI_TEMPLATE/.test(body), `${label} failed to render: ${body.slice(0, 200)}`);
+      }
+
+      for (const asset of ["home.css", "playground.css", "playground.js", "demo.css", "demo.js", "docs.css", "docs.js"]) {
+        const response = await fetch(`${baseUrl}/ui/${asset}`);
+        assert(response.ok, `/ui/${asset} returned ${response.status}`);
+        const body = await response.text();
+        // A static asset cannot carry a template placeholder: nothing substitutes it.
+        assert(!body.includes("{{"), `/ui/${asset} contains an unsubstituted placeholder`);
+      }
+
+      const pageErrors = [];
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${baseUrl}/demo/test-page?lang=ko` });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/fill`, {
+        locator: { testId: "message-input" },
+        value: "extracted",
+      });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, { locator: { testId: "send-message" } });
+      const demoStatus = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/locator/query`, {
+        locator: { testId: "status" },
+        operation: "textContent",
+      });
+      assert(demoStatus.payload.data.value?.trim(), "the demo page's script did not update the status");
+
+      // The playground's config now arrives through an inline bootstrap because
+      // its script is served statically; check the script actually received it.
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${baseUrl}/playground?lang=ko` });
+      const bootstrapped = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: '() => ({ hasConfig: typeof window.__PW_PLAYER__?.clientConfig?.apiBasePath === "string", wiredButtons: !!document.getElementById("healthBtn") })',
+      });
+      assert(bootstrapped.payload.data.result.hasConfig, "the playground never received its config");
+      assert(bootstrapped.payload.data.result.wiredButtons, "the playground markup is missing its controls");
+
+      const clicked = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, { locator: { css: "#healthBtn" } });
+      assert(clicked.status === 200, `clicking the playground button returned ${clicked.status}`);
+      const result = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/assert/text`, {
+        locator: { css: "#resultBox" },
+        expected: "uptimeSec",
+        timeoutMs: 10000,
+      });
+      assert(result.status === 200, "the playground's own API call did not populate the result box");
+      assert(pageErrors.length === 0, pageErrors.join("; "));
+    });
+
     await check("stopping a trace that never started is a 409", async () => {
       const { status, payload } = await call("POST", `/api/sessions/${sessionId}/trace/stop`, { contextId });
       assert(status === 409, `expected 409, got ${status}`);

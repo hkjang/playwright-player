@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="{{config.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{config.serviceName}} Swagger UI</title>
+  <link rel="stylesheet" href="{{config.swaggerAssetsPath}}/swagger-ui.css">
+  <link rel="stylesheet" href="{{config.uiAssetsPath}}/docs.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="{{config.swaggerAssetsPath}}/swagger-ui-bundle.js"></script>
+  <script src="{{config.swaggerAssetsPath}}/swagger-ui-standalone-preset.js"></script>
+  <script>
+    // Server-provided values for docs.js, which is served statically
+    // and therefore cannot carry template placeholders itself.
+    window.__PW_PLAYER__ = { openApiUrl: {{json.openApiUrl}} };
+  </script>
+  <script src="{{config.uiAssetsPath}}/docs.js" defer></script>
+</body>
+</html>

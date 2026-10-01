@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="{{config.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{copy.title}}</title>
+  <link rel="stylesheet" href="{{config.uiAssetsPath}}/home.css">
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="hero-header">
+        <h1>{{copy.heroTitle}}</h1>
+        {{raw.languageSwitcher}}
+      </div>
+      <p>{{copy.heroBody}}</p>
+      <div class="note">{{copy.autoLanguageNote}}</div>
+    </section>
+    <section class="grid">{{raw.cards}}</section>
+  </main>
+</body>
+</html>

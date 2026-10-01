@@ -12,6 +12,9 @@ RUN npm ci --omit=dev --no-fund --no-audit
 
 COPY server.js ./
 COPY scripts ./scripts
+# The built-in pages live here now; without them every page returns
+# 500 UI_TEMPLATE_MISSING.
+COPY public ./public
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

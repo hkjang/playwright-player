@@ -524,6 +524,32 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 - MCP는 Streamable HTTP 규격의 POST/DELETE 중심으로 구현했고, GET 기반 SSE stream 은 아직 비활성화했습니다.
 - 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션은 사라지지만, 실행 이력과 증적은 `RUNS_DIR` 에 남아 계속 조회할 수 있습니다.
 
+## 내장 페이지 구조
+
+페이지의 마크업·스타일·스크립트·문구는 `public/` 에 있습니다. `server.js` 에는 템플릿을 읽어 치환하는 로더만 남습니다.
+
+```
+public/
+  home.html  playground.html  demo.html  docs.html   마크업 + {{...}} 플레이스홀더
+  assets/    *.css  *.js                             /ui/* 로 정적 서빙
+  locales/   ko.json  en.json                        화면 문구
+```
+
+| 플레이스홀더 | 처리 |
+| --- | --- |
+| `{{copy.x}}` | HTML 이스케이프 |
+| `{{config.x}}` | HTML 이스케이프 |
+| `{{json.x}}` | `<script>` 안에서 안전한 JSON |
+| `{{raw.x}}` | 서버가 조립한 조각을 그대로 삽입 |
+
+없는 키는 조용히 빈칸이 되지 않고 `500 UI_TEMPLATE_KEY_MISSING` 으로 키 이름을 알려줍니다.
+
+`assets/*.js` 는 정적으로 서빙되므로 **플레이스홀더를 넣을 수 없습니다.** 서버가 주는 값은 HTML 의 인라인 부트스트랩이 `window.__PW_PLAYER__` 로 전달하고, 스크립트가 그걸 읽습니다.
+
+로케일 파일 안에서도 `{{config.serviceName}}` 같은 플레이스홀더를 쓸 수 있어, 경로와 서비스명이 언어별로 중복되지 않습니다.
+
+Docker 이미지에는 `public/` 이 포함되어야 합니다. 없으면 모든 페이지가 `500 UI_TEMPLATE_MISSING` 입니다.
+
 ## 내장 페이지
 
 - `/`

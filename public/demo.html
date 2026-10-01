@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="{{config.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{copy.title}}</title>
+  <link rel="stylesheet" href="{{config.uiAssetsPath}}/demo.css">
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="hero-header">
+        <div>
+          <h1>{{copy.heroTitle}}</h1>
+          <p>{{copy.heroBody}}</p>
+        </div>
+        {{raw.languageSwitcher}}
+      </div>
+    </section>
+    <section class="layout">
+      <div class="panel">
+        <h2>{{copy.interactionTitle}}</h2>
+        <p class="muted">{{copy.interactionBody}}</p>
+        <p class="muted">{{copy.targetNote}}</p>
+        <div>
+          <span class="chip">data-testid="primary-action"</span>
+          <span class="chip">data-testid="status"</span>
+          <span class="chip">data-testid="message-input"</span>
+          <span class="chip">data-testid="send-message"</span>
+        </div>
+
+        <div class="status" data-testid="status-panel" style="margin-top: 16px;">
+          <strong>{{copy.statusTitle}}</strong>
+          <div id="statusText" data-testid="status">{{copy.statusReady}}</div>
+        </div>
+
+        <div class="row" style="margin-top: 14px;">
+          <button type="button" id="primaryAction" data-testid="primary-action">{{copy.primaryAction}}</button>
+          <button type="button" id="secondaryAction" class="ghost" data-testid="secondary-action">{{copy.secondaryAction}}</button>
+        </div>
+
+        <div class="grid2" style="margin-top: 18px;">
+          <label>{{copy.nameLabel}}<input id="nameInput" placeholder="{{copy.namePlaceholder}}" data-testid="name-input"></label>
+          <label>{{copy.roleLabel}}
+            <select id="roleSelect" data-testid="role-select">{{raw.roleOptions}}</select>
+          </label>
+        </div>
+
+        <div class="row" style="margin-top: 14px;">
+          <button type="button" id="saveProfile" data-testid="save-profile">{{copy.saveProfile}}</button>
+          <div id="profileResult" data-testid="profile-result" class="muted">{{copy.profileUnsaved}}</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>{{copy.counterAndChat}}</h2>
+        <div class="counter" data-testid="counter-card">
+          <strong>{{copy.counterTitle}}</strong>
+          <div id="counterValue" data-testid="counter-value">0</div>
+          <div class="row" style="margin-top: 12px;">
+            <button type="button" id="incrementCounter" data-testid="increment-counter">{{copy.incrementCounter}}</button>
+            <button type="button" id="resetCounter" class="ghost" data-testid="reset-counter">{{copy.reset}}</button>
+          </div>
+        </div>
+
+        <div style="margin-top: 18px;">
+          <label>{{copy.messageLabel}}<input id="messageInput" data-testid="message-input" placeholder="{{copy.messagePlaceholder}}" aria-label="{{copy.messageLabel}}"></label>
+          <div class="row" style="margin-top: 12px;">
+            <button type="button" id="sendMessage" data-testid="send-message">{{copy.sendMessage}}</button>
+            <div id="chatSummary" data-testid="chat-summary" class="muted">{{copy.noMessages}}</div>
+          </div>
+          <ul id="messageFeed" class="feed" data-testid="message-feed">
+            <li>{{copy.systemLoaded}}</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Server-provided values for demo.js, which is served statically
+    // and therefore cannot carry template placeholders itself.
+    window.__PW_PLAYER__ = { copy: {{json.copy}} };
+  </script>
+  <script src="{{config.uiAssetsPath}}/demo.js" defer></script>
+</body>
+</html>
