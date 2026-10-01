@@ -463,6 +463,198 @@ async function runRetentionChecks() {
   }
 }
 
+// URL_ALLOWLIST was enforced on session browsers but not on script runs, which
+// are separate processes - the one security asymmetry left after v0.3.0.
+//
+// Two instances, because the policy checks need a generous RUN_TIMEOUT_MS while
+// the timeout check needs a short one, and that setting is per server.
+async function runWorkerIsolationChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-worker-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+
+  const workerPort = port + 4;
+  const workerUrl = `http://127.0.0.1:${workerPort}`;
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "netprobe.spec.js"),
+    [
+      'import { test, expect } from "@playwright/test";',
+      "",
+      'test("reaches outside the policy", async ({ page }) => {',
+      '  const outside = await page.goto("http://blocked.example/").then(',
+      '    (response) => `status ${response?.status()}`,',
+      // No backslash escapes in generated fixtures: a \n here becomes a real
+      // newline and breaks the string literal in the file that gets written.
+      '    (error) => `error ${String(error).slice(0, 80)}`,',
+      "  );",
+      "  console.log(`PROBE_OUTSIDE=${outside}`);",
+      "",
+      `  await page.goto("${workerUrl}/demo/test-page");`,
+      '  await expect(page.getByTestId("status")).toBeVisible();',
+      '  console.log("PROBE_LOOPBACK=ok");',
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "hang.spec.js"),
+    [
+      'import { test } from "@playwright/test";',
+      "",
+      'test("hangs well past the run timeout", async () => {',
+      "  test.setTimeout(0);",
+      "  await new Promise((resolve) => setTimeout(resolve, 600000));",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const spawnWorker = async (extraEnv, instancePort) => {
+    const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        PORT: String(instancePort),
+        HOST: "127.0.0.1",
+        SCRIPTS_DIR: scriptsDir,
+        RUNS_DIR: path.join(dataDir, `runs-${instancePort}`),
+        ARTIFACTS_DIR: path.join(dataDir, `artifacts-${instancePort}`),
+        STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+        ...extraEnv,
+      },
+    });
+    const instanceUrl = `http://127.0.0.1:${instancePort}`;
+    await waitForHealth(instanceUrl);
+
+    const api = async (method, urlPath, body) => {
+      const response = await fetch(`${instanceUrl}${urlPath}`, {
+        method,
+        headers: body === undefined ? {} : { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: response.status, payload: await response.json() };
+    };
+
+    const waitFor = async (runId, timeoutMs = 240_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const { payload } = await api("GET", `/api/runs/${runId}`);
+        if (["completed", "failed", "cancelled", "interrupted"].includes(payload.data.status)) {
+          return payload.data;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      throw new Error(`run ${runId} never finished`);
+    };
+
+    return {
+      api,
+      waitFor,
+      async stop() {
+        proc.kill("SIGKILL");
+        await new Promise((resolve) => proc.on("exit", resolve));
+      },
+    };
+  };
+
+  // --- instance A: the network policy -------------------------------------
+  let policy;
+  try {
+    policy = await spawnWorker(
+      { URL_ALLOWLIST: "allowed.example", RUN_TIMEOUT_MS: "300000" },
+      workerPort,
+    );
+  } catch (error) {
+    record("worker isolation checks", "fail", error.message);
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+    return;
+  }
+
+  try {
+    await check("health reports that the allowlist covers runs, not just sessions", async () => {
+      const { payload } = await policy.api("GET", "/health");
+      const coverage = payload.data.features.urlAllowlistCoverage;
+      assert(coverage.includes("sessions") && coverage.includes("runs"), JSON.stringify(coverage));
+    });
+
+    await check("a per-run allowlist can narrow the policy but never widen it", async () => {
+      const { payload } = await policy.api("POST", "/api/runs", {
+        scriptKey: "netprobe",
+        project: "chromium",
+        urlAllowlist: ["evil.example", "*.evil.example", "allowed.example"],
+      });
+      const network = payload.data.network;
+      assert(network.allowlist.length === 1 && network.allowlist[0] === "allowed.example",
+        `effective policy widened: ${JSON.stringify(network.allowlist)}`);
+      assert(network.rejectedAllowlistEntries.includes("evil.example"), JSON.stringify(network.rejectedAllowlistEntries));
+      assert(network.rejectedAllowlistEntries.includes("*.evil.example"), "wildcard widening was accepted");
+      await policy.api("POST", `/api/runs/${payload.data.runId}/cancel`);
+      await policy.waitFor(payload.data.runId);
+      await policy.api("DELETE", `/api/runs/${payload.data.runId}`);
+    });
+
+    await check("a script run cannot reach a host outside the allowlist", async () => {
+      const created = await policy.api("POST", "/api/runs", { scriptKey: "netprobe", project: "chromium" });
+      const runId = created.payload.data.runId;
+      assert(created.payload.data.network.enforced === true, "the run reported no network policy");
+
+      const finished = await policy.waitFor(runId);
+      const logs = await policy.api("GET", `/api/runs/${runId}/logs`);
+      const text = logs.payload.data.logs.map((entry) => entry.line).join("\n");
+
+      // The proxy answers 403, so the navigation resolves rather than erroring.
+      assert(/PROBE_OUTSIDE=status 403/.test(text), `the run reached outside the policy: ${text.slice(0, 400)}`);
+      // Loopback has to keep working or the policy is unusable for local targets.
+      assert(text.includes("PROBE_LOOPBACK=ok"), `loopback was blocked too: ${text.slice(0, 400)}`);
+      assert(finished.status === "completed", `run ${finished.status}: ${text.slice(0, 400)}`);
+
+      const network = finished.network;
+      assert(network.blockedRequests >= 1, `guard recorded ${network.blockedRequests} blocked requests`);
+      assert(network.blocked.some((entry) => entry.host === "blocked.example"),
+        `blocked list did not name the host: ${JSON.stringify(network.blocked)}`);
+      assert(!network.proxyUrl || network.proxyUrl.startsWith("http://127.0.0.1:"),
+        `the guard proxy must be loopback-only: ${network.proxyUrl}`);
+
+      await policy.api("DELETE", `/api/runs/${runId}`);
+    });
+  } catch (error) {
+    record("worker isolation checks", "fail", error.message);
+  } finally {
+    await policy.stop();
+  }
+
+  // --- instance B: the run wall-clock limit --------------------------------
+  let timeout;
+  try {
+    timeout = await spawnWorker({ RUN_TIMEOUT_MS: "25000" }, workerPort + 1);
+
+    await check("a hung run is killed and releases its slot", async () => {
+      const created = await timeout.api("POST", "/api/runs", { scriptKey: "hang", project: "chromium" });
+      const runId = created.payload.data.runId;
+      const started = Date.now();
+      const finished = await timeout.waitFor(runId, 120_000);
+      const elapsed = Date.now() - started;
+
+      assert(finished.status === "failed", `expected failed, got ${finished.status}`);
+      assert(/RUN_TIMEOUT_MS/.test(finished.interruptedReason || ""), finished.interruptedReason);
+      assert(elapsed < 90_000, `took ${elapsed}ms; the timeout should have fired at 25000ms`);
+
+      const queue = await timeout.api("GET", "/api/queue");
+      assert(queue.payload.data.running === 0, `${queue.payload.data.running} runs still hold a slot`);
+    });
+  } catch (error) {
+    record("a hung run is killed and releases its slot", "fail", error.message);
+  } finally {
+    if (timeout) {
+      await timeout.stop();
+    }
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
 async function runAllowlistChecks() {
   let extra;
   try {
@@ -1029,6 +1221,7 @@ async function run() {
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();
+  await runWorkerIsolationChecks();
 
   // ---- browser-dependent checks --------------------------------------------
   const session = await call("POST", "/api/sessions", {});

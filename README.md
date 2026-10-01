@@ -20,6 +20,7 @@
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
+- 세션과 스크립트 실행 양쪽에 적용되는 네트워크 허용목록, 실행 시간 상한
 
 ## 스크립트 규칙
 
@@ -206,7 +207,9 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MCP_BASE_PATH` | `/mcp` | MCP endpoint |
 | `API_TOKEN` | 없음 | 설정하면 `/api` 와 `/mcp` 가 `Authorization: Bearer <token>` 을 요구합니다. `/health`, 내장 페이지, Swagger 정적 파일은 계속 공개됩니다. localhost 밖으로 노출되는 배포에서는 반드시 설정하세요. |
 | `ALLOWED_ORIGINS` | 없음 | MCP 를 호출할 수 있는 추가 cross-origin 목록입니다. same-origin 과 loopback 은 항상 허용됩니다. |
-| `URL_ALLOWLIST` | 없음 | `page.goto` 가 접근할 수 있는 host 목록입니다. `*.example.com` 형태를 지원합니다. |
+| `URL_ALLOWLIST` | 없음 | 접근 가능한 host 목록. `*.example.com` 형태를 지원하며 세션과 스크립트 실행 양쪽에 적용됩니다. |
+| `RUN_TIMEOUT_MS` | `1800000` | 실행 시간 상한. 초과 시 `SIGKILL` 후 `failed`. `0` 이면 끕니다 |
+| `MAX_BLOCKED_REQUEST_LOG_ENTRIES` | `100` | 실행별로 보관하는 차단 요청 기록 수 |
 | `ENABLE_EVALUATE` | `true` | `false` 면 `page.evaluate` 가 `403` 을 반환합니다. |
 | `DEFAULT_DIALOG_ACTION` | `dismiss` | `alert`/`confirm`/`prompt` 기본 처리. `accept`, `dismiss`, `ignore` 중 선택합니다. `ignore` 는 대화상자를 열어둔 채로 두므로 이를 띄운 동작이 타임아웃됩니다. |
 | `DEFAULT_DIALOG_PROMPT_TEXT` | 빈 문자열 | `accept` 시 `prompt()` 에 입력할 값 |
@@ -241,6 +244,46 @@ Playwright 는 `dialog` 리스너가 **없을 때만** 대화상자를 자동으
 3. 페이지 단위: `POST /api/sessions/{id}/pages/{pageId}/dialog-policy`
 
 처리 결과는 페이지 응답의 `lastDialog` 와 `sessions/{id}/actions` 의 이벤트 로그에서 확인할 수 있습니다.
+
+## 네트워크 정책
+
+`URL_ALLOWLIST` 를 설정하면 두 경로 모두에서 강제됩니다. `/health` 의 `features.urlAllowlistCoverage` 로 확인할 수 있습니다.
+
+| 경로 | 적용 방식 |
+| --- | --- |
+| 세션 브라우저 | 컨텍스트 route 가드. 리다이렉트·iframe·XHR 등 **모든 요청**을 검사하고, 사용자 route 등록 후 재설치되어 항상 먼저 평가됩니다 |
+| 스크립트 실행 | 실행별 **루프백 전용 프록시**. 생성된 Playwright config 의 `proxy` 로 주입되며, 허용되지 않은 호스트에는 `403` 을 반환합니다 |
+
+실행 프로세스는 서버와 별개이므로 route 가드를 쓸 수 없습니다. 대신 실행마다 `127.0.0.1` 에만 바인딩된 프록시를 띄우고 브라우저를 그쪽으로 보냅니다. Chromium 전용 플래그 대신 프록시를 쓴 이유는 firefox·webkit 에도 동일하게 적용되고, 차단된 요청을 **어느 실행이 시도했는지** 귀속할 수 있기 때문입니다.
+
+루프백(`localhost`, `127.0.0.1`, `::1`)은 항상 허용됩니다. 내장 데모 페이지와 로컬 대상이 막히면 정책 자체를 쓸 수 없기 때문입니다.
+
+차단 내역은 실행 레코드에 남습니다.
+
+```json
+"network": {
+  "allowlist": ["allowed.example"],
+  "enforced": true,
+  "allowedRequests": 12,
+  "blockedRequests": 1,
+  "blocked": [{ "ts": "...", "method": "GET", "host": "blocked.example" }]
+}
+```
+
+### 업무별 허용 목적지
+
+실행 요청에 `urlAllowlist` 를 주면 그 실행만 더 좁게 제한할 수 있습니다. **넓힐 수는 없습니다** — 서버 정책이 허용하지 않는 항목은 무시되고 `network.rejectedAllowlistEntries` 에 보고됩니다.
+
+```jsonc
+// URL_ALLOWLIST=allowed.example 인 서버에서
+{ "scriptKey": "smoke", "urlAllowlist": ["evil.example", "allowed.example"] }
+// → network.allowlist: ["allowed.example"]
+// → network.rejectedAllowlistEntries: ["evil.example"]
+```
+
+### 실행 시간 상한
+
+`RUN_TIMEOUT_MS`(기본 30분)를 넘긴 실행은 `SIGKILL` 로 종료되고 `failed` 로 기록됩니다. 대기열이 있는 구조에서 멈춘 실행이 슬롯을 영구히 점유하지 못하게 하기 위한 것입니다. `interruptedReason` 에 사유가 남습니다.
 
 ## 실행 이력과 대기열
 
@@ -360,7 +403,7 @@ GET /api/runs/{runId}/artifacts/{relativePath}
 
 - `400 INVALID_REQUEST`, `400 INVALID_JSON`, `400 INVALID_LOCATOR`, `400 PATH_OUTSIDE_ROOT`
 - `401 UNAUTHORIZED`
-- `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`
+- `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`, `403 SCRIPTS_DIR_NOT_WRITABLE`
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
 - `409 SESSION_DISCONNECTED`, `409 TRACE_NOT_STARTED`, `409 SCRIPT_ALREADY_EXISTS`
@@ -371,7 +414,7 @@ GET /api/runs/{runId}/artifacts/{relativePath}
 - `proxy` 를 context 수준에서 동적으로 바꾸는 기능은 이번 구현에 포함하지 않았습니다.
 - `storage-state/import` 는 컨텍스트를 새로 만들기 때문에 기존 페이지가 닫힙니다. 응답의 `replacedPages` 에 닫힌 page id 가 담기며, 이후 `pages` 를 다시 생성해야 합니다.
 - `sessions/{id}/execute` 는 배치 전체가 하나의 세션 락 안에서 실행되므로 중간에 다른 요청이 끼어들지 않습니다. `continueOnError: true` 를 주면 실패한 단계 이후도 계속 진행하고 단계별 결과를 모두 반환합니다.
-- `URL_ALLOWLIST` 는 세션 브라우저의 **모든 요청**에 적용됩니다(리다이렉트·iframe·XHR 포함). 다만 `POST /api/runs` 로 실행되는 스크립트는 별도 프로세스이므로 이 정책이 적용되지 않습니다. 실행 격리는 다음 단계 과제입니다.
+- `URL_ALLOWLIST` 는 세션 브라우저와 스크립트 실행 **양쪽 모두**에 적용됩니다. 자세한 내용은 [네트워크 정책](#네트워크-정책) 을 보세요.
 - `page.evaluate` 의 `expression` 은 `"() => document.title"` 같은 함수 형태와 `"1 + 2"` 같은 단순 식을 모두 지원하며, 함수인 경우 `arg` 가 인자로 전달됩니다.
 - MCP는 Streamable HTTP 규격의 POST/DELETE 중심으로 구현했고, GET 기반 SSE stream 은 아직 비활성화했습니다.
 - 브라우저 세션은 메모리에 유지됩니다. 컨테이너 재시작 시 세션은 사라지지만, 실행 이력과 증적은 `RUNS_DIR` 에 남아 계속 조회할 수 있습니다.

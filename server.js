@@ -4,6 +4,8 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import http from "node:http";
+import net from "node:net";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
@@ -27,7 +29,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.5.1",
+  serviceVersion: process.env.SERVICE_VERSION || "0.6.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -47,6 +49,8 @@ const config = {
   maxPagesPerSession: parseInteger(process.env.MAX_PAGES_PER_SESSION, 10),
   maxConcurrentRuns: parseInteger(process.env.MAX_CONCURRENT_RUNS, 4),
   maxQueuedRuns: parseInteger(process.env.MAX_QUEUED_RUNS, 100),
+  runTimeoutMs: parseInteger(process.env.RUN_TIMEOUT_MS, 30 * 60 * 1000),
+  maxBlockedRequestLogEntries: parseInteger(process.env.MAX_BLOCKED_REQUEST_LOG_ENTRIES, 100),
   maxRetainedRuns: parseInteger(process.env.MAX_RETAINED_RUNS, 50),
   requeueInterruptedRuns: parseBoolean(process.env.REQUEUE_INTERRUPTED_RUNS, false),
   mcpSessionTtlMs: parseInteger(process.env.MCP_SESSION_TTL_MS, 60 * 60 * 1000),
@@ -242,6 +246,67 @@ function resolveWithin(baseDir, reference, label = "path") {
   }
 
   return target;
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"]);
+
+function matchesHostPattern(hostname, pattern) {
+  const host = String(hostname || "").toLowerCase();
+  const normalized = String(pattern || "").toLowerCase().trim();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === "*") {
+    return true;
+  }
+  if (normalized.startsWith("*.")) {
+    const suffix = normalized.slice(2);
+    return host === suffix || host.endsWith(`.${suffix}`);
+  }
+
+  return host === normalized;
+}
+
+// An empty allowlist means "no policy configured", which allows everything.
+// Loopback is always permitted: the server's own demo page lives there, and
+// blocking it would make the allowlist unusable for local targets.
+function isAllowedHost(hostname, allowlist) {
+  if (!allowlist?.length) {
+    return true;
+  }
+  if (LOOPBACK_HOSTS.has(String(hostname || "").toLowerCase())) {
+    return true;
+  }
+
+  return allowlist.some((entry) => matchesHostPattern(hostname, entry));
+}
+
+// A per-run allowlist may only narrow the configured one; otherwise a caller
+// could widen its own network reach past what the operator permitted.
+function narrowAllowlist(globalAllowlist, requested) {
+  if (!Array.isArray(requested) || !requested.length) {
+    return { allowlist: globalAllowlist, rejected: [] };
+  }
+
+  const cleaned = requested.map((entry) => String(entry).toLowerCase().trim()).filter(Boolean);
+  if (!globalAllowlist?.length) {
+    return { allowlist: cleaned, rejected: [] };
+  }
+
+  const allowlist = [];
+  const rejected = [];
+  for (const entry of cleaned) {
+    // Test the pattern's own host form against the operator policy, so
+    // "*.evil.com" cannot slip past an allowlist of "example.com".
+    const probe = entry.startsWith("*.") ? entry.slice(2) : entry;
+    if (entry !== "*" && globalAllowlist.some((allowed) => matchesHostPattern(probe, allowed))) {
+      allowlist.push(entry);
+    } else {
+      rejected.push(entry);
+    }
+  }
+
+  return { allowlist: allowlist.length ? allowlist : globalAllowlist, rejected };
 }
 
 const SCRIPT_EXTENSION_PATTERN = /\.(spec|test|pw)\.(js|mjs|cjs|ts|mts|cts)$/i;
@@ -557,7 +622,7 @@ async function collectFilesWithMetadata(baseDir) {
   return results.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-function renderPlaywrightConfig({ scriptsDir, outputDir, htmlReportDir, jsonReportPath }) {
+function renderPlaywrightConfig({ scriptsDir, outputDir, htmlReportDir, jsonReportPath, proxyUrl }) {
   return `import { createRequire } from "node:module";
 
 const require = createRequire(${JSON.stringify(serverModuleAnchorUrl)});
@@ -595,7 +660,12 @@ export default defineConfig({
     video,
     screenshot,
     storageState,
-  },
+${proxyUrl ? `    // URL_ALLOWLIST is enforced by a loopback proxy owned by the server.
+    // Set at launch as well as context level because Firefox only honours a
+    // proxy given at browser launch. Loopback bypasses it.
+    proxy: ${JSON.stringify({ server: proxyUrl, bypass: "localhost,127.0.0.1,::1" })},
+    launchOptions: { proxy: ${JSON.stringify({ server: proxyUrl, bypass: "localhost,127.0.0.1,::1" })} },
+` : ""}  },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"], browserName: "chromium" } },
     { name: "firefox", use: { ...devices["Desktop Firefox"], browserName: "firefox" } },
@@ -620,6 +690,138 @@ const RUN_INTERNAL_FILES = new Set([RUN_RECORD_FILE, RUN_LOG_FILE]);
 
 function isRunEvidence(relativePath) {
   return !RUN_INTERNAL_FILES.has(relativePath);
+}
+
+// URL_ALLOWLIST was only enforced on session browsers. A script run is a separate
+// process, so nothing stopped it reaching any host - the one security asymmetry
+// left after v0.3.0. Each run now gets its own loopback-only proxy that the run's
+// browser is pointed at, which works for all three engines (a Chromium-specific
+// flag would not) and attributes every blocked request to the run that made it.
+class RunNetworkGuard {
+  constructor({ allowlist, maxBlockedEntries = 100 }) {
+    this.allowlist = allowlist;
+    this.maxBlockedEntries = maxBlockedEntries;
+    this.blocked = [];
+    this.blockedCount = 0;
+    this.allowedCount = 0;
+    this.server = null;
+    this.sockets = new Set();
+  }
+
+  recordBlocked(method, host) {
+    this.blockedCount += 1;
+    if (this.blocked.length < this.maxBlockedEntries) {
+      this.blocked.push({ ts: toIso(), method, host });
+    }
+  }
+
+  track(socket) {
+    this.sockets.add(socket);
+    socket.on("close", () => this.sockets.delete(socket));
+  }
+
+  async start() {
+    this.server = http.createServer((req, res) => {
+      // Proxied plain HTTP arrives as an absolute-form request URI.
+      let hostname;
+      try {
+        hostname = new URL(req.url).hostname;
+      } catch {
+        res.writeHead(400, { "content-type": "text/plain" }).end("malformed proxy request");
+        return;
+      }
+
+      if (!isAllowedHost(hostname, this.allowlist)) {
+        this.recordBlocked(req.method || "GET", hostname);
+        res.writeHead(403, { "content-type": "text/plain" })
+          .end(`playwright-player: ${hostname} is not in URL_ALLOWLIST`);
+        return;
+      }
+
+      this.allowedCount += 1;
+      const target = new URL(req.url);
+      const upstream = http.request({
+        host: target.hostname,
+        port: target.port || 80,
+        method: req.method,
+        path: `${target.pathname}${target.search}`,
+        headers: req.headers,
+      }, (upstreamRes) => {
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      });
+      upstream.on("error", () => {
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "text/plain" }).end("upstream error");
+        } else {
+          res.end();
+        }
+      });
+      req.pipe(upstream);
+    });
+
+    this.server.on("connect", (req, socket, head) => {
+      this.track(socket);
+      const [rawHost, rawPort] = String(req.url || "").split(":");
+      const hostname = rawHost?.replace(/^\[|\]$/g, "");
+      if (!hostname || !isAllowedHost(hostname, this.allowlist)) {
+        this.recordBlocked("CONNECT", hostname || "unknown");
+        socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        return;
+      }
+
+      this.allowedCount += 1;
+      const upstream = net.connect(Number(rawPort) || 443, hostname, () => {
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head?.length) {
+          upstream.write(head);
+        }
+        upstream.pipe(socket);
+        socket.pipe(upstream);
+      });
+      this.track(upstream);
+      upstream.on("error", () => socket.destroy());
+      socket.on("error", () => upstream.destroy());
+    });
+
+    this.server.on("clientError", (error, socket) => {
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    });
+
+    // Loopback only: nothing outside this container can use the proxy.
+    await new Promise((resolve, reject) => {
+      this.server.once("error", reject);
+      this.server.listen(0, "127.0.0.1", resolve);
+    });
+
+    return this.proxyUrl;
+  }
+
+  get proxyUrl() {
+    const address = this.server?.address();
+    return address ? `http://127.0.0.1:${address.port}` : null;
+  }
+
+  summary() {
+    return {
+      allowlist: this.allowlist,
+      proxyUrl: this.proxyUrl,
+      allowedRequests: this.allowedCount,
+      blockedRequests: this.blockedCount,
+      blocked: this.blocked,
+    };
+  }
+
+  async stop() {
+    for (const socket of this.sockets) {
+      socket.destroy();
+    }
+    this.sockets.clear();
+    if (this.server) {
+      await new Promise((resolve) => this.server.close(resolve));
+      this.server = null;
+    }
+  }
 }
 
 class RunManager {
@@ -674,6 +876,7 @@ class RunManager {
       interruptedReason: run.interruptedReason,
       request: run.request,
       script: run.script,
+      network: run.network,
       paths: run.paths,
       summary: run.summary,
       tests: run.tests,
@@ -837,6 +1040,7 @@ class RunManager {
       interruptedReason: run.interruptedReason ?? null,
       request: run.request,
       script: run.script ?? null,
+      network: run.network ?? null,
       paths: run.paths,
       logCount: run.logCount ?? run.logs.length,
       artifactCount: run.artifacts.length,
@@ -1010,6 +1214,7 @@ class RunManager {
       );
     }
 
+    const policy = narrowAllowlist(this.options.urlAllowlist, request.urlAllowlist);
     const runId = createId("run");
     const runDir = this.runDir(runId);
     await ensureDir(runDir);
@@ -1024,6 +1229,11 @@ class RunManager {
       request,
       script: pinnedScript,
       status: "queued",
+      network: {
+        allowlist: policy.allowlist,
+        rejectedAllowlistEntries: policy.rejected,
+        enforced: policy.allowlist.length > 0,
+      },
       priority: Number.isFinite(Number(request.priority)) ? Number(request.priority) : 0,
       attempt: meta.attempt ?? 1,
       retryOf: meta.retryOf ?? null,
@@ -1118,6 +1328,19 @@ class RunManager {
 
     await ensureDir(runDir);
     await ensureDir(outputDir);
+
+    // The guard has to be listening before the browser launches.
+    let proxyUrl = null;
+    if (run.network?.allowlist?.length) {
+      run.guard = new RunNetworkGuard({
+        allowlist: run.network.allowlist,
+        maxBlockedEntries: this.options.maxBlockedRequestLogEntries,
+      });
+      proxyUrl = await run.guard.start();
+      run.network.proxyUrl = proxyUrl;
+      console.log(`[run] ${runId} network policy active on ${proxyUrl} (${run.network.allowlist.join(", ")})`);
+    }
+
     await fsPromises.writeFile(
       configPath,
       renderPlaywrightConfig({
@@ -1125,6 +1348,7 @@ class RunManager {
         outputDir,
         htmlReportDir,
         jsonReportPath,
+        proxyUrl,
       }),
       "utf8",
     );
@@ -1173,6 +1397,23 @@ class RunManager {
 
     run.startedAt = toIso();
     run.pid = child.pid;
+
+    // A hung run would otherwise hold a queue slot forever.
+    if (this.options.runTimeoutMs > 0) {
+      run.timeoutTimer = setTimeout(() => {
+        if (run.process !== child) {
+          return;
+        }
+        run.timedOut = true;
+        this.appendLog(
+          run,
+          "stderr",
+          Buffer.from(`playwright-player: run exceeded RUN_TIMEOUT_MS (${this.options.runTimeoutMs}ms) and was killed`, "utf8"),
+        );
+        child.kill("SIGKILL");
+      }, this.options.runTimeoutMs);
+      run.timeoutTimer.unref?.();
+    }
     run.paths = {
       runDir,
       configPath,
@@ -1198,12 +1439,17 @@ class RunManager {
       this.drain();
     });
     child.on("close", (code, signal) => {
+      clearTimeout(run.timeoutTimer);
+      run.timeoutTimer = null;
       run.exitCode = code;
       run.signal = signal;
       run.endedAt = toIso();
       run.process = null;
       if (run.cancelRequested) {
         run.status = "cancelled";
+      } else if (run.timedOut) {
+        run.status = "failed";
+        run.interruptedReason = `exceeded RUN_TIMEOUT_MS (${this.options.runTimeoutMs}ms)`;
       } else if (code === 0) {
         run.status = "completed";
       } else {
@@ -1213,6 +1459,12 @@ class RunManager {
       // This callback is not awaited by anyone, so a rejection here would take
       // the whole process down as an unhandled rejection.
       (async () => {
+        if (run.guard) {
+          // Keep the counters and the blocked list; drop the listener.
+          run.network = { ...run.network, ...run.guard.summary() };
+          await run.guard.stop();
+          run.guard = null;
+        }
         run.summary = await this.buildSummary(run);
         run.tests = await this.extractTestResults(run);
         run.artifacts = (await collectFilesWithMetadata(run.paths.runDir))
@@ -1554,6 +1806,11 @@ class RunManager {
 
   async killAll() {
     for (const run of this.runs.values()) {
+      clearTimeout(run.timeoutTimer);
+      if (run.guard) {
+        await run.guard.stop().catch(() => undefined);
+        run.guard = null;
+      }
       if (run.process) {
         run.process.kill("SIGKILL");
         run.status = "interrupted";
@@ -2478,37 +2735,18 @@ class SessionManager {
     }
   }
 
+  // Shares isAllowedHost with the run network guard so a session and a script
+  // run cannot disagree about what the policy permits.
   isAllowedUrl(url) {
-    const allowlist = this.options.urlAllowlist;
-    if (!allowlist.length) {
+    if (!this.options.urlAllowlist.length) {
       return true;
     }
 
-    let parsed;
     try {
-      parsed = new URL(url);
+      return isAllowedHost(new URL(url).hostname, this.options.urlAllowlist);
     } catch {
       return false;
     }
-
-    // Loopback is where the built-in demo page lives; blocking it would make the
-    // allowlist unusable with the server's own pages.
-    const hostname = parsed.hostname.toLowerCase();
-    if (["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname)) {
-      return true;
-    }
-
-    return allowlist.some((entry) => {
-      const normalized = entry.toLowerCase();
-      if (normalized === "*") {
-        return true;
-      }
-      if (normalized.startsWith("*.")) {
-        const suffix = normalized.slice(2);
-        return hostname === suffix || hostname.endsWith(`.${suffix}`);
-      }
-      return hostname === normalized;
-    });
   }
 
   assertAllowedUrl(url) {
@@ -4726,6 +4964,13 @@ function buildOpenApiSpec(req) {
             video: { type: "string", example: "retain-on-failure" },
             storageStateRef: { type: "string", example: "auth/customer.json" },
             shard: { type: "string", example: "1/3" },
+            priority: { type: "integer", default: 0, description: "Higher priority runs ahead of what is already queued" },
+            urlAllowlist: {
+              type: "array",
+              items: { type: "string" },
+              example: ["*.staging.example.com"],
+              description: "Narrow this run's network policy. It can only restrict URL_ALLOWLIST, never widen it.",
+            },
             variables: { type: "object", additionalProperties: true },
           },
         },
@@ -6591,6 +6836,7 @@ app.get("/health", asyncRoute(async (req, res) => {
       maxConcurrentRuns: config.maxConcurrentRuns,
       maxQueuedRuns: config.maxQueuedRuns,
       maxRetainedRuns: config.maxRetainedRuns,
+      runTimeoutMs: config.runTimeoutMs,
     },
     features: {
       evaluate: config.enableEvaluate,
@@ -6598,6 +6844,10 @@ app.get("/health", asyncRoute(async (req, res) => {
       failureArtifacts: config.captureFailureArtifacts,
       persistentRunHistory: true,
       urlAllowlist: config.urlAllowlist,
+      urlAllowlistCoverage: config.urlAllowlist.length
+        ? ["sessions", "runs"]
+        : [],
+      runTimeoutMs: config.runTimeoutMs,
     },
   });
 }));
@@ -7104,6 +7354,11 @@ const mcpTools = [
         shard: { type: "string", example: "1/3" },
         timeoutMs: { type: "integer" },
         priority: { type: "integer", default: 0, description: "Higher runs first" },
+        urlAllowlist: {
+          type: "array",
+          items: { type: "string" },
+          description: "Narrow this run's network policy, e.g. [\"*.staging.example.com\"]. It can only restrict URL_ALLOWLIST, never widen it; entries the server policy does not permit are reported in network.rejectedAllowlistEntries.",
+        },
         variables: { type: "object", additionalProperties: true },
       },
       required: ["scriptKey"],
