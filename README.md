@@ -64,6 +64,8 @@ npx playwright install chromium
 node server.js
 ```
 
+릴리즈 절차와 이미지 검증 항목은 [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) 에 있습니다.
+
 ### 스모크 테스트
 
 서버를 임시 포트와 임시 데이터 디렉터리로 띄워 REST, MCP, 실제 브라우저 세션까지 한 번에 검증합니다.

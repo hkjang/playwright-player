@@ -33,7 +33,11 @@ if [ "$(id -u)" = "0" ]; then
     echo "note: $scripts_dir is not writable by $APP_USER (uid $APP_UID); reading scripts works, uploading them will not." >&2
   fi
 
-  exec setpriv --reuid="$APP_USER" --regid="$APP_USER" --init-groups "$@"
+  # runuser, not setpriv: dropping privileges with setpriv made Chromium die at
+  # launch with a crashpad error and SIGTRAP, which broke every browser session
+  # in the container while script runs kept working. runuser keeps one root
+  # parent process but forwards signals, so graceful shutdown still works.
+  exec runuser -u "$APP_USER" -- "$@"
 fi
 
 exec "$@"

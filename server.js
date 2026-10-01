@@ -29,7 +29,7 @@ const documentationPaths = {
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.7.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.7.1",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
