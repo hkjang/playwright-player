@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="{{config.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{copy.title}}</title>
+  <link rel="stylesheet" href="{{config.uiAssetsPath}}/runs.css">
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="hero-header">
+        <div>
+          <h1>{{copy.heroTitle}}</h1>
+          <p>{{copy.heroBody}}</p>
+        </div>
+        {{raw.languageSwitcher}}
+      </div>
+      <nav>
+        <a class="secondary" href="{{config.playgroundPath}}">{{copy.openPlayground}}</a>
+        <a class="secondary" href="{{config.docsPath}}">{{copy.openDocs}}</a>
+      </nav>
+      <label class="token">{{copy.apiTokenLabel}}
+        <input id="apiToken" type="password" autocomplete="off" placeholder="{{copy.apiTokenPlaceholder}}">
+      </label>
+      <div id="statusBox" class="status" hidden></div>
+    </section>
+
+    <section class="panel" id="listView">
+      <div class="panel-header">
+        <h2>{{copy.listTitle}}</h2>
+        <div class="row">
+          <label class="inline">{{copy.filterLabel}}
+            <select id="statusFilter">
+              <option value="">{{copy.filterAll}}</option>
+              <option value="queued">queued</option>
+              <option value="running">running</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+              <option value="interrupted">interrupted</option>
+            </select>
+          </label>
+          <button type="button" id="refreshBtn" class="secondary">{{copy.refresh}}</button>
+        </div>
+      </div>
+      <p id="queueSummary" class="muted"></p>
+      <div id="runList"></div>
+    </section>
+
+    <section class="panel" id="detailView" hidden>
+      <div class="panel-header">
+        <h2>{{copy.detailTitle}}</h2>
+        <div class="row">
+          <button type="button" id="backBtn" class="secondary">{{copy.backToList}}</button>
+          <button type="button" id="retryBtn">{{copy.retry}}</button>
+          <button type="button" id="cancelBtn" class="secondary">{{copy.cancel}}</button>
+          <button type="button" id="deleteBtn" class="warn">{{copy.delete}}</button>
+        </div>
+      </div>
+      <div id="detailBody"></div>
+    </section>
+  </main>
+
+  <script>
+    // Server-provided values for runs.js, which is served statically and
+    // therefore cannot carry template placeholders itself.
+    window.__PW_PLAYER__ = { clientConfig: {{json.clientConfig}} };
+  </script>
+  <script src="{{config.uiAssetsPath}}/common.js" defer></script>
+  <script src="{{config.uiAssetsPath}}/runs.js" defer></script>
+</body>
+</html>

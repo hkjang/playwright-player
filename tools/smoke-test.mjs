@@ -1868,7 +1868,7 @@ async function run() {
     // the only coverage they ever had, which would not notice a page that renders
     // but no longer works. This drives them with the server's own session API.
     await check("the built-in pages still work after being served from public/", async () => {
-      for (const [label, pagePath] of [["home", "/?lang=en"], ["demo", "/demo/test-page?lang=ko"], ["playground", "/playground?lang=ko"]]) {
+      for (const [label, pagePath] of [["home", "/?lang=en"], ["demo", "/demo/test-page?lang=ko"], ["playground", "/playground?lang=ko"], ["runs", "/runs?lang=ko"], ["runs-en", "/runs?lang=en"]]) {
         const response = await fetch(`${baseUrl}${pagePath}`);
         assert(response.ok, `${label} returned ${response.status}`);
         const body = await response.text();
@@ -1876,7 +1876,7 @@ async function run() {
         assert(!/UI_TEMPLATE/.test(body), `${label} failed to render: ${body.slice(0, 200)}`);
       }
 
-      for (const asset of ["home.css", "playground.css", "playground.js", "demo.css", "demo.js", "docs.css", "docs.js"]) {
+      for (const asset of ["common.js", "home.css", "playground.css", "playground.js", "demo.css", "demo.js", "docs.css", "docs.js", "runs.css", "runs.js"]) {
         const response = await fetch(`${baseUrl}/ui/${asset}`);
         assert(response.ok, `/ui/${asset} returned ${response.status}`);
         const body = await response.text();
@@ -1915,6 +1915,101 @@ async function run() {
       });
       assert(result.status === 200, "the playground's own API call did not populate the result box");
       assert(pageErrors.length === 0, pageErrors.join("; "));
+    });
+
+    // The run history page consumes the timeline API added in v0.7.1. Asserting
+    // it returns 200 would not notice a page that renders an empty timeline.
+    await check("the run history page renders a real timeline from a real run", async () => {
+      await call("PUT", "/api/scripts/ui-timeline", {
+        content: [
+          'import { test, expect } from "@playwright/test";',
+          "",
+          'test("fails on the last assertion", async ({ page }) => {',
+          `  await page.goto("${baseUrl}/demo/test-page");`,
+          '  await page.getByTestId("message-input").fill("ui");',
+          '  await page.getByTestId("send-message").click();',
+          '  await expect(page.getByTestId("status")).toContainText("will not match", { timeout: 1500 });',
+          "});",
+          "",
+        ].join("\n"),
+      });
+      const created = await call("POST", "/api/runs", { scriptKey: "ui-timeline", project: "chromium" });
+      const runId = created.payload.data.runId;
+      await waitForRuns([runId]);
+
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: `${baseUrl}/runs?lang=ko&runId=${runId}`,
+      });
+
+      // This harness runs with API_TOKEN set, so the page's own calls are 401
+      // until its token field is filled — which is what an operator would do.
+      // The page fetches asynchronously, so this has to wait rather than read
+      // the status box the instant the navigation returns.
+      const unauthorised = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/assert/text`, {
+        locator: { css: "#statusBox" },
+        expected: "/token|토큰/i",
+        timeoutMs: 15000,
+      });
+      assert(unauthorised.status === 200,
+        `the page never said a token was required: ${JSON.stringify(unauthorised.payload.error)}`);
+
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/fill`, {
+        locator: { css: "#apiToken" },
+        value: token,
+      });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, { locator: { css: "#refreshBtn" } });
+
+      // `first` because the page renders many .step rows and an ambiguous
+      // locator is rejected on purpose.
+      const rendered = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, {
+        locator: { css: ".step", first: true },
+        timeoutMs: 20000,
+      });
+      assert(rendered.status === 200, "the timeline never rendered any steps");
+
+      const summary = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/evaluate`, {
+        expression: `() => ({
+          steps: document.querySelectorAll(".step").length,
+          failed: document.querySelectorAll(".step.is-failed").length,
+          errorShown: (document.querySelector(".step-error")?.textContent || "").length,
+          evidence: document.querySelectorAll(".evidence figure").length,
+          slowest: document.querySelectorAll(".chip").length,
+          placeholders: document.body.innerHTML.includes("{{"),
+        })`,
+      });
+      const data = summary.payload.data.result;
+      assert(data.steps > 3, `only ${data.steps} steps rendered`);
+      // The whole point is pinpointing the failure, not just showing a duration.
+      assert(data.failed === 1, `${data.failed} steps marked as failing`);
+      assert(data.errorShown > 20, "the failing step's error was not shown");
+      assert(data.evidence > 0, "no evidence linked to the run");
+      assert(data.slowest > 0, "no slowest-step summary");
+      assert(data.placeholders === false, "the page rendered an unsubstituted placeholder");
+
+      // Waiting for a locator that matches many elements used to surface
+      // Playwright's "strict mode violation", which says nothing about the fix.
+      const ambiguous = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, {
+        locator: { css: ".step" },
+        timeoutMs: 5000,
+      });
+      assert(ambiguous.status === 400, `expected 400, got ${ambiguous.status}`);
+      assert(ambiguous.payload.error.code === "AMBIGUOUS_LOCATOR", ambiguous.payload.error.code);
+      assert(ambiguous.payload.error.details.matchCount > 1, JSON.stringify(ambiguous.payload.error.details));
+      assert(/first, last, or nth/.test(ambiguous.payload.error.message), ambiguous.payload.error.message);
+
+      // Logs are behind a toggle so the page does not fetch them unprompted.
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, {
+        locator: { testId: "log-toggle" },
+      });
+      const logs = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, {
+        locator: { css: "#logBox" },
+        state: "visible",
+        timeoutMs: 15000,
+      });
+      assert(logs.status === 200, "the log panel never opened");
+
+      await call("DELETE", `/api/runs/${runId}`);
+      await call("DELETE", "/api/scripts/ui-timeline");
     });
 
     await check("stopping a trace that never started is a 409", async () => {

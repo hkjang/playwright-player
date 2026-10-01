@@ -40,7 +40,8 @@ docker run -d --name ppcheck --init --ipc=host -p 3000:3000 \
 | `docker kill` 후 **새 컨테이너**로 이력·증적 조회 | 영속성의 목적 |
 | `docker inspect --format '{{.State.Health.Status}}'` → `healthy` | HEALTHCHECK |
 | `docker stop` 이 10초 안에 끝나고 graceful shutdown 로그가 남는지 | 신호 전달. 권한 축소 방식을 바꾸면 깨질 수 있습니다 |
-| 내장 페이지 4개(`/`, `/playground`, `/demo/test-page`, `/docs`)와 `/ui/*` 자산이 200 인지 | 페이지는 `public/` 에서 읽습니다. 이미지에 디렉터리를 넣지 않으면 `500 UI_TEMPLATE_MISSING` 이 납니다 |
+| 내장 페이지 5개(`/`, `/playground`, `/runs`, `/demo/test-page`, `/docs`)와 `/ui/*` 자산이 200 인지 | 페이지는 `public/` 에서 읽습니다. 이미지에 디렉터리를 넣지 않으면 `500 UI_TEMPLATE_MISSING` 이 납니다 |
+| 렌더된 페이지에 `{{` 가 남아 있지 않은지 | 치환되지 않은 플레이스홀더는 빈 화면이나 깨진 스크립트로 나타납니다 |
 
 ## 4. 패키징
 

@@ -24,12 +24,13 @@ const documentationPaths = {
   openApi: "/openapi.json",
   docs: "/docs",
   playground: "/playground",
+  runs: "/runs",
   swaggerAssets: "/swagger-ui",
 };
 
 const config = {
   serviceName: process.env.SERVICE_NAME || "playwright-player",
-  serviceVersion: process.env.SERVICE_VERSION || "0.9.0",
+  serviceVersion: process.env.SERVICE_VERSION || "0.10.0",
   host: process.env.HOST || "0.0.0.0",
   port: parseInteger(process.env.PORT, 3000),
   apiBasePath: process.env.API_BASE_PATH || "/api",
@@ -2335,7 +2336,7 @@ class ScriptAssistant {
       },
       examplesAvailable: true,
       authoringLocales: ["ko", "en"],
-      browserLanguageAwarePages: ["/", documentationPaths.playground, "/demo/test-page"],
+      browserLanguageAwarePages: ["/", documentationPaths.playground, documentationPaths.runs, "/demo/test-page"],
       stableDemoTestIds: ["primary-action", "status", "message-input", "send-message", "profile-result", "counter-value"],
     };
   }
@@ -4194,6 +4195,25 @@ class SessionManager {
         // re-deriving which artifacts belong to which step.
         artifactIds: Object.values(artifacts).map((artifact) => artifact?.artifactId).filter(Boolean),
       });
+      // Playwright's own wording for this is "strict mode violation", which says
+      // nothing about the fix. The locator is ambiguous; the caller needs to
+      // narrow it or say which match they meant.
+      const ambiguous = /strict mode violation/i.test(error?.message || "");
+      if (ambiguous) {
+        const matched = /resolved to (\d+) element/i.exec(error.message)?.[1];
+        throw new ApiError(
+          400,
+          "AMBIGUOUS_LOCATOR",
+          `The locator matches ${matched || "several"} elements. Narrow it, or add first, last, or nth to say which one you mean.`,
+          {
+            sessionId: session.sessionId,
+            pageId,
+            locator: input?.locator ?? input?.source ?? null,
+            matchCount: matched ? Number(matched) : undefined,
+          },
+        );
+      }
+
       // A Playwright timeout is a failed expectation, not a server fault.
       const isTimeout = error?.name === "TimeoutError" || /Timeout \d+ms exceeded/.test(error?.message || "");
       throw toApiError(error, {
@@ -5391,7 +5411,7 @@ const uiTemplates = new Map();
 const uiCopy = new Map();
 
 async function loadUiAssets() {
-  for (const name of ["home", "playground", "demo", "docs"]) {
+  for (const name of ["home", "playground", "demo", "docs", "runs"]) {
     uiTemplates.set(name, await fsPromises.readFile(path.join(uiDir, `${name}.html`), "utf8"));
   }
   for (const language of ["ko", "en"]) {
@@ -5465,6 +5485,7 @@ function uiConfig(language) {
     swaggerAssetsPath: documentationPaths.swaggerAssets,
     docsPath: appendLanguageParam(documentationPaths.docs, language),
     playgroundPath: appendLanguageParam(documentationPaths.playground, language),
+    runsPath: appendLanguageParam(documentationPaths.runs, language),
     demoPath: appendLanguageParam("/demo/test-page", language),
   };
 }
@@ -5493,6 +5514,7 @@ function renderHomePage(req) {
   const entries = [
     { href: appendLanguageParam(documentationPaths.docs, language), label: copy.swaggerLabel, description: copy.swaggerDescription },
     { href: appendLanguageParam(documentationPaths.playground, language), label: copy.playgroundLabel, description: copy.playgroundDescription },
+    { href: appendLanguageParam(documentationPaths.runs, language), label: copy.runsLabel, description: copy.runsDescription },
     { href: appendLanguageParam("/demo/test-page", language), label: copy.demoLabel, description: copy.demoDescription },
     { href: documentationPaths.openApi, label: copy.openApiLabel, description: copy.openApiDescription },
     { href: "/health", label: copy.healthLabel, description: copy.healthDescription },
@@ -5538,6 +5560,23 @@ function renderPlaygroundPage(req) {
     config: clientConfig,
     json: { clientConfig },
     raw: { languageSwitcher: renderLanguageSwitcher(documentationPaths.playground, language) },
+  });
+}
+
+function renderRunsPage(req) {
+  const language = resolveRequestLanguage(req);
+  const copy = getPageCopy(language).runs;
+  const clientConfig = {
+    ...uiConfig(language),
+    authRequired: Boolean(config.apiToken),
+    copy,
+  };
+
+  return renderUiTemplate("runs", {
+    copy,
+    config: clientConfig,
+    json: { clientConfig },
+    raw: { languageSwitcher: renderLanguageSwitcher(documentationPaths.runs, language) },
   });
 }
 
@@ -5772,6 +5811,13 @@ function buildOpenApiSpec(req) {
           tags: ["Docs"],
           summary: "Interactive API playground",
           responses: { 200: { description: "Playground page" } },
+        },
+      },
+      [documentationPaths.runs]: {
+        get: {
+          tags: ["Docs"],
+          summary: "Run history and per-step timelines",
+          responses: { 200: { description: "Run history page" } },
         },
       },
       "/demo/test-page": {
@@ -6556,7 +6602,15 @@ app.use((req, res, next) => {
 
 // Optional shared-secret gate. The API can launch browsers and read files from
 // the configured directories, so any non-loopback deployment should set it.
-const publicPaths = new Set(["/health", "/", documentationPaths.docs, documentationPaths.openApi, documentationPaths.playground, "/demo/test-page"]);
+const publicPaths = new Set([
+  "/health",
+  "/",
+  documentationPaths.docs,
+  documentationPaths.openApi,
+  documentationPaths.playground,
+  documentationPaths.runs,
+  "/demo/test-page",
+]);
 app.use((req, res, next) => {
   if (!config.apiToken || publicPaths.has(req.path) || req.path.startsWith(documentationPaths.swaggerAssets)) {
     return next();
@@ -6586,6 +6640,10 @@ app.get(documentationPaths.docs, asyncRoute(async (req, res) => {
 
 app.get(documentationPaths.playground, asyncRoute(async (req, res) => {
   res.type("html").send(renderPlaygroundPage(req));
+}));
+
+app.get(documentationPaths.runs, asyncRoute(async (req, res) => {
+  res.type("html").send(renderRunsPage(req));
 }));
 
 app.get("/demo/test-page", asyncRoute(async (req, res) => {

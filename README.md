@@ -19,6 +19,7 @@
 - 실제 DOM 검증을 포함한 페이지 구조 분석 `page_inspect`
 - 단계별 소요시간·콘솔/네트워크 오류·증적을 연결한 실행 타임라인
 - API 응답·다운로드 파일 내용·처리번호까지 확인하는 업무 결과 검증
+- 실행 목록과 단계별 타임라인을 보여주는 `/runs` 화면
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -409,6 +410,18 @@ POST /api/sessions/{sessionId}/contexts/{contextId}/request
 
 **캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
 
+## 실행 이력 화면
+
+`/runs` 에서 실행 목록과 단계별 타임라인을 봅니다. 새 API 없이 기존 엔드포인트만 사용합니다.
+
+**목록** — 실행 ID, 스크립트, 상태, 소요시간, 시작 시각, 테스트 수와 실패 수. 상태 필터와 대기열 요약을 함께 표시합니다.
+
+**상세** (`/runs?runId=...`) — 상태, 스크립트 핀(sha256·크기), 시도 횟수, 종료 코드, 중단 사유, 네트워크 정책과 차단된 요청, 단계 타임라인, 증적, 로그, 그리고 다시 실행·취소·삭제.
+
+타임라인은 중첩 단계를 들여쓰기로 보여주고 소요시간을 막대로 표현합니다. **실패한 단계는 강조되고 바로 아래에 오류 메시지가 붙습니다.** 가장 느린 단계 3개를 함께 표시하므로 통과했지만 느린 실행도 바로 읽힙니다.
+
+스크린샷은 인라인으로 미리보기 됩니다. `API_TOKEN` 을 설정한 경우 `<img src>` 로는 헤더를 보낼 수 없으므로 인증 fetch 후 blob 으로 표시합니다. 페이지 상단의 API 토큰 칸을 채운 뒤 새로고침하면 됩니다 — 토큰은 메모리에만 두고 저장하지 않습니다.
+
 ## 실행 타임라인
 
 ### 스크립트 실행
@@ -509,6 +522,7 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 - `401 UNAUTHORIZED`
 - `403 EVALUATE_DISABLED`, `403 URL_NOT_ALLOWED`, `403 MCP_ORIGIN_DENIED`, `403 SCRIPTS_DIR_NOT_WRITABLE`
 - `404 SCRIPT_NOT_FOUND`, `404 SESSION_NOT_FOUND`, `404 PAGE_NOT_FOUND`, `404 NOT_FOUND`
+- `400 AMBIGUOUS_LOCATOR` — locator 가 여러 요소에 매칭됩니다. `first`/`last`/`nth` 를 붙이거나 더 구체적인 locator 를 쓰세요
 - `408 TIMEOUT` — assertion 또는 Playwright 타임아웃
 - `422 API_ASSERTION_FAILED`, `422 DOWNLOAD_ASSERTION_FAILED`, `422 VALUE_ASSERTION_FAILED`, `422 EMPTY_CAPTURED_VALUE`
 - `409 SESSION_DISCONNECTED`, `409 TRACE_NOT_STARTED`, `409 SCRIPT_ALREADY_EXISTS`
@@ -530,8 +544,8 @@ MCP 도구 `session_timeline` 으로도 같은 정보를 조회합니다.
 
 ```
 public/
-  home.html  playground.html  demo.html  docs.html   마크업 + {{...}} 플레이스홀더
-  assets/    *.css  *.js                             /ui/* 로 정적 서빙
+  home.html  playground.html  runs.html  demo.html  docs.html
+  assets/    *.css  *.js  common.js                  /ui/* 로 정적 서빙
   locales/   ko.json  en.json                        화면 문구
 ```
 
@@ -556,6 +570,8 @@ Docker 이미지에는 `public/` 이 포함되어야 합니다. 없으면 모든
   - 링크 허브 및 상태 진입점
 - `/playground`
   - 브라우저에서 직접 REST API를 호출하는 운영자용 플레이그라운드
+- `/runs`
+  - 실행 목록과 단계별 타임라인, 실패 원인과 증적
 - `/demo/test-page`
   - `data-testid`가 안정적으로 유지되는 로컬 데모 페이지
 
