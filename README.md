@@ -25,6 +25,7 @@
 - 조건 분기·반복·승인 대기를 지원하는 업무 흐름(`if`/`repeat`/`forEach`/`while`/`break`/`continue`/`approval`)
 - OpenAI 호환 로컬 LLM(vLLM 등)으로 실패 원인 가설 제시 — 진단만 하고 아무것도 고치지 않습니다
 - 이름 있는 신원·역할·업무 범위(`principals.json`) — 승인이 토큰에 귀속되고 감사 기록에 증명 여부가 남습니다
+- 시나리오 녹화와 단계 편집 — locator 고유성을 클릭 시점에 검증하고, 자격증명은 비밀정보 참조로 기록합니다
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -255,6 +256,7 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_PENDING_APPROVALS` | `50` | 동시에 승인을 기다릴 수 있는 워크플로 수. 초과 시 `429 APPROVAL_LIMIT_EXCEEDED` |
 | `MAX_SCRIPT_BUNDLE_FILES` | `50` | 스냅샷이 담을 수 있는 모듈 수 |
 | `MAX_SCRIPT_BUNDLE_BYTES` | `8388608` | 스냅샷 전체 크기 상한 |
+| `MAX_RECORDED_STEPS` | `300` | 한 세션이 녹화할 수 있는 단계 수. 넘으면 버리고 `droppedSteps` 로 보고합니다 |
 | `PRINCIPALS_FILE` | `SECRETS_DIR/principals.json` | 이름 있는 신원·역할 정의. 없으면 공유 `API_TOKEN` 이 이전과 같이 동작합니다. 명시 지정한 파일을 읽을 수 없으면 서버가 뜨지 않습니다 |
 | `LLM_BASE_URL` | 없음 | OpenAI 호환 chat completions base (예: `http://vllm:8000/v1`). 비우면 실패 분석이 `503 LLM_NOT_CONFIGURED` 를 반환합니다 |
 | `LLM_MODEL` | 없음 | 비우면 `/v1/models` 의 첫 모델을 사용합니다 |
@@ -575,6 +577,74 @@ POST /api/sessions/{sessionId}/contexts/{contextId}/request
 `saveAs` 는 단계 결과에서 값을 꺼내 저장하고, `savePath` 로 JSON 내부 경로를 지정할 수 있습니다. 실패는 `422` 와 함께 `failedStepIndex` 로 어느 단계가 깨졌는지 알려줍니다.
 
 **캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
+
+## 시나리오 녹화
+
+브라우저를 손으로 조작한 뒤 같은 시나리오를 다시 적는 것이 가장 느린 방법입니다. 녹화는 **실제로 한 일을** `execute` 가 그대로 재생할 수 있는 단계로 담습니다.
+
+```
+POST /api/sessions/{id}/recording/start    { "contextId": "ctx_..." }
+GET  /api/sessions/{id}/recording
+POST /api/sessions/{id}/recording/edit     { "operation": "delete|move|insert|replace|clear", ... }
+POST /api/sessions/{id}/recording/export   { "format": "execute" | "script" }
+POST /api/sessions/{id}/recording/stop
+```
+
+클릭, 입력 확정(`change`), `Enter`, `select` 를 담습니다. 재생이 어디서 시작해야 하는지 알아야 하므로 **현재 URL 이 첫 `goto` 단계로** 들어갑니다.
+
+### locator 가 문제의 전부입니다
+
+**떠오른 첫 선택자를 내보내는 녹화기는 다음 릴리즈에 깨지는 시나리오를 만듭니다.** 그래서 `page_inspect` 와 **같은 후보 순서와 같은 고유성 검증**을 씁니다 — 클릭한 **그 순간의 DOM** 에 대해 후보를 하나씩 세어보고 고유한 것을 고릅니다. DOM 이 그 사람이 조작한 것과 일치한다고 알려진 유일한 시점입니다.
+
+```jsonc
+// data-testid 가 있으면 그것부터
+{ "action": "click", "locator": { "testId": "send-message" } }
+
+// aria-label 만 있으면 label 로
+{ "action": "click", "locator": { "label": "Save profile" } }
+
+// 똑같은 버튼이 3개라면 — 텍스트로 구분할 수 없으므로 위치로 좁히고, 약하다고 말합니다
+{ "action": "click", "locator": { "role": "button", "name": "Duplicate", "nth": 1 },
+  "note": "narrowed to a positional index; it will break if the list order changes" }
+```
+
+고유하게 풀리지 않으면 **버리지 않고** 기록한 뒤 `ambiguous: true` 로 표시하고 경고에 올립니다. 사람이 보고 고칠 수 있는 단계가 조용히 사라진 단계보다 낫습니다. `ambiguousSteps` 는 내보낸 결과에도 함께 실려, 어디서 읽어도 보이게 합니다.
+
+### 자격증명은 시나리오에 들어가지 않습니다
+
+시나리오는 커밋됩니다. 그래서 비밀번호 필드나 `REDACT_VARIABLE_PATTERN` 에 걸리는 이름의 필드는 **값이 아니라 참조로** 기록됩니다.
+
+```jsonc
+{ "action": "fill", "locator": { "label": "Password" },
+  "value": "{{secret.PASSWORD}}", "maskedSecret": true }
+```
+
+경고도 함께 남습니다 — *supply it through SECRETS_DIR rather than in the scenario*. 실제 값은 녹화에도, **내보낸 Playwright 스크립트에도** 들어가지 않습니다. 실행 변수 마스킹과 **같은 패턴**을 쓰므로 한쪽이 가리는 필드를 다른 쪽이 평문으로 기록하는 일이 없습니다.
+
+### 편집은 서버에서
+
+녹화된 단계가 시나리오의 재료이므로, 잘못 눌린 클릭 하나를 지우는 일이 **브라우저 탭 하나에만 살아 있으면 안 됩니다.**
+
+```
+delete  index            잘못 눌린 단계 제거
+move    index, toIndex   순서 변경
+insert  index?, step     단언 추가
+replace index, step      단계 교체
+clear                    전부 비우기
+```
+
+**끼워 넣는 단계는 받아들이기 전에 컴파일합니다.** 실행할 수 없는 단언은 재생할 때가 아니라 **사람이 보고 있는 동안** 거부됩니다(`400`).
+
+`/playground` 의 **시나리오 녹화** 패널에서 단계 목록을 보고 순서를 바꾸거나 지울 수 있습니다. 고유하지 않은 locator 는 **배경색으로 구분**되고, 비밀정보로 대체된 값은 그 자리에 표시됩니다.
+
+### 내보내기
+
+- `format: "execute"` — `execute` 에 그대로 보낼 수 있는 단계 배열. 사람이 읽기 위해 녹화기가 붙인 `strategy`·`recordedAt`·`note` 같은 기록은 빠집니다
+- `format: "script"` — 기존 `assist_scaffold` 로 Playwright 스펙 파일 렌더링. `save: true` 는 레지스트리에 코드를 쓰는 일이므로 **admin** 이 필요합니다
+
+```
+MAX_RECORDED_STEPS=300    넘으면 버리고 droppedSteps 로 알려줍니다 (조용히 자르지 않습니다)
+```
 
 ## 신원과 권한
 
@@ -995,6 +1065,7 @@ Docker 이미지에는 `public/` 이 포함되어야 합니다. 없으면 모든
 - `/playground`
   - 브라우저에서 직접 REST API를 호출하는 운영자용 플레이그라운드
   - 승인 대기 중인 워크플로를 목록으로 보고 승인·반려할 수 있습니다
+  - 시나리오를 녹화하고 단계를 지우거나 순서를 바꿀 수 있습니다
 - `/runs`
   - 실행 목록과 단계별 타임라인, 실패 원인과 증적
 - `/demo/test-page`

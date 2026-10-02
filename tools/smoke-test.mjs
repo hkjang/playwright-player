@@ -685,7 +685,12 @@ async function runScheduleChecks() {
       // Sampled rather than measured once at the end: a fire is identified by
       // the minute it claimed, so two fires claiming the same minute is the
       // failure, whatever else happened in the window.
-      const firedMinutes = [schedule.payload.data.lastFiredMinute];
+      //
+      // Only transitions of lastTriggeredAt count, and the pre-window minute is
+      // deliberately not seeded. The tick writes lastFiredMinute *before* the
+      // run and triggerSchedule writes lastTriggeredAt *after* it, so pairing
+      // the two across that gap counts a single fire twice.
+      const firedMinutes = [];
       let lastTriggeredAt = schedule.payload.data.lastTriggeredAt;
       for (let tick = 0; tick < 14; tick += 1) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -3901,6 +3906,142 @@ async function run() {
       await call("DELETE", "/api/scripts/analysis-ui");
     });
 
+    await check("recording captures what was done and the result replays", async () => {
+      await gotoDemo();
+      const started = await call("POST", `/api/sessions/${sessionId}/recording/start`, { contextId });
+      assert(started.status === 200, `start returned ${started.status}: ${started.payload.error?.message}`);
+      // A replay needs somewhere to start, so the current URL is seeded.
+      assert(started.payload.data.recording.steps[0]?.action === "goto",
+        JSON.stringify(started.payload.data.recording.steps[0]));
+      assert((await call("POST", `/api/sessions/${sessionId}/recording/start`, { contextId })).status === 409,
+        "starting a second recording was allowed");
+
+      // Driven through the API, which is what a person's clicks look like to
+      // the page. Each status is checked: an unnoticed 4xx here is
+      // indistinguishable from a recorder that captured nothing.
+      for (const [action, body] of [
+        ["click", { locator: { testId: "reset-counter" } }],
+        ["fill", { locator: { testId: "message-input" }, value: "recorded" }],
+        ["click", { locator: { testId: "send-message" } }],
+        ["click", { locator: { testId: "increment-counter" } }],
+      ]) {
+        const result = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
+        assert(result.status === 200, `${action} while recording returned ${result.status}`);
+      }
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, { sleepMs: 800 });
+
+      const stopped = await call("POST", `/api/sessions/${sessionId}/recording/stop`, {});
+      assert(stopped.payload.data.recording.active === false, "recording did not stop");
+      const recording = stopped.payload.data.recording;
+      assert(recording.steps.some((step) => step.action === "fill" && step.value === "recorded"),
+        JSON.stringify(recording.steps.map((step) => step.action)));
+      // Everything on this page has a data-testid, so nothing should be ambiguous.
+      assert(recording.ambiguousSteps === 0, `${recording.ambiguousSteps} ambiguous steps`);
+
+      const exported = await call("POST", `/api/sessions/${sessionId}/recording/export`, { format: "execute" });
+      assert(exported.status === 200, `export returned ${exported.status}`);
+      // The bookkeeping the recorder keeps for a human reader is not part of a
+      // replayable step.
+      assert(exported.payload.data.steps.every((step) => !("strategy" in step) && !("recordedAt" in step)),
+        JSON.stringify(exported.payload.data.steps[1]));
+
+      // The point of the whole feature: what was recorded has to run.
+      const freshPage = (await call("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {}))
+        .payload.data.pageId;
+      const replay = await call("POST", `/api/sessions/${sessionId}/execute`, {
+        pageId: freshPage,
+        steps: exported.payload.data.steps,
+      });
+      assert(replay.status === 200 && replay.payload.data.failedCount === 0,
+        JSON.stringify(replay.payload.data?.results?.filter((entry) => entry.status === "error")
+          || replay.payload.error?.message));
+      await call("DELETE", `/api/sessions/${sessionId}/pages/${freshPage}`);
+
+      // Recording twice on one context used to fail: a binding cannot be
+      // registered a second time.
+      const again = await call("POST", `/api/sessions/${sessionId}/recording/start`, { contextId });
+      assert(again.status === 200, `recording a second time returned ${again.status}: ${again.payload.error?.message}`);
+      await call("POST", `/api/sessions/${sessionId}/recording/stop`, {});
+    });
+
+    await check("a recorded credential becomes a secret reference, never a value", async () => {
+      const page = [
+        "<!doctype html><html><body>",
+        '<label>Password <input type="password" name="password"></label>',
+        '<label>User <input type="text" name="username"></label>',
+        "<button>Duplicate</button><button>Duplicate</button><button>Duplicate</button>",
+        "</body></html>",
+      ].join("");
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: `data:text/html,${encodeURIComponent(page)}`,
+        waitUntil: "domcontentloaded",
+      });
+      await call("POST", `/api/sessions/${sessionId}/recording/edit`, { operation: "clear" });
+      await call("POST", `/api/sessions/${sessionId}/recording/start`, { contextId });
+
+      for (const [action, body] of [
+        ["fill", { locator: { css: 'input[name="password"]' }, value: "a-real-secret-value" }],
+        ["fill", { locator: { css: 'input[name="username"]' }, value: "kim" }],
+        ["click", { locator: { role: "button", name: "Duplicate", nth: 1 } }],
+      ]) {
+        const result = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
+        assert(result.status === 200, `${action} returned ${result.status}: ${result.payload.error?.message}`);
+      }
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, { sleepMs: 800 });
+
+      const recording = (await call("POST", `/api/sessions/${sessionId}/recording/stop`, {})).payload.data.recording;
+      const masked = recording.steps.find((step) => step.maskedSecret);
+      assert(masked && masked.value === "{{secret.PASSWORD}}", JSON.stringify(masked));
+      // Scenarios get committed, so this is the assertion that matters.
+      assert(!JSON.stringify(recording).includes("a-real-secret-value"), "the password was recorded in plain text");
+      assert(recording.warnings.some((warning) => /credential/.test(warning.message)),
+        JSON.stringify(recording.warnings));
+      assert(recording.steps.some((step) => step.value === "kim"), "a non-secret value was masked too");
+
+      // Three identical buttons cannot be told apart by text, so the step has
+      // to be narrowed to an index and said to be fragile.
+      const duplicate = recording.steps.find((step) => step.locator?.name === "Duplicate");
+      assert(duplicate, JSON.stringify(recording.steps.map((step) => step.locator)));
+      assert(duplicate.locator.nth === 1, JSON.stringify(duplicate.locator));
+      assert(/order changes/.test(duplicate.note || ""), duplicate.note);
+
+      const script = await call("POST", `/api/sessions/${sessionId}/recording/export`, {
+        format: "script", scriptKey: "recorded/smoke", testName: "recorded scenario",
+      });
+      assert(script.status === 200 && /test\(/.test(script.payload.data.content || ""),
+        JSON.stringify(Object.keys(script.payload.data || {})));
+      assert(!JSON.stringify(script.payload.data).includes("a-real-secret-value"),
+        "the password reached the exported script");
+    });
+
+    await check("a recorded step can be edited, and an unrunnable one is refused", async () => {
+      const before = (await call("GET", `/api/sessions/${sessionId}/recording`)).payload.data.recording.stepCount;
+      assert(before > 1, `only ${before} steps to edit`);
+
+      const deleted = await call("POST", `/api/sessions/${sessionId}/recording/edit`, { operation: "delete", index: 0 });
+      assert(deleted.payload.data.recording.stepCount === before - 1,
+        `${before} -> ${deleted.payload.data.recording.stepCount}`);
+
+      const inserted = await call("POST", `/api/sessions/${sessionId}/recording/edit`, {
+        operation: "insert", index: 0, step: { action: "assertVisible", locator: { css: "body" } },
+      });
+      assert(inserted.payload.data.recording.steps[0].action === "assertVisible",
+        JSON.stringify(inserted.payload.data.recording.steps[0]));
+
+      // Compiled before it is accepted, so a step that cannot run is refused
+      // while the person is still looking at it rather than on replay.
+      const refused = await call("POST", `/api/sessions/${sessionId}/recording/edit`, {
+        operation: "insert", step: { action: "if", when: { value: "a" }, then: [{ action: "click" }] },
+      });
+      assert(refused.status === 400 && refused.payload.error.code === "INVALID_CONDITION",
+        `${refused.status} ${refused.payload.error?.code}`);
+
+      assert((await call("POST", `/api/sessions/${sessionId}/recording/edit`, { operation: "delete", index: 999 }))
+        .status === 400, "an out-of-range index was accepted");
+      assert((await call("POST", `/api/sessions/${sessionId}/recording/export`, { format: "yaml" })).status === 400,
+        "an unknown export format was accepted");
+    });
+
     await check("closing a session drops the gates that were waiting on it", async () => {
       // The continuation needs the page it suspended on. Keeping the gate after
       // the session is gone would leave a decision that can never be applied.
@@ -3921,6 +4062,61 @@ async function run() {
       const afterClose = await call("GET", `/api/sessions/${otherId}/approvals/${gateId}`);
       assert(afterClose.status === 404, `expected 404 after close, got ${afterClose.status}`);
       assert(afterClose.payload.error.code === "APPROVAL_NOT_FOUND", afterClose.payload.error.code);
+    });
+
+    await check("a person can record and edit a scenario from the playground page", async () => {
+      const act = (action, body) => call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
+      const settle = (fragment) => act("assert/text", {
+        locator: { css: "#statusBox" }, expected: fragment, match: "contains", timeoutMs: 20000,
+      });
+
+      await act("goto", { url: `${baseUrl}/playground?lang=ko`, waitUntil: "domcontentloaded" });
+      await act("fill", { locator: { css: "#apiToken" }, value: token });
+      for (const [button, fragment] of [
+        ["#createSessionBtn", "/api/sessions completed"],
+        ["#createContextBtn", "/contexts completed"],
+        ["#createPageBtn", "/pages completed"],
+        ["#gotoDemoBtn", "/goto completed"],
+      ]) {
+        await act("click", { locator: { css: button } });
+        await settle(fragment);
+      }
+
+      await act("click", { locator: { css: "#startRecordingBtn" } });
+      const started = await settle("녹화를 시작");
+      assert(started.status === 200, "the panel did not report that recording started");
+
+      // Driving the playground's own buttons makes the inner session act, which
+      // is the context being recorded.
+      await act("click", { locator: { css: "#clickPrimaryBtn" } });
+      await settle("/click completed");
+      await act("click", { locator: { css: "#sendMessageBtn" } });
+      await act("wait-for", { sleepMs: 1500 });
+      await act("click", { locator: { css: "#refreshRecordingBtn" } });
+
+      const rendered = await act("wait-for", {
+        locator: { css: "[data-testid='recording-step']" }, state: "visible", timeoutMs: 20000,
+      });
+      assert(rendered.status === 200, "no recorded step rendered in the panel");
+      const rows = (await act("locator/query", {
+        locator: { css: "[data-testid='recording-step']" }, operation: "allTextContents",
+      })).payload.data.values || [];
+      // The locator is the thing a person has to be able to judge, so it has to
+      // be on screen rather than only in the payload.
+      assert(rows.some((row) => /testId=/.test(row)), JSON.stringify(rows));
+
+      const before = rows.length;
+      // The third control on a row is its delete button.
+      await act("click", { locator: { css: "[data-testid='recording-step'] button", nth: 2 } });
+      await act("wait-for", { sleepMs: 1200 });
+      const after = (await act("locator/query", {
+        locator: { css: "[data-testid='recording-step']" }, operation: "count",
+      })).payload.data.count;
+      assert(after === before - 1, `deleting from the panel left ${after} of ${before} steps`);
+
+      await act("click", { locator: { css: "#stopRecordingBtn" } });
+      await settle("정지");
+      await act("click", { locator: { css: "#closeSessionBtn" } });
     });
 
     await check("a person can clear an approval gate from the playground page", async () => {

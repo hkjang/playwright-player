@@ -98,7 +98,19 @@
     "rejectButton": "Reject",
     "decidedByRequired": "A decision has to say who made it. Fill in the approver field.",
     "approvalSampleMessage": "May the counter go up by one?",
-    "workflowStatusPrefix": "Workflow status:"
+    "workflowStatusPrefix": "Workflow status:",
+    "recorderTitle": "Scenario recording",
+    "recorderBody": "Records what you do in the browser as steps. Each locator is checked for uniqueness against the DOM at the moment of the click, and narrowed or flagged when it is not unique. A value that looks like a credential is recorded as a secret reference, not in plain text.",
+    "startRecording": "Start recording",
+    "stopRecording": "Stop recording",
+    "refreshRecording": "Refresh",
+    "exportRecording": "Export as execute steps",
+    "noRecording": "Nothing recorded yet.",
+    "recordingStarted": "Recording. Steps appear as you work in the browser.",
+    "recordingStopped": "Recording stopped.",
+    "recordingExported": "Steps exported — see the JSON result below.",
+    "recordingExportedAmbiguous": "Exported, but some locators are not unique:",
+    "recordingMasked": "replaced with a secret reference — supply the value through SECRETS_DIR"
   },
   "demo": {
     "title": "Playwright Player Demo Page",

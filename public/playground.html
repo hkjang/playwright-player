@@ -91,6 +91,18 @@
           <label>{{copy.approvalCommentLabel}}<input id="approvalComment" placeholder="{{copy.approvalCommentPlaceholder}}"></label>
           <div id="approvalList" data-testid="approval-list" style="margin-top:12px;">{{copy.noApprovals}}</div>
         </section>
+        <section class="panel">
+          <h2>{{copy.recorderTitle}}</h2>
+          <p>{{copy.recorderBody}}</p>
+          <div class="row">
+            <button type="button" id="startRecordingBtn">{{copy.startRecording}}</button>
+            <button type="button" id="stopRecordingBtn" class="secondary">{{copy.stopRecording}}</button>
+            <button type="button" id="refreshRecordingBtn" class="secondary">{{copy.refreshRecording}}</button>
+            <button type="button" id="exportRecordingBtn" class="secondary">{{copy.exportRecording}}</button>
+          </div>
+          <div id="recordingWarnings" class="muted" style="margin-top:8px;"></div>
+          <div id="recordingSteps" data-testid="recording-steps" style="margin-top:12px;">{{copy.noRecording}}</div>
+        </section>
       </div>
 
       <div>

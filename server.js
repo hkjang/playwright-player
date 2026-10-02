@@ -81,6 +81,7 @@ const config = {
   // Named identities with roles. Absent, the shared API_TOKEN keeps behaving
   // exactly as before — this is opt-in.
   principalsFile: (process.env.PRINCIPALS_FILE || "").trim(),
+  maxRecordedSteps: parseInteger(process.env.MAX_RECORDED_STEPS, 300),
   // An OpenAI-compatible chat completions base, e.g. a vLLM server at
   // http://vllm:8000/v1. Configuration only: see the comment on FailureAnalyst
   // for why a request may not supply its own URL.
@@ -2328,6 +2329,26 @@ class RunManager {
   }
 
   async tickSchedules() {
+    // setInterval does not wait for the previous tick, and this one awaits a
+    // disk read, a disk write and one createRun per dataset row. A tick that
+    // outlives its interval would overlap with the next, both would read the
+    // same lastFiredMinute before either wrote it, and the minute would fire
+    // twice. That was not reproducible at a 200ms tick, so this is a guard
+    // against the hazard rather than a fix for an observed failure — but for a
+    // product that submits orders, a duplicated run is the wrong thing to leave
+    // to timing.
+    if (this.scheduleTickActive) {
+      return;
+    }
+    this.scheduleTickActive = true;
+    try {
+      await this.tickSchedulesOnce();
+    } finally {
+      this.scheduleTickActive = false;
+    }
+  }
+
+  async tickSchedulesOnce() {
     const now = new Date();
     // Minute granularity: the tick runs more often than that, so the fired
     // minute is recorded to stop a schedule firing twice for the same minute.
@@ -3704,6 +3725,148 @@ async function poll(timeoutMs, fn, onTimeoutMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario recording
+//
+// Driving a browser by hand and then writing the scenario out again is the
+// slowest way to produce one. Recording captures what was actually done, as
+// steps the `execute` endpoint can replay.
+//
+// The locator is the whole problem. A recorder that emits the first selector it
+// thinks of produces scenarios that break on the next release, so this reuses
+// the same candidate order and the same uniqueness verification `page_inspect`
+// uses: a locator is resolved against the live DOM at the moment of the click,
+// and an ambiguous one is narrowed or reported rather than guessed at.
+// ---------------------------------------------------------------------------
+
+// Runs in the page. Describes the element an event happened on in the same
+// vocabulary the inspect snapshot uses, so one locator strategy serves both.
+const RECORDER_INIT_SCRIPT = `(() => {
+  if (window.__pwPlayerRecorderInstalled) return;
+  window.__pwPlayerRecorderInstalled = true;
+
+  const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 140);
+
+  const labelFor = (element) => {
+    if (element.labels && element.labels.length) return normalize(element.labels[0].textContent);
+    const aria = element.getAttribute("aria-label");
+    if (aria) return normalize(aria);
+    const describedBy = element.getAttribute("aria-labelledby");
+    if (describedBy) {
+      const target = document.getElementById(describedBy);
+      if (target) return normalize(target.textContent);
+    }
+    return "";
+  };
+
+  // A child-index chain, so the server can resolve an ambiguous locator to a
+  // concrete nth without mutating the page.
+  const domPath = (element) => {
+    const parts = [];
+    for (let node = element; node && node.parentNode; node = node.parentNode) {
+      parts.unshift([...node.parentNode.childNodes].indexOf(node));
+    }
+    return parts.join("/");
+  };
+
+  const describe = (element) => ({
+    tag: element.tagName ? element.tagName.toLowerCase() : "",
+    type: normalize(element.getAttribute && element.getAttribute("type")),
+    testId: normalize(element.getAttribute && element.getAttribute("data-testid")),
+    role: normalize(element.getAttribute && element.getAttribute("role")) || undefined,
+    ariaLabel: labelFor(element),
+    placeholder: normalize(element.getAttribute && element.getAttribute("placeholder")),
+    title: normalize(element.getAttribute && element.getAttribute("title")),
+    altText: normalize(element.getAttribute && element.getAttribute("alt")),
+    id: normalize(element.id),
+    name: normalize(element.getAttribute && element.getAttribute("name")),
+    text: normalize(element.innerText || element.textContent),
+    domPath: domPath(element),
+  });
+
+  const send = (payload) => {
+    try {
+      window.__pwPlayerRecord(payload);
+    } catch {
+      // The binding disappears when recording stops; dropping the event is
+      // correct, and throwing here would break the page being recorded.
+    }
+  };
+
+  document.addEventListener("click", (event) => {
+    const element = event.target;
+    if (!element || !element.tagName) return;
+    // The interactive ancestor is what a scenario should click: a click on the
+    // <span> inside a button has to replay as a click on the button.
+    const actionable = element.closest("button, a, [role=button], [role=link], input, select, textarea, label, summary")
+      || element;
+    send({ kind: "click", element: describe(actionable) });
+  }, true);
+
+  document.addEventListener("change", (event) => {
+    const element = event.target;
+    if (!element || !element.tagName) return;
+    const tag = element.tagName.toLowerCase();
+    if (tag === "select") {
+      send({ kind: "selectOption", element: describe(element), value: element.value });
+      return;
+    }
+    if (element.type === "checkbox" || element.type === "radio") {
+      send({ kind: "click", element: describe(element) });
+      return;
+    }
+    // Fired once the field is done, so the final value is recorded rather than
+    // one event per keystroke.
+    send({ kind: "fill", element: describe(element), value: element.value, isPassword: element.type === "password" });
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const element = event.target;
+    if (!element || !element.tagName) return;
+    send({ kind: "press", element: describe(element), value: "Enter" });
+  }, true);
+})()`;
+
+// Same order and the same confidences page_inspect uses. Kept in one place so a
+// recorded locator and an inspected one cannot disagree.
+function recorderLocatorCandidates(element) {
+  const candidates = [];
+  const push = (strategy, locator, confidence) => candidates.push({ strategy, locator, confidence });
+
+  if (element.testId) push("testId", { testId: element.testId }, 1);
+  if (element.ariaLabel) push("label", { label: element.ariaLabel }, 0.98);
+  const role = element.role || IMPLICIT_ROLES[`${element.tag}:${element.type}`] || IMPLICIT_ROLES[element.tag];
+  if (role && element.ariaLabel) push("role", { role, name: element.ariaLabel }, 0.96);
+  if (role && element.text && ["button", "link"].includes(role)) push("role", { role, name: element.text }, 0.95);
+  if (element.placeholder) push("placeholder", { placeholder: element.placeholder }, 0.92);
+  if (element.title) push("title", { title: element.title }, 0.86);
+  if (element.altText) push("altText", { altText: element.altText }, 0.84);
+  if (element.text && ["button", "a", "summary"].includes(element.tag)) push("text", { text: element.text }, 0.8);
+  if (element.name) push("css", { css: `[name="${element.name.replaceAll('"', '\\\\"')}"]` }, 0.6);
+  // `#123abc` is not a valid CSS selector even though it is a valid id.
+  if (element.id) push("css", { css: `[id="${element.id.replaceAll('"', '\\\\"')}"]` }, 0.45);
+
+  return candidates;
+}
+
+const IMPLICIT_ROLES = {
+  button: "button",
+  a: "link",
+  select: "combobox",
+  textarea: "textbox",
+  summary: "button",
+  "input:text": "textbox",
+  "input:email": "textbox",
+  "input:search": "searchbox",
+  "input:password": "textbox",
+  "input:checkbox": "checkbox",
+  "input:radio": "radio",
+  "input:submit": "button",
+  "input:button": "button",
+};
+
+
+// ---------------------------------------------------------------------------
 // Identity and roles
 //
 // Until now the API had one shared secret: it said which client called, never
@@ -4947,6 +5110,9 @@ class SessionManager {
         { action: "dismiss", promptText: "" },
       ),
     };
+    // Shared with run variable redaction so a field the one masks the other
+    // does not record in plain text.
+    this.secretNamePattern = new RegExp(options.redactVariablePattern, "i");
     this.sessions = new Map();
     // Artifacts outlive their session: the files stayed on disk but the only
     // index that could resolve an artifactId was thrown away on close, so
@@ -7050,6 +7216,294 @@ class SessionManager {
     }
   }
 
+  // Resolves a recorded element to a locator that is unique *now*, which is the
+  // only moment the DOM is known to match what the person just acted on.
+  async resolveRecordedLocator(page, element) {
+    const candidates = recorderLocatorCandidates(element);
+    const countFor = async (locator) => {
+      try {
+        return await resolveLocator(page, locator).count();
+      } catch {
+        return null;
+      }
+    };
+
+    const tried = [];
+    for (const candidate of candidates.slice(0, 6)) {
+      const matchCount = await countFor(candidate.locator);
+      tried.push({ strategy: candidate.strategy, locator: candidate.locator, matchCount });
+      if (matchCount === 1) {
+        return { locator: candidate.locator, strategy: candidate.strategy, unique: true, tried };
+      }
+      if (matchCount !== null && matchCount > 1) {
+        // Ambiguity is the failure that matters. Narrow by text first, then by
+        // a concrete index, rather than emitting something that will click the
+        // wrong element on replay.
+        if (element.text) {
+          const narrowed = { ...candidate.locator, hasText: element.text };
+          if ((await countFor(narrowed)) === 1) {
+            return { locator: narrowed, strategy: `${candidate.strategy}+hasText`, unique: true, tried };
+          }
+        }
+        if (element.domPath && matchCount <= 50) {
+          const index = await this.findLocatorIndex(page, candidate.locator, element.domPath);
+          if (index !== null) {
+            return {
+              locator: { ...candidate.locator, nth: index },
+              strategy: `${candidate.strategy}+nth`,
+              unique: true,
+              nth: true,
+              tried,
+            };
+          }
+        }
+      }
+    }
+
+    // Nothing resolved uniquely. Recorded anyway with the best candidate and a
+    // warning: a step the person can see and fix beats a silently dropped one.
+    const fallback = candidates[0];
+    return fallback
+      ? { locator: fallback.locator, strategy: fallback.strategy, unique: false, tried }
+      : null;
+  }
+
+  // A recorded password would sit in the scenario in plain text, and scenarios
+  // get committed. The field name becomes a secret reference instead.
+  maskRecordedValue(element, value, isPassword) {
+    const fieldName = element.name || element.id || element.testId || "value";
+    const looksSecret = isPassword || this.secretNamePattern.test(fieldName);
+    if (!looksSecret) {
+      return { value, masked: false };
+    }
+    const reference = `{{secret.${fieldName.toUpperCase().replace(/[^A-Z0-9_]+/g, "_")}}}`;
+    return { value: reference, masked: true, secretName: reference.slice(10, -2) };
+  }
+
+  async startRecording(sessionId, request = {}) {
+    return this.withLock(sessionId, async (session) => {
+      const contextRecord = this.getContextRecord(session, request.contextId);
+      if (session.recording?.active) {
+        throw new ApiError(409, "RECORDING_ALREADY_ACTIVE", "This session is already recording");
+      }
+
+      const recording = {
+        active: true,
+        contextId: contextRecord.contextId,
+        startedAt: toIso(),
+        steps: [],
+        warnings: [],
+        dropped: 0,
+      };
+      session.recording = recording;
+
+      const onEvent = async (source, payload) => {
+        if (!session.recording?.active || !payload?.element) {
+          return;
+        }
+        if (session.recording.steps.length >= this.options.maxRecordedSteps) {
+          session.recording.dropped += 1;
+          return;
+        }
+
+        const page = source.page;
+        const resolved = await this.resolveRecordedLocator(page, payload.element).catch(() => null);
+        if (!resolved) {
+          session.recording.warnings.push({
+            at: toIso(),
+            message: `a ${payload.kind} could not be described by any locator and was not recorded`,
+          });
+          return;
+        }
+
+        const step = cleanObject({
+          action: payload.kind,
+          locator: resolved.locator,
+          strategy: resolved.strategy,
+          recordedAt: toIso(),
+        });
+
+        if (payload.kind === "fill" || payload.kind === "selectOption") {
+          const masked = this.maskRecordedValue(payload.element, payload.value ?? "", payload.isPassword);
+          if (payload.kind === "selectOption") {
+            step.values = [masked.value];
+          } else {
+            step.value = masked.value;
+          }
+          if (masked.masked) {
+            step.maskedSecret = true;
+            session.recording.warnings.push({
+              at: toIso(),
+              message: `a value that looks like a credential was recorded as ${masked.value}; supply it through SECRETS_DIR rather than in the scenario`,
+            });
+          }
+        }
+        if (payload.kind === "press") {
+          step.key = payload.value || "Enter";
+          delete step.value;
+        }
+        if (!resolved.unique) {
+          step.ambiguous = true;
+          step.note = "no unique locator was found; check this step before relying on it";
+          session.recording.warnings.push({
+            at: toIso(),
+            message: `a ${payload.kind} on ${JSON.stringify(resolved.locator)} is not unique`,
+          });
+        }
+        if (resolved.nth) {
+          step.note = "narrowed to a positional index; it will break if the list order changes";
+        }
+
+        // A click on a checkbox arrives twice, once from click and once from
+        // change. Identical consecutive steps are one action.
+        const previous = session.recording.steps[session.recording.steps.length - 1];
+        if (previous
+          && previous.action === step.action
+          && JSON.stringify(previous.locator) === JSON.stringify(step.locator)
+          && previous.value === step.value
+          && Date.parse(step.recordedAt) - Date.parse(previous.recordedAt) < 600) {
+          return;
+        }
+
+        session.recording.steps.push(step);
+      };
+
+      // A binding cannot be registered twice on a context, so recording a
+      // second time would have failed with a 500. The handler reads
+      // session.recording on every event rather than closing over one
+      // recording, so the first installation serves every later one.
+      if (!contextRecord.recorderInstalled) {
+        await contextRecord.context.exposeBinding("__pwPlayerRecord", onEvent);
+        await contextRecord.context.addInitScript(RECORDER_INIT_SCRIPT);
+        contextRecord.recorderInstalled = true;
+      }
+      // Pages already open never ran the init script, so they are instrumented
+      // directly; without this, recording on the current page captures nothing.
+      for (const pageRecord of session.pages.values()) {
+        if (pageRecord.contextId === contextRecord.contextId && !pageRecord.page.isClosed()) {
+          await pageRecord.page.evaluate(RECORDER_INIT_SCRIPT).catch(() => undefined);
+        }
+      }
+
+      // The first thing a replay needs is where to start.
+      const firstPage = [...session.pages.values()].find((entry) => entry.contextId === contextRecord.contextId);
+      if (firstPage && !firstPage.page.isClosed()) {
+        const url = firstPage.page.url();
+        if (url && url !== "about:blank") {
+          recording.steps.push({ action: "goto", url, recordedAt: toIso() });
+        }
+      }
+
+      this.touch(session);
+      console.log(`[recording] started sessionId=${sessionId} contextId=${contextRecord.contextId}`);
+      return this.serializeRecording(session);
+    });
+  }
+
+  async stopRecording(sessionId) {
+    return this.withLock(sessionId, async (session) => {
+      if (!session.recording?.active) {
+        throw new ApiError(409, "RECORDING_NOT_ACTIVE", "This session is not recording");
+      }
+      session.recording.active = false;
+      session.recording.endedAt = toIso();
+      this.touch(session);
+      console.log(`[recording] stopped sessionId=${sessionId} steps=${session.recording.steps.length}`);
+      return this.serializeRecording(session);
+    });
+  }
+
+  getRecording(sessionId) {
+    const session = this.getSession(sessionId);
+    return this.serializeRecording(session);
+  }
+
+  // Editing is deliberately server-side: the recorded steps are the thing a
+  // scenario is built from, so dropping a stray click has to survive a page
+  // reload rather than living in one browser tab.
+  editRecording(sessionId, request = {}) {
+    const session = this.getSession(sessionId);
+    if (!session.recording) {
+      throw new ApiError(404, "NO_RECORDING", "This session has no recording");
+    }
+
+    const steps = session.recording.steps;
+    const operation = String(request.operation || "");
+    const index = Number(request.index);
+    const inRange = Number.isInteger(index) && index >= 0 && index < steps.length;
+
+    switch (operation) {
+      case "delete":
+        if (!inRange) {
+          throw new ApiError(400, "INVALID_REQUEST", `index must be 0..${steps.length - 1}`);
+        }
+        steps.splice(index, 1);
+        break;
+      case "move": {
+        const to = Number(request.toIndex);
+        if (!inRange || !Number.isInteger(to) || to < 0 || to >= steps.length) {
+          throw new ApiError(400, "INVALID_REQUEST", `index and toIndex must be 0..${steps.length - 1}`);
+        }
+        const [moved] = steps.splice(index, 1);
+        steps.splice(to, 0, moved);
+        break;
+      }
+      case "insert": {
+        if (!request.step || typeof request.step !== "object") {
+          throw new ApiError(400, "INVALID_REQUEST", "step is required");
+        }
+        // Compiled before it is accepted, so an assertion that cannot run is
+        // refused while the person is still looking at it.
+        compileWorkflow([request.step]);
+        const at = Number.isInteger(index) ? Math.min(Math.max(index, 0), steps.length) : steps.length;
+        steps.splice(at, 0, { ...request.step, addedByHand: true });
+        break;
+      }
+      case "replace": {
+        if (!inRange) {
+          throw new ApiError(400, "INVALID_REQUEST", `index must be 0..${steps.length - 1}`);
+        }
+        if (!request.step || typeof request.step !== "object") {
+          throw new ApiError(400, "INVALID_REQUEST", "step is required");
+        }
+        compileWorkflow([request.step]);
+        steps[index] = { ...request.step, addedByHand: true };
+        break;
+      }
+      case "clear":
+        steps.length = 0;
+        session.recording.warnings.length = 0;
+        break;
+      default:
+        throw new ApiError(400, "INVALID_REQUEST", "operation must be delete, move, insert, replace or clear");
+    }
+
+    this.touch(session);
+    return this.serializeRecording(session);
+  }
+
+  serializeRecording(session) {
+    const recording = session.recording;
+    if (!recording) {
+      return { sessionId: session.sessionId, recording: null };
+    }
+    return {
+      sessionId: session.sessionId,
+      recording: cleanObject({
+        active: recording.active,
+        contextId: recording.contextId,
+        startedAt: recording.startedAt,
+        endedAt: recording.endedAt,
+        stepCount: recording.steps.length,
+        // Dropped rather than silently truncated, and said so.
+        droppedSteps: recording.dropped || 0,
+        ambiguousSteps: recording.steps.filter((step) => step.ambiguous).length,
+        steps: recording.steps,
+        warnings: recording.warnings.slice(-50),
+      }),
+    };
+  }
+
   // Answers the page-state half of a condition. A condition is a question, so
   // "the element is not visible" has to come back as false; only a locator the
   // page cannot even evaluate is an error. Conflating the two would turn every
@@ -8579,6 +9033,89 @@ function buildOpenApiSpec(req) {
           responses: { 200: { description: "Execution result after the gate" } },
         },
       },
+      [`${api}/sessions/{sessionId}/recording/start`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Start recording what is done in this session's browser",
+          description:
+            "Captures clicks, field changes and Enter presses. Each one is resolved to a locator that is verified "
+            + "unique against the live DOM at that moment; an ambiguous one is narrowed by text or by index and "
+            + "flagged. A value that looks like a credential is recorded as a {{secret.NAME}} reference, never in "
+            + "plain text.",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: false,
+            content: { "application/json": { schema: { type: "object", properties: { contextId: { type: "string" } } } } },
+          },
+          responses: { 200: { description: "Recording state" }, 409: { description: "Already recording" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/recording/stop`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Stop recording",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Recording state" }, 409: { description: "Not recording" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/recording`]: {
+        get: {
+          tags: ["Sessions"],
+          summary: "Read the recorded steps, with warnings and the ambiguous count",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          responses: { 200: { description: "Recording state" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/recording/edit`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Delete, move, insert or replace a recorded step",
+          description: "An inserted or replaced step is compiled before it is accepted, so one that cannot run is refused while the person is still looking at it.",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["operation"],
+                  properties: {
+                    operation: { type: "string", enum: ["delete", "move", "insert", "replace", "clear"] },
+                    index: { type: "integer" },
+                    toIndex: { type: "integer" },
+                    step: { $ref: "#/components/schemas/WorkflowStep" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Recording state" } },
+        },
+      },
+      [`${api}/sessions/{sessionId}/recording/export`]: {
+        post: {
+          tags: ["Sessions"],
+          summary: "Export the recording as execute steps or as a Playwright script",
+          parameters: [{ name: "sessionId", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: false,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    format: { type: "string", enum: ["execute", "script"], default: "execute" },
+                    scriptKey: { type: "string" },
+                    testName: { type: "string" },
+                    save: { type: "boolean", description: "Writing into the registry needs the admin role" },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: "Steps or a rendered script" }, 409: { description: "Nothing recorded" } },
+        },
+      },
       [`${api}/sessions/{sessionId}/approvals`]: {
         get: {
           tags: ["Sessions"],
@@ -9839,6 +10376,68 @@ app.get(`${config.apiBasePath}/analysis/capabilities`, asyncRoute(async (req, re
   // probe=true reaches the configured endpoint; without it this stays a
   // zero-dependency read of the configuration.
   ok(res, parseBoolean(req.query.probe, false) ? await failureAnalyst.probe() : failureAnalyst.describe());
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/recording/start`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.startRecording(req.params.sessionId, req.body || {}));
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/recording/stop`, asyncRoute(async (req, res) => {
+  ok(res, await sessionManager.stopRecording(req.params.sessionId));
+}));
+
+app.get(`${config.apiBasePath}/sessions/:sessionId/recording`, asyncRoute(async (req, res) => {
+  ok(res, sessionManager.getRecording(req.params.sessionId));
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/recording/edit`, asyncRoute(async (req, res) => {
+  ok(res, sessionManager.editRecording(req.params.sessionId, req.body || {}));
+}));
+
+app.post(`${config.apiBasePath}/sessions/:sessionId/recording/export`, asyncRoute(async (req, res) => {
+  const recording = sessionManager.getRecording(req.params.sessionId).recording;
+  if (!recording || !recording.steps.length) {
+    throw new ApiError(409, "NO_RECORDED_STEPS", "Nothing has been recorded in this session");
+  }
+
+  const format = String((req.body || {}).format || "execute");
+  // Replayable steps are what `execute` takes, minus the bookkeeping the
+  // recorder added for the person reading it.
+  const steps = recording.steps.map((step) => {
+    const { strategy, recordedAt, ambiguous, note, addedByHand, maskedSecret, ...rest } = step;
+    return rest;
+  });
+
+  if (format === "execute") {
+    ok(res, {
+      format,
+      steps,
+      // Carried across the export rather than dropped: a scenario built on an
+      // ambiguous locator should say so wherever it is read.
+      ambiguousSteps: recording.ambiguousSteps,
+      warnings: recording.warnings,
+    });
+    return;
+  }
+
+  if (format !== "script") {
+    throw new ApiError(400, "INVALID_REQUEST", `format must be execute or script (got ${format})`);
+  }
+
+  // Checked before scaffolding, because scaffolding with save writes the file.
+  if ((req.body || {}).save && principals && !hasRole(req.principal, "admin")) {
+    throw new ApiError(
+      403,
+      "FORBIDDEN",
+      `saving a recorded script writes code and needs the admin role; ${req.principal.id} has ${req.principal.roles.join(", ")}`,
+    );
+  }
+  const scaffold = await scriptAssistant.scaffold({
+    ...(req.body || {}),
+    steps,
+    testName: (req.body || {}).testName || "recorded scenario",
+  });
+  ok(res, { format, ...scaffold, ambiguousSteps: recording.ambiguousSteps, warnings: recording.warnings });
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/execute/resume`, asyncRoute(async (req, res) => {

@@ -367,3 +367,135 @@ onClick('runWorkflowBtn', async () => {
 });
 
 onClick('refreshApprovalsBtn', refreshApprovals);
+
+// Scenario recording.
+//
+// The recorded steps are what a scenario is built from, so editing them lives
+// on the server: dropping a stray click has to survive a page reload rather
+// than existing only in this tab.
+
+// This page builds its DOM with createElement rather than the shared helper
+// runs.js uses, so the recorder follows suit instead of reaching for one that
+// is not loaded here.
+function node(tag, options, children) {
+  const created = document.createElement(tag);
+  if (options) {
+    if (options.className) created.className = options.className;
+    if (options.textContent) created.textContent = options.textContent;
+    if (options.type) created.type = options.type;
+    if (options.style) created.style.cssText = options.style;
+  }
+  for (const child of children || []) {
+    created.append(child);
+  }
+  return created;
+}
+const recordingSteps = document.getElementById('recordingSteps');
+const recordingWarnings = document.getElementById('recordingWarnings');
+
+function describeLocator(locator) {
+  if (!locator) {
+    return '';
+  }
+  const key = Object.keys(locator).find(function (name) {
+    return ['testId', 'label', 'role', 'text', 'placeholder', 'title', 'altText', 'css', 'selector'].includes(name);
+  });
+  const base = key ? key + '=' + locator[key] : JSON.stringify(locator);
+  const name = locator.name ? ' "' + locator.name + '"' : '';
+  const nth = locator.nth !== undefined ? ' #' + locator.nth : '';
+  return base + name + nth;
+}
+
+async function editRecording(body) {
+  const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/recording/edit', body);
+  renderRecording(payload.data.recording);
+}
+
+function renderRecording(recording) {
+  recordingSteps.replaceChildren();
+  recordingWarnings.replaceChildren();
+
+  if (!recording || !recording.steps || !recording.steps.length) {
+    recordingSteps.textContent = COPY.noRecording;
+    return;
+  }
+
+  for (const warning of recording.warnings || []) {
+    recordingWarnings.append(node('div', { textContent: '⚠ ' + warning.message }));
+  }
+
+  recording.steps.forEach(function (step, index) {
+    const row = node('div', { className: 'step' });
+    row.dataset.testid = 'recording-step';
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:8px;border-radius:10px;'
+      + 'margin-bottom:6px;background:' + (step.ambiguous ? 'rgba(185,28,28,0.08)' : 'rgba(15,118,110,0.06)') + ';';
+
+    const label = node('div', { style: 'flex:1;min-width:0;' });
+    label.append(node('strong', { textContent: index + '. ' + step.action }));
+    const detail = [describeLocator(step.locator), step.value, step.url, step.key]
+      .filter(Boolean).join(' · ');
+    if (detail) {
+      label.append(node('div', { className: 'muted', style: 'font-size:.85rem;', textContent: detail }));
+    }
+    // The two things a reader must not miss: a locator that is not unique, and
+    // a value that was replaced because it looked like a credential.
+    if (step.note) {
+      label.append(node('div', { className: 'muted', style: 'font-size:.8rem;', textContent: step.note }));
+    }
+    if (step.maskedSecret) {
+      label.append(node('div', { style: 'font-size:.8rem;color:#0f766e;', textContent: COPY.recordingMasked }));
+    }
+    row.append(label);
+
+    [['↑', 'move', index - 1], ['↓', 'move', index + 1], ['✕', 'delete', null]].forEach(function (entry) {
+      const button = node('button', { type: 'button', textContent: entry[0] });
+      button.style.cssText = 'padding:4px 10px;border-radius:8px;border:0;cursor:pointer;background:#e2e8f0;';
+      button.disabled = entry[1] === 'move' && (entry[2] < 0 || entry[2] >= recording.steps.length);
+      button.addEventListener('click', function () {
+        const body = entry[1] === 'move'
+          ? { operation: 'move', index: index, toIndex: entry[2] }
+          : { operation: 'delete', index: index };
+        editRecording(body).catch(function (error) { setStatus(error.message, true); });
+      });
+      row.append(button);
+    });
+
+    recordingSteps.append(row);
+  });
+}
+
+async function refreshRecording() {
+  requireValue(state.sessionId, COPY.createSessionFirst);
+  const payload = await api('GET', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/recording');
+  renderRecording(payload.data.recording);
+}
+
+onClick('startRecordingBtn', async () => {
+  requireValue(state.contextId, COPY.createContextFirst);
+  await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/recording/start', {
+    contextId: state.contextId
+  });
+  await refreshRecording();
+  // Last, so the queue refresh above does not overwrite the one message the
+  // person is waiting for.
+  setStatus(COPY.recordingStarted, false);
+});
+
+onClick('stopRecordingBtn', async () => {
+  requireValue(state.sessionId, COPY.createSessionFirst);
+  await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/recording/stop');
+  await refreshRecording();
+  setStatus(COPY.recordingStopped, false);
+});
+
+onClick('refreshRecordingBtn', refreshRecording);
+
+onClick('exportRecordingBtn', async () => {
+  requireValue(state.sessionId, COPY.createSessionFirst);
+  const payload = await api('POST', CONFIG.apiBasePath + '/sessions/' + state.sessionId + '/recording/export', {
+    format: 'execute'
+  });
+  setResult(payload.data);
+  const ambiguous = payload.data.ambiguousSteps || 0;
+  setStatus(ambiguous ? COPY.recordingExportedAmbiguous + ' ' + ambiguous : COPY.recordingExported, ambiguous > 0);
+});

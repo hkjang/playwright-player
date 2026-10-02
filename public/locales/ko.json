@@ -98,7 +98,19 @@
     "rejectButton": "반려",
     "decidedByRequired": "누가 결정했는지 기록해야 합니다. 승인자 칸을 채우세요.",
     "approvalSampleMessage": "카운터를 1 올려도 될까요?",
-    "workflowStatusPrefix": "워크플로 상태:"
+    "workflowStatusPrefix": "워크플로 상태:",
+    "recorderTitle": "시나리오 녹화",
+    "recorderBody": "브라우저에서 한 일을 단계로 기록합니다. locator 는 클릭한 그 순간의 DOM 에 대해 고유한지 검증하고, 고유하지 않으면 좁히거나 표시합니다. 자격증명처럼 보이는 값은 평문이 아니라 비밀정보 참조로 기록됩니다.",
+    "startRecording": "녹화 시작",
+    "stopRecording": "녹화 정지",
+    "refreshRecording": "새로고침",
+    "exportRecording": "execute 단계로 내보내기",
+    "noRecording": "녹화된 단계가 없습니다.",
+    "recordingStarted": "녹화를 시작했습니다. 브라우저에서 조작하면 단계가 쌓입니다.",
+    "recordingStopped": "녹화를 정지했습니다.",
+    "recordingExported": "단계를 내보냈습니다. 아래 JSON 결과를 보세요.",
+    "recordingExportedAmbiguous": "내보냈지만 고유하지 않은 locator 가 있습니다:",
+    "recordingMasked": "비밀정보 참조로 대체됨 — SECRETS_DIR 로 값을 공급하세요"
   },
   "demo": {
     "title": "Playwright Player 데모 페이지",
