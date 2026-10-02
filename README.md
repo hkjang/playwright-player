@@ -23,6 +23,7 @@
 - 환경·계정·데이터셋 분리와 비밀정보 참조
 - cron 예약 실행, 배포 파이프라인 트리거, 실패 알림 콜백
 - 조건 분기·반복·승인 대기를 지원하는 업무 흐름(`if`/`repeat`/`forEach`/`while`/`break`/`continue`/`approval`)
+- OpenAI 호환 로컬 LLM(vLLM 등)으로 실패 원인 가설 제시 — 진단만 하고 아무것도 고치지 않습니다
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -253,6 +254,14 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_PENDING_APPROVALS` | `50` | 동시에 승인을 기다릴 수 있는 워크플로 수. 초과 시 `429 APPROVAL_LIMIT_EXCEEDED` |
 | `MAX_SCRIPT_BUNDLE_FILES` | `50` | 스냅샷이 담을 수 있는 모듈 수 |
 | `MAX_SCRIPT_BUNDLE_BYTES` | `8388608` | 스냅샷 전체 크기 상한 |
+| `LLM_BASE_URL` | 없음 | OpenAI 호환 chat completions base (예: `http://vllm:8000/v1`). 비우면 실패 분석이 `503 LLM_NOT_CONFIGURED` 를 반환합니다 |
+| `LLM_MODEL` | 없음 | 비우면 `/v1/models` 의 첫 모델을 사용합니다 |
+| `LLM_API_KEY` | 없음 | vLLM 을 `--api-key` 로 띄운 경우 |
+| `LLM_TIMEOUT_MS` | `60000` | 모델 응답 대기 상한. 초과 시 `504 LLM_TIMEOUT` |
+| `LLM_MAX_OUTPUT_TOKENS` | `1200` | 답변 길이 상한 |
+| `LLM_TEMPERATURE` | `0` | 같은 증거에 같은 답을 받기 위한 기본값 |
+| `LLM_MAX_LOG_LINES` | `60` | 모델에 보낼 로그 꼬리 줄 수 |
+| `LLM_RESPONSE_FORMAT_JSON` | `false` | `response_format: json_object` 를 지원하는 서버에서만 켜세요 |
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
@@ -565,6 +574,65 @@ POST /api/sessions/{sessionId}/contexts/{contextId}/request
 
 **캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
 
+## 실패 분석 (로컬 LLM)
+
+실패한 실행에는 오류 메시지, 단계 타임라인, 로그가 남습니다. 그걸 읽는 것이 느린 작업이고, 로컬 모델이 1차 분류에는 쓸 만합니다. vLLM 처럼 **OpenAI 호환 `/v1/chat/completions`** 를 제공하는 서버를 가리키면 됩니다.
+
+```
+LLM_BASE_URL=http://vllm:8000/v1
+LLM_MODEL=                      # 비우면 /v1/models 의 첫 모델을 씁니다
+LLM_API_KEY=                    # vLLM 을 --api-key 로 띄운 경우에만
+```
+
+```
+POST /api/runs/{runId}/analyze        { "refresh": false, "force": false }
+GET  /api/analysis/capabilities?probe=true
+```
+
+환경변수만으로 설정하므로, 값이 제대로 들어갔는지 확인할 방법이 필요합니다. `probe=true` 가 설정된 엔드포인트의 `/models` 를 실제로 호출해서 **응답했는지, 어떤 모델을 쓰게 되는지, 안 되면 무엇이 잘못됐는지** 알려줍니다. `probe` 없이는 서버 밖으로 아무것도 나가지 않습니다.
+
+```json
+{ "reachable": false, "code": "LLM_UNREACHABLE",
+  "error": "http://127.0.0.1:9/v1/models could not be reached: fetch failed" }
+```
+
+### 네 가지 결정
+
+**엔드포인트는 설정이고 요청 입력이 아닙니다.** 요청마다 URL 을 받으면 이 서버가 네트워크에서 보이는 모든 것에 닿는 프록시가 됩니다 — 알림 URL 을 허용목록으로 막은 것과 같은 이유이고, 여기서는 아예 받을 이유가 없습니다.
+
+**진단만 하고 아무것도 고치지 않습니다.** 이 기능은 스크립트도, 기대값도, 실행 기록도 쓸 수 없습니다. 프롬프트에 규칙으로도 넣습니다 — *기대값·단언·테스트를 통과시키려고 바꾸라고 제안하지 말 것. 기대값 자체가 틀려 보이면 사람이 판단해야 한다고 말할 것.* **실패하는 단언을 통과시킬 수 있는 모델은 그 테스트가 존재한 유일한 증거를 지울 수 있는 모델입니다.**
+
+**서버가 통제하는 텍스트만 보냅니다** — 실행 메타데이터, 실패한 테스트 제목과 오류 메시지, 단계 이름과 소요시간, 차단된 요청 호스트, **스크러빙된** 로그 줄. 스크린샷·DOM 덤프·트레이스·영상의 **내용은 읽지도 보내지도 않습니다** — 비밀정보 스크러빙이 닿지 못하는 것이 바로 그것들입니다. 단, Playwright 가 첨부 파일 경로를 로그에 출력하므로 **경로는** 로그 줄에 포함될 수 있습니다. 내용이 아니라 참조이고, 유용한 쪽입니다. 과장해서 말하는 것도 유출만큼 잘못입니다.
+
+**재실행이 안전한지는 모델이 판단하지 않습니다.** 그건 시나리오가 업무 상태를 바꿨는지에 달렸고, 그걸 아는 건 시나리오 작성자뿐입니다. 요청의 `retrySafe` 로 선언하면 분석에 그대로 전달되고, 추론하지는 않습니다.
+
+### 답변
+
+```json
+{
+  "status": "ok",
+  "model": "Qwen2.5-7B-Instruct",
+  "summary": "단언이 기대한 문구를 끝까지 보지 못했습니다.",
+  "hypotheses": [
+    { "cause": "단언이 실행될 때 상태 요소가 비어 있었음",
+      "evidence": ["failedTests[0].error", "failedTests[0].steps"],
+      "confidence": "medium" }
+  ],
+  "suggestedChecks": ["실패한 테스트에 첨부된 스크린샷 확인"],
+  "needsHuman": false,
+  "evidence": { "...": "모델에 보낸 내용 전체" },
+  "disclaimer": "A hypothesis produced by a language model from the evidence above. Nothing was modified."
+}
+```
+
+**보낸 증거를 답변과 함께 돌려줍니다.** 아무도 검증할 수 없는 분석은 가치가 적습니다. 각 가설은 근거로 삼은 필드를 인용해야 하고, `confidence` 가 스키마에 없는 값이면 `low` 로 내립니다 — 모델이 만든 값을 그대로 믿지 않습니다. `needsHuman` 이 빠져 있으면 `true` 로 둡니다. 둘 중 안전한 쪽입니다.
+
+JSON 으로 파싱되지 않는 답변은 `status: "unusable"` 로 **원문과 함께** 돌려줍니다. 산문을 요약해서 발견처럼 보이게 만드는 것이 더 나쁩니다. 코드 펜스로 감싼 JSON 은 파싱합니다.
+
+`/runs` 상세 화면의 **실패 원인 분석** 패널에서 사람이 직접 요청하고 읽을 수 있습니다. 각 가설 옆에 **근거로 삼은 필드와 확신도**가 함께 표시되므로, 모델의 말을 그대로 받는 대신 가서 확인할 수 있습니다. `needsHuman` 은 화면에서 강조되고, 하단에 모델 이름과 "이것은 가설이며 아무것도 수정되지 않았다"는 문구가 항상 붙습니다. 설정이 없으면 서버 오류처럼 보이지 않게 **`LLM_BASE_URL` 를 설정하라고** 알려줍니다.
+
+답변은 실행 기록에 저장되어 재시작을 넘깁니다. 다시 묻고 싶으면 `refresh: true` 입니다. 모델이 죽어 있으면 `502`/`504` 를 내고 **실행 기록과 기존 답변은 건드리지 않습니다**.
+
 ## 업무 흐름 분기
 
 평평한 단계 목록은 "언제나 전부 실행한다" 밖에 표현하지 못합니다. 실제 업무는 **분기**하고(승인 배너가 떠 있으면 누르고, 없으면 양식을 채운다) **반복**하고(데이터셋 행마다 같은 처리), 때로는 **사람을 기다립니다**. `execute` 의 `steps` 는 중첩할 수 있습니다.
@@ -666,7 +734,7 @@ POST /api/sessions/{sessionId}/execute/resume              { gateId }
 
 **목록** — 실행 ID, 스크립트, 상태, 소요시간, 시작 시각, 테스트 수와 실패 수. 상태 필터와 대기열 요약을 함께 표시합니다.
 
-**상세** (`/runs?runId=...`) — 상태, 스크립트 핀(sha256·크기), 시도 횟수, 종료 코드, 중단 사유, 네트워크 정책과 차단된 요청, 단계 타임라인, 증적, 로그, 그리고 다시 실행·취소·삭제.
+**상세** (`/runs?runId=...`) — 상태, 스크립트 핀(sha256·크기), 시도 횟수, 종료 코드, 중단 사유, 네트워크 정책과 차단된 요청, 단계 타임라인, 증적, 로그, 실패한 실행에는 원인 분석 패널, 그리고 다시 실행·취소·삭제.
 
 타임라인은 중첩 단계를 들여쓰기로 보여주고 소요시간을 막대로 표현합니다. **실패한 단계는 강조되고 바로 아래에 오류 메시지가 붙습니다.** 가장 느린 단계 3개를 함께 표시하므로 통과했지만 느린 실행도 바로 읽힙니다.
 

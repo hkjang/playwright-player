@@ -205,6 +205,18 @@
     "stepCount": "단계",
     "testPassed": "통과",
     "testFailed": "실패",
-    "testSkipped": "건너뜀"
+    "testSkipped": "건너뜀",
+    "analysisTitle": "실패 원인 분석",
+    "analyzeButton": "원인 분석 요청",
+    "analysisNone": "아직 분석하지 않았습니다.",
+    "analysisRunning": "모델에 질문하는 중…",
+    "analysisDone": "분석을 받았습니다.",
+    "analysisConfidence": "확신",
+    "analysisChecks": "확인해 볼 것",
+    "analysisNeedsHuman": "사람이 판단해야 합니다",
+    "analysisModel": "모델",
+    "analysisCached": "저장된 답변",
+    "analysisUnusable": "모델이 JSON 으로 답하지 않아 사용할 수 없습니다. 원문은 아래와 같습니다.",
+    "analysisNotConfigured": "실패 분석이 설정되지 않았습니다. LLM_BASE_URL 에 OpenAI 호환 주소(예: http://vllm:8000/v1)를 설정하세요."
   }
 }

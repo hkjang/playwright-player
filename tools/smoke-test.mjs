@@ -678,11 +678,25 @@ async function runScheduleChecks() {
       assert(schedule.payload.data.lastFiredMinute, "the fired minute was not recorded");
 
       // The tick runs every 3s here, so without the guard the same minute would
-      // fire repeatedly.
-      const settled = (await api("GET", "/api/runs?limit=200")).payload.data.total;
-      await new Promise((resolve) => setTimeout(resolve, 12000));
-      const later = (await api("GET", "/api/runs?limit=200")).payload.data.total;
-      assert(later === settled, `fired again within the same minute: ${settled} -> ${later}`);
+      // fire repeatedly. Asserting "the count did not move for 12 seconds" is
+      // the wrong test: if the window crosses a minute boundary a legitimate
+      // fire appears and the guard gets blamed for working. The invariant is
+      // that no two fires share a minute, so that is what is checked.
+      // Sampled rather than measured once at the end: a fire is identified by
+      // the minute it claimed, so two fires claiming the same minute is the
+      // failure, whatever else happened in the window.
+      const firedMinutes = [schedule.payload.data.lastFiredMinute];
+      let lastTriggeredAt = schedule.payload.data.lastTriggeredAt;
+      for (let tick = 0; tick < 14; tick += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const current = (await api("GET", "/api/schedules/everyminute")).payload.data;
+        if (current.lastTriggeredAt && current.lastTriggeredAt !== lastTriggeredAt) {
+          lastTriggeredAt = current.lastTriggeredAt;
+          firedMinutes.push(current.lastFiredMinute);
+        }
+      }
+      const repeated = firedMinutes.filter((minute, index) => firedMinutes.indexOf(minute) !== index);
+      assert(!repeated.length, `the same minute fired more than once: ${repeated.join(", ")}`);
 
       await api("PUT", "/api/schedules/everyminute", {
         cron: "* * * * *",
@@ -1361,6 +1375,354 @@ async function runScriptBundleChecks() {
     });
   } finally {
     proc.kill("SIGTERM");
+    await fsPromises.rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+// An OpenAI-compatible stub, shaped like the vLLM server this talks to. The
+// mode switch is how the awkward answers get covered: a model that returns
+// prose, and an endpoint that is down.
+function startModelStub() {
+  const prompts = [];
+  let mode = "good";
+  const answer = {
+    summary: "The assertion never saw the expected text.",
+    hypotheses: [
+      {
+        cause: "The element was still empty when the assertion ran",
+        evidence: ["failedTests[0].error", "failedTests[0].steps"],
+        confidence: "medium",
+      },
+      { cause: "a hypothesis with a bogus confidence", evidence: ["none"], confidence: "certainly" },
+    ],
+    suggestedChecks: ["Open the screenshot attached to the failed test"],
+    needsHuman: false,
+    humanReason: "",
+  };
+
+  let modelId = "stub-model-7b";
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      if (req.url.endsWith("/models")) {
+        res.writeHead(200, { "content-type": "application/json" })
+          .end(JSON.stringify({ data: [{ id: modelId }] }));
+        return;
+      }
+      prompts.push(body);
+      if (mode === "down") {
+        res.writeHead(500).end("model server exploded");
+        return;
+      }
+      const content = mode === "prose"
+        ? "I reckon the button moved. Here is no JSON at all."
+        : JSON.stringify(answer);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        usage: { prompt_tokens: 800, completion_tokens: 100, total_tokens: 900 },
+        choices: [{ message: { content } }],
+      }));
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
+        prompts,
+        setMode: (next) => { mode = next; },
+        setModel: (next) => { modelId = next; },
+        close: () => server.close(),
+      });
+    });
+  });
+}
+
+// Failure analysis is configured only by environment variable, so it runs on its
+// own instance. The second instance deliberately has no LLM configured: that is
+// how the refusal path and the persistence of a cached answer get covered.
+async function runFailureAnalysisChecks() {
+  const stub = await startModelStub();
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-llm-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  const secretsDir = path.join(dataDir, "secrets");
+  await fsPromises.mkdir(scriptsDir, { recursive: true });
+  await fsPromises.mkdir(secretsDir, { recursive: true });
+  await fsPromises.writeFile(path.join(secretsDir, "ANALYSIS_PASSWORD"), "s3cr3t-analysis-value\n", "utf8");
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "failing.spec.js"),
+    'import { test, expect } from "@playwright/test";\n'
+    + 'test("expects text that never arrives", async ({ page }) => {\n'
+    + '  await page.goto("data:text/html,<div id=target></div>");\n'
+    + '  await expect(page.locator("#target")).toHaveText("접수 완료", { timeout: 1500 });\n'
+    + "});\n",
+    "utf8",
+  );
+  await fsPromises.writeFile(
+    path.join(scriptsDir, "passing.spec.js"),
+    'import { test, expect } from "@playwright/test";\n'
+    + 'test("passes", async ({ page }) => {\n'
+    + '  await page.goto("data:text/html,<h1>ok</h1>");\n'
+    + '  await expect(page.getByRole("heading")).toHaveText("ok");\n'
+    + "});\n",
+    "utf8",
+  );
+
+  const sharedEnv = {
+    ...process.env,
+    HOST: "127.0.0.1",
+    SCRIPTS_DIR: scriptsDir,
+    RUNS_DIR: path.join(dataDir, "runs"),
+    ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+    STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+    SECRETS_DIR: secretsDir,
+    DATA_DIR: path.join(dataDir, "data"),
+    SCHEDULE_TICK_MS: "0",
+  };
+
+  const analysisPort = port + 9;
+  const analysisUrl = `http://127.0.0.1:${analysisPort}`;
+  let proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    // A deliberately invalid temperature: Number("abc") is NaN, which
+    // JSON.stringify writes as null and a model server rejects.
+    env: { ...sharedEnv, PORT: String(analysisPort), LLM_BASE_URL: stub.baseUrl, LLM_TEMPERATURE: "abc" },
+  });
+
+  const callOn = (baseUrl) => async (method, urlPath, body) => {
+    const response = await fetch(`${baseUrl}${urlPath}`, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json() };
+  };
+  const api = callOn(analysisUrl);
+  const settle = async (runId, request) => {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const status = (await request("GET", `/api/runs/${runId}`)).payload.data.status;
+      if (status !== "running" && status !== "queued") {
+        return status;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    return "timed-out";
+  };
+
+  let failingRunId = null;
+  try {
+    await waitForHealth(analysisUrl);
+
+    await check("the analysis probe reports reachability and which model would answer", async () => {
+      const quiet = (await api("GET", "/api/analysis/capabilities")).payload.data;
+      // Without probe this stays a read of the configuration: nothing leaves.
+      assert(quiet.reachable === undefined, JSON.stringify(Object.keys(quiet)));
+      assert(quiet.editsAnything === false, "analysis claims it can edit something");
+
+      const probed = (await api("GET", "/api/analysis/capabilities?probe=true")).payload.data;
+      assert(probed.reachable === true, JSON.stringify(probed.error));
+      assert(probed.wouldUse === "stub-model-7b", String(probed.wouldUse));
+    });
+
+    await check("a failing run is diagnosed, and the answer is bound to its evidence", async () => {
+      const created = await api("POST", "/api/runs", {
+        scriptKey: "failing",
+        project: "chromium",
+        retrySafe: true,
+        variables: { password: "{{secret.ANALYSIS_PASSWORD}}" },
+      });
+      failingRunId = created.payload.data.runId;
+      const status = await settle(failingRunId, api);
+      if (status !== "failed") {
+        const logs = (await api("GET", `/api/runs/${failingRunId}/logs`)).payload.data.logs
+          .map((entry) => entry.line).join("\n");
+        if (/Executable doesn't exist|playwright install/i.test(logs) && !requireBrowser) {
+          record("failure analysis checks", "skip", "no Playwright browser installed");
+          return "skip";
+        }
+        assert(false, `expected a failed run, got ${status}`);
+      }
+
+      const { payload } = await api("POST", `/api/runs/${failingRunId}/analyze`, {});
+      const analysis = payload.data.analysis;
+      assert(analysis.status === "ok", JSON.stringify(analysis.status));
+      assert(analysis.model === "stub-model-7b", String(analysis.model));
+      // A confidence the model invented is normalised down, not trusted.
+      assert(analysis.hypotheses[1].confidence === "low", analysis.hypotheses[1].confidence);
+      // The evidence comes back so the answer can be checked against it.
+      assert(analysis.evidence.failedTests.length >= 1, JSON.stringify(analysis.evidence.failedTests));
+      // Retry safety is declared by the caller, never inferred by the model.
+      assert(analysis.evidence.retrySafeDeclared === true, String(analysis.evidence.retrySafeDeclared));
+      assert(/hypothesis/i.test(analysis.disclaimer), analysis.disclaimer);
+
+      const cached = await api("POST", `/api/runs/${failingRunId}/analyze`, {});
+      assert(cached.payload.data.cached === true, "a second call asked the model again");
+      return undefined;
+    });
+
+    await check("nothing secret and no attachment content reaches the model", async () => {
+      const sent = stub.prompts.join("\\n");
+      assert(sent.length > 0, "the stub was never called");
+      assert(!sent.includes("s3cr3t-analysis-value"), "a secret value was sent to the model");
+      // Log lines may name an attachment's path because Playwright prints it;
+      // the claim is that no file contents are read or sent.
+      assert(!/base64|data:image/.test(sent), "attachment content was sent");
+      assert(!/"attachments"/.test(sent), "the attachments list was sent");
+      // The instruction that keeps this advisory has to actually be in the prompt.
+      assert(/Never suggest changing an expected value/.test(sent), "the prompt lost its guardrail");
+    });
+
+    await check("an unusable LLM_TEMPERATURE falls back instead of sending null", async () => {
+      const sent = JSON.parse(stub.prompts[stub.prompts.length - 1]);
+      assert(sent.temperature === 0, `temperature was sent as ${JSON.stringify(sent.temperature)}`);
+    });
+
+    await check("the model is re-resolved, so swapping it out does not need a restart", async () => {
+      if (!failingRunId) {
+        return;
+      }
+      // Caching the id for the process lifetime meant an operator who restarted
+      // the model server with a different model got stale failures until this
+      // server restarted too.
+      stub.setModel("stub-model-13b");
+      const { payload } = await api("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+      assert(payload.data.analysis.model === "stub-model-13b", String(payload.data.analysis.model));
+      stub.setModel("stub-model-7b");
+    });
+
+    await check("analysis is refused when nothing failed", async () => {
+      const created = await api("POST", "/api/runs", { scriptKey: "passing", project: "chromium" });
+      const runId = created.payload.data.runId;
+      const status = await settle(runId, api);
+      if (status !== "completed") {
+        return;
+      }
+      const refused = await api("POST", `/api/runs/${runId}/analyze`, {});
+      assert(refused.status === 409 && refused.payload.error.code === "RUN_DID_NOT_FAIL",
+        `${refused.status} ${refused.payload.error?.code}`);
+      assert((await api("POST", `/api/runs/${runId}/analyze`, { force: true })).status === 200,
+        "force did not override the refusal");
+    });
+
+    await check("a reply that is not JSON is reported unusable, not summarised", async () => {
+      if (!failingRunId) {
+        return;
+      }
+      stub.setMode("prose");
+      const { payload } = await api("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+      const analysis = payload.data.analysis;
+      // Turning prose into something that looks like a finding would be worse
+      // than admitting the answer is unusable.
+      assert(analysis.status === "unusable", JSON.stringify(analysis.status));
+      assert(analysis.needsHuman === true, String(analysis.needsHuman));
+      assert(/did not return JSON/.test(analysis.humanReason), analysis.humanReason);
+    });
+
+    await check("an unreachable model is a clear error and leaves the run alone", async () => {
+      if (!failingRunId) {
+        return;
+      }
+      stub.setMode("down");
+      const failed = await api("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+      assert(failed.status === 502 && failed.payload.error.code === "LLM_REQUEST_FAILED",
+        `${failed.status} ${failed.payload.error?.code}`);
+      // The run itself must be untouched by a failed analysis.
+      const run = (await api("GET", `/api/runs/${failingRunId}`)).payload.data;
+      assert(run.status === "failed", run.status);
+      assert(run.analysis !== null, "the previous answer was lost");
+      stub.setMode("good");
+    });
+
+    await check("a person can read the diagnosis on the run page", async () => {
+      if (!failingRunId) {
+        return;
+      }
+      // Re-analysed with the stub healthy so the panel has a good answer to show.
+      await api("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+
+      const session = await api("POST", "/api/sessions", {});
+      if (session.status !== 201) {
+        const message = session.payload?.error?.message || `HTTP ${session.status}`;
+        if (/Executable doesn't exist|playwright install/i.test(message) && !requireBrowser) {
+          return;
+        }
+        assert(false, message.split("\n")[0]);
+      }
+      const sessionId = session.payload.data.sessionId;
+      try {
+        const contextId = (await api("POST", `/api/sessions/${sessionId}/contexts`, {})).payload.data.contextId;
+        const pageId = (await api("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {}))
+          .payload.data.pageId;
+        const act = (action, body) => api("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
+
+        // This instance runs without API_TOKEN, so the page loads the run directly.
+        await act("goto", { url: `${analysisUrl}/runs?lang=ko&runId=${failingRunId}`, waitUntil: "domcontentloaded" });
+        const panel = await act("wait-for", {
+          locator: { css: "[data-testid='analysis-panel']" }, state: "visible", timeoutMs: 20000,
+        });
+        assert(panel.status === 200, "the analysis panel never appeared for a failed run");
+
+        await act("click", { locator: { css: "[data-testid='analyze-run']" } });
+        const hypothesis = await act("wait-for", {
+          locator: { css: "[data-testid='analysis-hypothesis']", first: true }, timeoutMs: 25000,
+        });
+        assert(hypothesis.status === 200, "no hypothesis rendered");
+
+        const shown = await act("locator/query", {
+          locator: { css: "[data-testid='analysis-hypothesis']", first: true }, operation: "textContent",
+        });
+        // The evidence has to be on screen, not just in the payload: a reader
+        // deciding what to do next needs to be able to go and check it.
+        assert(/failedTests/.test(shown.payload.data.value || ""), shown.payload.data.value);
+
+        const disclaimer = await act("locator/query", {
+          locator: { css: "[data-testid='analysis-disclaimer']" }, operation: "textContent",
+        });
+        // A hypothesis from a model is not a finding, and the screen says so.
+        assert(/hypothesis/i.test(disclaimer.payload.data.value || ""), disclaimer.payload.data.value);
+        assert(/stub-model-7b/.test(disclaimer.payload.data.value || ""), disclaimer.payload.data.value);
+      } finally {
+        await api("DELETE", `/api/sessions/${sessionId}`);
+      }
+    });
+
+    await check("a cached answer survives a restart, and an unconfigured server refuses", async () => {
+      if (!failingRunId) {
+        return;
+      }
+      // Re-analysed with the stub healthy so there is a good answer to restore.
+      await api("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+      proc.kill("SIGTERM");
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      const plainPort = port + 10;
+      const plainUrl = `http://127.0.0.1:${plainPort}`;
+      proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+        cwd: rootDir,
+        stdio: ["ignore", "ignore", "pipe"],
+        // No LLM_BASE_URL: analysis must refuse rather than pretend.
+        env: { ...sharedEnv, PORT: String(plainPort) },
+      });
+      await waitForHealth(plainUrl);
+      const plain = callOn(plainUrl);
+
+      const health = (await plain("GET", "/health")).payload.data;
+      assert(health.features.failureAnalysis === false, String(health.features.failureAnalysis));
+
+      const restored = (await plain("GET", `/api/runs/${failingRunId}`)).payload.data;
+      assert(restored.analysis?.status === "ok", JSON.stringify(restored.analysis?.status));
+      assert(restored.analysis.model === "stub-model-7b", String(restored.analysis.model));
+
+      const refused = await plain("POST", `/api/runs/${failingRunId}/analyze`, { refresh: true });
+      assert(refused.status === 503 && refused.payload.error.code === "LLM_NOT_CONFIGURED",
+        `${refused.status} ${refused.payload.error?.code}`);
+      // The message has to name the variable, since this is configured only by env.
+      assert(/LLM_BASE_URL/.test(refused.payload.error.message), refused.payload.error.message);
+    });
+  } finally {
+    proc.kill("SIGTERM");
+    stub.close();
     await fsPromises.rm(dataDir, { recursive: true, force: true });
   }
 }
@@ -2399,6 +2761,7 @@ async function run() {
   await runRetentionChecks();
   await runApprovalLimitChecks();
   await runScriptBundleChecks();
+  await runFailureAnalysisChecks();
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();
@@ -3210,6 +3573,54 @@ async function run() {
       });
       assert(payload.error.code === "INVALID_CONDITION", JSON.stringify(payload));
       assert(/compares numbers/.test(payload.error.message), payload.error.message);
+    });
+
+    await check("an unconfigured diagnosis names the variable to set", async () => {
+      // This harness has no LLM_BASE_URL, so the page must say what to do about
+      // it rather than report a server fault.
+      const script = await call("PUT", "/api/scripts/analysis-ui", {
+        content: [
+          'import { expect, test } from "@playwright/test";',
+          "",
+          'test("fails for the analysis panel", async ({ page }) => {',
+          '  await page.goto("data:text/html,<div id=t></div>");',
+          '  await expect(page.locator("#t")).toHaveText("never", { timeout: 1200 });',
+          "});",
+          "",
+        ].join("\n"),
+      });
+      assert(script.status < 300, `uploading the script returned ${script.status}`);
+      const created = await call("POST", "/api/runs", { scriptKey: "analysis-ui", project: "chromium" });
+      const failedRunId = created.payload.data.runId;
+      await waitForRuns([failedRunId]);
+
+      const refused = await call("POST", `/api/runs/${failedRunId}/analyze`, {});
+      assert(refused.status === 503 && refused.payload.error.code === "LLM_NOT_CONFIGURED",
+        `${refused.status} ${refused.payload.error?.code}`);
+      assert(/LLM_BASE_URL/.test(refused.payload.error.message), refused.payload.error.message);
+
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, {
+        url: `${baseUrl}/runs?lang=ko&runId=${failedRunId}`,
+      });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/fill`, {
+        locator: { css: "#apiToken" }, value: token,
+      });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, { locator: { css: "#refreshBtn" } });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/wait-for`, {
+        locator: { css: "[data-testid='analyze-run']" }, state: "visible", timeoutMs: 20000,
+      });
+      await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/click`, {
+        locator: { css: "[data-testid='analyze-run']" },
+      });
+      const told = await call("POST", `/api/sessions/${sessionId}/pages/${pageId}/assert/text`, {
+        locator: { css: "[data-testid='analysis-panel']" },
+        expected: "LLM_BASE_URL",
+        timeoutMs: 15000,
+      });
+      assert(told.status === 200, "the page did not name the variable an operator has to set");
+
+      await call("DELETE", `/api/runs/${failedRunId}`);
+      await call("DELETE", "/api/scripts/analysis-ui");
     });
 
     await check("closing a session drops the gates that were waiting on it", async () => {

@@ -202,6 +202,106 @@ async function renderEvidence(runId, tests) {
   return panel;
 }
 
+// The diagnosis panel.
+//
+// A hypothesis from a model is not a finding, so the panel says so on screen
+// rather than only in the API payload — someone reading this is deciding what
+// to do next, and the distinction is the whole point.
+function renderAnalysis(runId, run) {
+  const panel = element('div', { className: 'subpanel' }, [
+    element('h3', { textContent: COPY.analysisTitle }),
+  ]);
+  panel.dataset.testid = 'analysis-panel';
+
+  const body = element('div');
+  const button = element('button', {
+    type: 'button',
+    id: 'analyzeBtn',
+    className: 'secondary',
+    textContent: COPY.analyzeButton,
+  });
+  button.dataset.testid = 'analyze-run';
+
+  const draw = (analysis, cached) => {
+    body.replaceChildren();
+    if (!analysis) {
+      body.append(element('p', { className: 'muted', textContent: COPY.analysisNone }));
+      return;
+    }
+
+    if (analysis.status === 'unusable') {
+      // Summarising prose into something that reads like a finding would be
+      // worse than showing that the answer cannot be used.
+      body.append(element('p', { className: 'step-error', textContent: COPY.analysisUnusable }));
+      body.append(element('pre', { className: 'log', textContent: analysis.raw || '' }));
+    } else {
+      body.append(element('p', { textContent: analysis.summary || '' }));
+      for (const hypothesis of analysis.hypotheses || []) {
+        const item = element('div', { className: 'step' }, [
+          element('strong', { textContent: hypothesis.cause || '' }),
+          element('div', { className: 'chips' }, [
+            element('span', {
+              className: 'chip',
+              textContent: `${COPY.analysisConfidence}: ${hypothesis.confidence}`,
+            }),
+            // Each hypothesis names the evidence it rests on, so a reader can
+            // go and check it instead of taking the model's word.
+            ...(hypothesis.evidence || []).map((line) => element('span', { className: 'chip', textContent: line })),
+          ]),
+        ]);
+        item.dataset.testid = 'analysis-hypothesis';
+        body.append(item);
+      }
+      if ((analysis.suggestedChecks || []).length) {
+        body.append(element('h4', { textContent: COPY.analysisChecks }));
+        const list = element('ul');
+        for (const line of analysis.suggestedChecks) {
+          list.append(element('li', { textContent: line }));
+        }
+        body.append(list);
+      }
+      if (analysis.needsHuman) {
+        const flag = element('p', {
+          className: 'step-error',
+          textContent: `${COPY.analysisNeedsHuman}${analysis.humanReason ? ` — ${analysis.humanReason}` : ''}`,
+        });
+        flag.dataset.testid = 'analysis-needs-human';
+        body.append(flag);
+      }
+    }
+
+    const meta = element('p', { className: 'muted' });
+    meta.dataset.testid = 'analysis-disclaimer';
+    meta.textContent = [
+      analysis.model ? `${COPY.analysisModel}: ${analysis.model}` : null,
+      cached ? COPY.analysisCached : null,
+      analysis.disclaimer,
+    ].filter(Boolean).join(' · ');
+    body.append(meta);
+  };
+
+  onClick(button, async () => {
+    setStatus(COPY.analysisRunning, false);
+    try {
+      const result = await api('POST', `${CONFIG.apiBasePath}/runs/${runId}/analyze`, { refresh: true });
+      draw(result.data.analysis, result.data.cached);
+      // Set after drawing: api() writes the status line on every call, so
+      // reporting first would be overwritten by the request that follows.
+      setStatus(COPY.analysisDone, false);
+    } catch (error) {
+      // "Not configured" is an operator problem with a specific fix, so the
+      // message names the variable instead of reading as a server fault.
+      const message = error.status === 503 ? COPY.analysisNotConfigured : error.message;
+      body.replaceChildren(element('p', { className: 'step-error', textContent: message }));
+      setStatus(message, true);
+    }
+  });
+
+  panel.append(button, body);
+  draw(run.analysis, Boolean(run.analysis));
+  return panel;
+}
+
 async function showDetail(runId) {
   currentRunId = runId;
   listView.hidden = true;
@@ -281,6 +381,12 @@ async function showDetail(runId) {
   detailBody.append(timeline);
 
   detailBody.append(await renderEvidence(runId, run.tests));
+
+  // Only for a run that actually went wrong: asking why a passing run passed is
+  // refused by the API anyway.
+  if (isTerminal && (run.status !== 'completed' || (run.tests || []).some((test) => test.status !== 'passed'))) {
+    detailBody.append(renderAnalysis(runId, run));
+  }
 
   const logPanel = element('div', { className: 'subpanel' }, [
     element('h3', { textContent: COPY.logsTitle }),

@@ -205,6 +205,18 @@
     "stepCount": "steps",
     "testPassed": "passed",
     "testFailed": "failed",
-    "testSkipped": "skipped"
+    "testSkipped": "skipped",
+    "analysisTitle": "Failure analysis",
+    "analyzeButton": "Ask for a diagnosis",
+    "analysisNone": "Not analysed yet.",
+    "analysisRunning": "Asking the model…",
+    "analysisDone": "Diagnosis received.",
+    "analysisConfidence": "confidence",
+    "analysisChecks": "Things to check",
+    "analysisNeedsHuman": "A person needs to decide",
+    "analysisModel": "model",
+    "analysisCached": "stored answer",
+    "analysisUnusable": "The model did not answer with JSON, so this cannot be used. Its raw reply follows.",
+    "analysisNotConfigured": "Failure analysis is not configured. Set LLM_BASE_URL to an OpenAI-compatible base such as http://vllm:8000/v1."
   }
 }

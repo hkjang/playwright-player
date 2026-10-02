@@ -78,6 +78,17 @@ const config = {
   approvalTimeoutMs: parseInteger(process.env.APPROVAL_TIMEOUT_MS, 60 * 60 * 1000),
   maxPendingApprovals: parseInteger(process.env.MAX_PENDING_APPROVALS, 50),
   maxScriptBundleFiles: parseInteger(process.env.MAX_SCRIPT_BUNDLE_FILES, 50),
+  // An OpenAI-compatible chat completions base, e.g. a vLLM server at
+  // http://vllm:8000/v1. Configuration only: see the comment on FailureAnalyst
+  // for why a request may not supply its own URL.
+  llmBaseUrl: (process.env.LLM_BASE_URL || "").trim().replace(/\/+$/, ""),
+  llmModel: (process.env.LLM_MODEL || "").trim(),
+  llmApiKey: process.env.LLM_API_KEY || "",
+  llmTimeoutMs: parseInteger(process.env.LLM_TIMEOUT_MS, 60 * 1000),
+  llmMaxOutputTokens: parseInteger(process.env.LLM_MAX_OUTPUT_TOKENS, 1200),
+  llmTemperature: parseFiniteNumber(process.env.LLM_TEMPERATURE, 0),
+  llmMaxLogLines: parseInteger(process.env.LLM_MAX_LOG_LINES, 60),
+  llmJsonMode: parseBoolean(process.env.LLM_RESPONSE_FORMAT_JSON, false),
   maxScriptBundleBytes: parseInteger(process.env.MAX_SCRIPT_BUNDLE_BYTES, 8 * 1024 * 1024),
   maxEventLogEntries: parseInteger(process.env.MAX_EVENT_LOG_ENTRIES, 1500),
   maxRunLogEntries: parseInteger(process.env.MAX_RUN_LOG_ENTRIES, 3000),
@@ -146,6 +157,16 @@ for (const [label, dirPath] of [
     }
     throw error;
   }
+}
+
+// Number("abc") is NaN, which JSON.stringify writes as null and a model server
+// rejects. A bad value falls back rather than producing an unsendable request.
+function parseFiniteNumber(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function parseBoolean(value, fallback = false) {
@@ -1427,6 +1448,7 @@ class RunManager {
       tests: run.tests,
       logCount: run.logCount,
       artifactCount: run.artifacts.length,
+      analysis: run.analysis,
       recordVersion: 1,
     };
   }
@@ -1619,6 +1641,9 @@ class RunManager {
       artifactCount: run.artifacts.length,
       summary: run.summary,
       tests: run.tests ?? [],
+      // The full analysis is large and only wanted on a single run, so the list
+      // carries just the fact that one exists.
+      analysis: run.analysis ?? null,
     };
   }
 
@@ -2647,6 +2672,46 @@ class RunManager {
       totalCount: run.logCount ?? logs.length,
       logs: logs.slice(-limit),
     };
+  }
+
+  // Reads the failure evidence, asks the configured model about it, and keeps
+  // the answer on the run so it is not re-asked on every page load.
+  async analyzeRun(runId, request = {}) {
+    const run = this.getRun(runId);
+    if (!TERMINAL_RUN_STATUSES.has(run.status)) {
+      throw new ApiError(409, "RUN_NOT_FINISHED", `Run ${runId} is ${run.status}; analysis needs a finished run`);
+    }
+    if (!run.tests?.length && run.paths?.runDir) {
+      run.tests = await this.extractTestResults(run);
+    }
+
+    const failed = (run.tests || []).filter((test) => test.status !== "passed");
+    // Asking a model why a passing run passed burns a request to be told nothing.
+    if (run.status === "completed" && !failed.length && !request.force) {
+      throw new ApiError(
+        409,
+        "RUN_DID_NOT_FAIL",
+        `Run ${runId} completed with no failing tests; pass force to analyse it anyway`,
+      );
+    }
+
+    if (run.analysis && !request.refresh) {
+      return { runId, cached: true, analysis: run.analysis };
+    }
+    if (!this.options.analyst) {
+      throw new ApiError(500, "ANALYST_NOT_WIRED", "This server was started without a failure analyst");
+    }
+
+    const { logs } = await this.getLogs(runId, { limit: this.options.llmMaxLogLines });
+    const logLines = logs
+      // Scrubbed again on the way out: this text is about to leave the server.
+      .map((entry) => truncate(scrubSensitive(entry.line, run.sensitiveValues), 400))
+      .slice(-this.options.llmMaxLogLines);
+
+    const analysis = await this.options.analyst.analyze(run, logLines);
+    run.analysis = analysis;
+    await this.persist(run);
+    return { runId, cached: false, analysis };
   }
 
   async deleteRun(runId) {
@@ -4303,6 +4368,325 @@ function parseJsonArray(value, at) {
     return JSON.parse(value);
   } catch {
     throw new ApiError(400, "INVALID_STEP", `step ${at}: forEach items is not a JSON array: ${truncate(value, 120)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Failure analysis
+//
+// A failed run leaves an error message, a step timeline and a log. Reading them
+// is the slow part of the job, and a local model is good at the first pass. Four
+// decisions shape what follows.
+//
+// The endpoint is configuration, never request input. Accepting a URL per
+// request would make this server a proxy for reaching anything the network can
+// see — the same reason notify URLs are allowlisted, except here there is no
+// reason to accept one at all.
+//
+// It diagnoses and never edits. Nothing in this class can write a script,
+// change an expected value or alter a run. A model that can make a failing
+// assertion pass is a model that can delete the only evidence the test existed
+// to produce.
+//
+// Only text the server controls is sent: run metadata, error messages, step
+// names and scrubbed log lines. The contents of screenshots, DOM dumps, traces
+// and videos are never read or sent, because those are exactly what secret
+// scrubbing cannot reach. A log line may still name an attachment's path, since
+// Playwright prints it, and that reference is useful rather than sensitive.
+//
+// Whether re-running is safe is not the model's call. That depends on whether
+// the scenario mutated business state, which only its author knows, so it is
+// read from a `retrySafe` flag the caller declares and echoed back — never
+// inferred.
+// ---------------------------------------------------------------------------
+
+const ANALYSIS_SYSTEM_PROMPT = [
+  "You diagnose failures in browser automation runs (Playwright).",
+  "",
+  "Answer with a single JSON object and nothing else:",
+  '{"summary": string, "hypotheses": [{"cause": string, "evidence": [string], "confidence": "high"|"medium"|"low"}],',
+  ' "suggestedChecks": [string], "needsHuman": boolean, "humanReason": string}',
+  "",
+  "Rules:",
+  "1. Never suggest changing an expected value, an assertion or a test so that it passes.",
+  "   If the expected value itself looks wrong, say so and set needsHuman to true: deciding",
+  "   what the correct value is belongs to a person, not to you.",
+  "2. Every hypothesis must quote the evidence it rests on, using the field names given.",
+  "   Do not invent log lines, selectors, URLs or numbers that are not in the evidence.",
+  "3. If the evidence does not support a diagnosis, say that plainly in summary, return an",
+  "   empty hypotheses array and set needsHuman to true. A guess presented as a finding is",
+  "   worse than no answer.",
+  "4. suggestedChecks are things a person can verify. Do not propose code edits.",
+].join("\n");
+
+class FailureAnalyst {
+  constructor(options) {
+    this.options = options;
+    // Only for reporting in describe(); never used to answer a request.
+    this.lastSeenModel = null;
+  }
+
+  get available() {
+    return Boolean(this.options.llmBaseUrl);
+  }
+
+  describe() {
+    return cleanObject({
+      available: this.available,
+      baseUrl: this.options.llmBaseUrl || null,
+      model: this.options.llmModel || this.lastSeenModel || null,
+      // Stated so an operator can see what leaves the server without reading
+      // the source.
+      sends: ["run metadata", "failed test titles and error messages", "step names and durations", "scrubbed log lines", "blocked request hosts"],
+      // Stated as contents, not references: Playwright prints the paths of the
+      // files it attached, and those lines are part of the log tail. Claiming
+      // more than is true would be the same mistake as leaking.
+      neverSends: ["screenshot contents", "DOM dump contents", "trace contents", "video contents", "secret values"],
+      note: "Log lines may name an attachment's path, because Playwright prints it. No file contents are read or sent.",
+      editsAnything: false,
+    });
+  }
+
+  // The endpoint is set by environment variable, so an operator needs a way to
+  // find out whether the value took without first having to produce a failing
+  // run. Reports what went wrong rather than just "unavailable".
+  async probe() {
+    const base = this.describe();
+    if (!this.available) {
+      return { ...base, reachable: false, error: "LLM_BASE_URL is not set" };
+    }
+
+    const startedAtMonotonic = monotonicNow();
+    try {
+      const listed = await this.call("GET", "/models");
+      const models = (listed?.data || []).map((entry) => entry.id).filter(Boolean);
+      return {
+        ...base,
+        reachable: true,
+        durationMs: elapsedMs(startedAtMonotonic),
+        models,
+        // Which one an analysis would actually use, given LLM_MODEL may be unset.
+        wouldUse: this.options.llmModel || models[0] || null,
+        apiKeyConfigured: Boolean(this.options.llmApiKey),
+      };
+    } catch (error) {
+      const apiError = toApiError(error);
+      return {
+        ...base,
+        reachable: false,
+        durationMs: elapsedMs(startedAtMonotonic),
+        code: apiError.code,
+        // The message names the URL that was tried, which is usually the typo.
+        error: apiError.message,
+        apiKeyConfigured: Boolean(this.options.llmApiKey),
+      };
+    }
+  }
+
+  requireAvailable() {
+    if (!this.available) {
+      throw new ApiError(
+        503,
+        "LLM_NOT_CONFIGURED",
+        "Failure analysis needs LLM_BASE_URL, an OpenAI-compatible chat completions base such as http://vllm:8000/v1",
+      );
+    }
+  }
+
+  async call(method, endpointPath, body) {
+    const url = `${this.options.llmBaseUrl}${endpointPath}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.options.llmTimeoutMs);
+    timer.unref?.();
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: cleanObject({
+          "Content-Type": body === undefined ? undefined : "application/json",
+          Authorization: this.options.llmApiKey ? `Bearer ${this.options.llmApiKey}` : undefined,
+        }),
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new ApiError(
+          502,
+          "LLM_REQUEST_FAILED",
+          `${method} ${url} returned ${response.status}: ${truncate(text, 400)}`,
+        );
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new ApiError(502, "LLM_REQUEST_FAILED", `${url} did not return JSON: ${truncate(text, 200)}`);
+      }
+    } catch (error) {
+      if (error instanceof ApiError) {
+        throw error;
+      }
+      if (error?.name === "AbortError") {
+        throw new ApiError(504, "LLM_TIMEOUT", `${url} did not answer within ${this.options.llmTimeoutMs}ms`);
+      }
+      throw new ApiError(502, "LLM_UNREACHABLE", `${url} could not be reached: ${error.message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // vLLM serves /v1/models, so an operator does not have to restate the model
+  // the server is already running. Deliberately not cached: an operator who
+  // restarts the model server with a different model would otherwise get a
+  // stale id until this server restarted too, and analysis is triggered by a
+  // person, so one cheap GET is the better trade.
+  async resolveModel() {
+    if (this.options.llmModel) {
+      return this.options.llmModel;
+    }
+    const listed = await this.call("GET", "/models");
+    const id = listed?.data?.[0]?.id;
+    if (!id) {
+      throw new ApiError(
+        502,
+        "LLM_MODEL_UNKNOWN",
+        `${this.options.llmBaseUrl}/models listed no model; set LLM_MODEL explicitly`,
+      );
+    }
+    this.lastSeenModel = id;
+    return id;
+  }
+
+  // The evidence is built here rather than in the prompt so that what was sent
+  // can be returned alongside the answer: an analysis nobody can audit is not
+  // worth much.
+  buildEvidence(run, logLines) {
+    const failedTests = (run.tests || []).filter((test) => test.status !== "passed");
+    return cleanObject({
+      scriptKey: run.scriptKey,
+      status: run.status,
+      exitCode: run.exitCode ?? null,
+      signal: run.signal ?? null,
+      interruptedReason: run.interruptedReason ?? null,
+      attempt: run.attempt ?? 1,
+      durationMs: run.summary?.stats?.duration ?? null,
+      project: run.request?.project ?? null,
+      environment: run.environment?.name ?? null,
+      // Declared by the caller, never inferred.
+      retrySafeDeclared: run.request?.retrySafe ?? null,
+      failedTests: failedTests.slice(0, 10).map((test) => cleanObject({
+        title: test.title,
+        project: test.project,
+        status: test.status,
+        retries: test.retries,
+        error: test.error ? truncate(test.error, 1200) : undefined,
+        // The step that failed plus what ran just before it is usually the
+        // whole story, and it is far smaller than the full timeline.
+        steps: (test.steps || []).slice(-12).map((step) => cleanObject({
+          title: step.title,
+          status: step.status,
+          durationMs: step.durationMs,
+          error: step.error ? truncate(step.error, 300) : undefined,
+        })),
+      })),
+      blockedRequests: (run.network?.blocked || []).slice(0, 10).map((entry) => cleanObject({
+        method: entry.method,
+        host: entry.host,
+      })),
+      urlAllowlist: run.network?.allowlist ?? null,
+      logTail: logLines,
+    });
+  }
+
+  parseAnswer(content) {
+    // Models wrap JSON in prose or fences often enough that refusing to look is
+    // needlessly brittle, but a response that cannot be parsed is reported as
+    // unusable rather than summarised into something that sounds like an answer.
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(content);
+    const candidate = fenced ? fenced[1] : content;
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start === -1 || end <= start) {
+      return null;
+    }
+    try {
+      return JSON.parse(candidate.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+
+  normalizeAnswer(parsed) {
+    const confidences = new Set(["high", "medium", "low"]);
+    const hypotheses = Array.isArray(parsed.hypotheses) ? parsed.hypotheses : [];
+    return {
+      summary: typeof parsed.summary === "string" ? truncate(parsed.summary, 2000) : "",
+      hypotheses: hypotheses.slice(0, 6).map((entry) => cleanObject({
+        cause: typeof entry?.cause === "string" ? truncate(entry.cause, 600) : "",
+        evidence: Array.isArray(entry?.evidence)
+          ? entry.evidence.slice(0, 8).map((line) => truncate(String(line), 300))
+          : [],
+        confidence: confidences.has(entry?.confidence) ? entry.confidence : "low",
+      })),
+      suggestedChecks: Array.isArray(parsed.suggestedChecks)
+        ? parsed.suggestedChecks.slice(0, 8).map((line) => truncate(String(line), 300))
+        : [],
+      // A model that forgot the field is treated as "a person should look",
+      // which is the safer default of the two.
+      needsHuman: typeof parsed.needsHuman === "boolean" ? parsed.needsHuman : true,
+      humanReason: typeof parsed.humanReason === "string" ? truncate(parsed.humanReason, 600) : "",
+    };
+  }
+
+  async analyze(run, logLines) {
+    this.requireAvailable();
+    const model = await this.resolveModel();
+    const evidence = this.buildEvidence(run, logLines);
+    const startedAtMonotonic = monotonicNow();
+
+    const completion = await this.call("POST", "/chat/completions", cleanObject({
+      model,
+      temperature: this.options.llmTemperature,
+      max_tokens: this.options.llmMaxOutputTokens,
+      response_format: this.options.llmJsonMode ? { type: "json_object" } : undefined,
+      messages: [
+        { role: "system", content: ANALYSIS_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `Diagnose this run.\n\nEVIDENCE:\n${JSON.stringify(evidence, null, 2)}`,
+        },
+      ],
+    }));
+
+    const content = completion?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) {
+      throw new ApiError(502, "LLM_EMPTY_RESPONSE", `${model} returned no content`);
+    }
+
+    const parsed = this.parseAnswer(content);
+    const elapsed = elapsedMs(startedAtMonotonic);
+    const base = {
+      model,
+      analyzedAt: toIso(),
+      durationMs: elapsed,
+      usage: completion.usage ?? null,
+      // What was sent, so the answer can be checked against it.
+      evidence,
+      // Restated on every answer: this is a hypothesis from a model, not a
+      // finding, and nothing here changed the run or the script.
+      disclaimer: "A hypothesis produced by a language model from the evidence above. Nothing was modified.",
+    };
+
+    if (!parsed) {
+      return {
+        ...base,
+        status: "unusable",
+        raw: truncate(content, 2000),
+        needsHuman: true,
+        humanReason: "The model did not return JSON that could be parsed.",
+      };
+    }
+
+    return { ...base, status: "ok", ...this.normalizeAnswer(parsed) };
   }
 }
 
@@ -8253,6 +8637,41 @@ function buildOpenApiSpec(req) {
           responses: { 201: { description: "New queued run" }, 409: { description: "The original run has not finished" } },
         }),
       },
+      [`${api}/runs/{runId}/analyze`]: {
+        post: operation({
+          tag: "Runs",
+          summary: "Ask the configured model why a finished run failed",
+          description:
+            "Diagnosis only: nothing here edits a script, a run or an expected value. Sends run metadata, "
+            + "failed test titles and errors, step names and durations, blocked request hosts and scrubbed log "
+            + "lines. Never sends screenshots, DOM dumps, traces or videos. The answer is cached on the run.",
+          parameters: [pathParam("runId")],
+          body: {
+            type: "object",
+            properties: {
+              refresh: { type: "boolean", description: "Ask again instead of returning the cached answer" },
+              force: { type: "boolean", description: "Analyse even though nothing failed" },
+            },
+          },
+          responses: {
+            200: { description: "Hypotheses with the evidence each rests on, plus what was sent" },
+            409: { description: "The run has not finished, or nothing failed" },
+            503: { description: "LLM_BASE_URL is not configured" },
+            504: { description: "The model did not answer in time" },
+          },
+        }),
+      },
+      [`${api}/analysis/capabilities`]: {
+        get: operation({
+          tag: "Runs",
+          summary: "Whether failure analysis is configured, and exactly what it sends",
+          description:
+            "probe=true also calls the configured endpoint's /models and reports whether it answered, which "
+            + "model an analysis would use, and the error if it did not. Without probe nothing leaves the server.",
+          parameters: [{ name: "probe", in: "query", required: false, schema: { type: "boolean" } }],
+          responses: { 200: { description: "Availability, model, the send/never-send lists, and optionally reachability" } },
+        }),
+      },
       [`${api}/runs/{runId}/artifacts/{artifactPath}`]: {
         get: operation({
           tag: "Runs",
@@ -8490,9 +8909,11 @@ function buildOpenApiSpec(req) {
 
 const scriptRegistry = new ScriptRegistry(config);
 await scriptRegistry.refresh();
+const failureAnalyst = new FailureAnalyst(config);
 const runManager = new RunManager({
   ...config,
   registry: scriptRegistry,
+  analyst: failureAnalyst,
 });
 await loadUiAssets();
 await runManager.restore();
@@ -8665,6 +9086,7 @@ app.get("/health", asyncRoute(async (req, res) => {
       persistentRunHistory: true,
       scheduler: config.scheduleTickMs > 0,
       workflowControlFlow: ["if", "repeat", "forEach", "while", "break", "continue", "approval"],
+      failureAnalysis: failureAnalyst.available,
       // Gates live in memory with the session they suspended, so a restart
       // cancels them rather than silently resuming later.
       approvalGatesPersistAcrossRestart: false,
@@ -8976,6 +9398,16 @@ app.post(`${config.apiBasePath}/sessions/:sessionId/trace/stop`, asyncRoute(asyn
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/execute`, asyncRoute(async (req, res) => {
   ok(res, await sessionManager.execute(req.params.sessionId, req.body || {}));
+}));
+
+app.post(`${config.apiBasePath}/runs/:runId/analyze`, asyncRoute(async (req, res) => {
+  ok(res, await runManager.analyzeRun(req.params.runId, req.body || {}));
+}));
+
+app.get(`${config.apiBasePath}/analysis/capabilities`, asyncRoute(async (req, res) => {
+  // probe=true reaches the configured endpoint; without it this stays a
+  // zero-dependency read of the configuration.
+  ok(res, parseBoolean(req.query.probe, false) ? await failureAnalyst.probe() : failureAnalyst.describe());
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/execute/resume`, asyncRoute(async (req, res) => {
@@ -9589,6 +10021,26 @@ const mcpTools = [
     "Queue a new run with the same request as a finished one. Returns the new runId; the original is left untouched.",
     { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] },
     async (args) => runManager.retryRun(args.runId),
+  ),
+  defineTool(
+    "run_analyze",
+    "Ask the locally configured model why a finished run failed. Returns hypotheses, each quoting the evidence it rests on, plus the exact evidence that was sent. Diagnosis only: this cannot and must not be used to change a script, an assertion or an expected value so that a test passes — if the expected value itself looks wrong, the answer says a person must decide. The answer is cached on the run; pass refresh to ask again.",
+    {
+      type: "object",
+      properties: {
+        runId: { type: "string" },
+        refresh: { type: "boolean", description: "Ask again instead of returning the cached answer" },
+        force: { type: "boolean", description: "Analyse even though nothing failed" },
+      },
+      required: ["runId"],
+    },
+    async (args) => runManager.analyzeRun(args.runId, args),
+  ),
+  defineTool(
+    "analysis_capabilities",
+    "Whether failure analysis is configured, which model answers, and exactly what is and is not sent to it. Pass probe to also check the endpoint actually answers and report the error if it does not.",
+    { type: "object", properties: { probe: { type: "boolean" } } },
+    async (args) => (args?.probe ? failureAnalyst.probe() : failureAnalyst.describe()),
   ),
   defineTool("run_delete", "Delete a finished run and reclaim its artifacts from disk.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.deleteRun(args.runId)),
   defineTool("session_list", "List active browser sessions.", { type: "object", properties: {} }, async () => ({ sessions: sessionManager.listSessions() })),
