@@ -1727,6 +1727,283 @@ async function runFailureAnalysisChecks() {
   }
 }
 
+// Named identities with roles and scopes. Runs on its own instances because the
+// principals file is read at boot, and one instance is deliberately started
+// with a broken file to confirm the server refuses to run rather than falling
+// back to a shared secret.
+async function runRoleChecks() {
+  const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-roles-"));
+  const scriptsDir = path.join(dataDir, "scripts");
+  const secretsDir = path.join(dataDir, "secrets");
+  await fsPromises.mkdir(path.join(scriptsDir, "checkout"), { recursive: true });
+  await fsPromises.mkdir(path.join(scriptsDir, "payroll"), { recursive: true });
+  await fsPromises.mkdir(secretsDir, { recursive: true });
+  const spec = 'import { test, expect } from "@playwright/test";\n'
+    + 'test("ok", async () => { expect(1).toBe(1); });\n';
+  await fsPromises.writeFile(path.join(scriptsDir, "checkout", "order.spec.js"), spec, "utf8");
+  await fsPromises.writeFile(path.join(scriptsDir, "payroll", "salary.spec.js"), spec, "utf8");
+  await fsPromises.writeFile(path.join(secretsDir, "principals.json"), JSON.stringify({
+    principals: [
+      { id: "kim@example.com", name: "Kim", token: "kim-tok", roles: ["approver", "runner"], scopes: ["checkout/*"] },
+      { id: "lee@example.com", token: "lee-tok", roles: ["approver"] },
+      { id: "ci", token: "ci-tok", roles: ["runner"], scopes: ["checkout/*"] },
+      { id: "watcher", token: "watch-tok", roles: ["viewer"] },
+      { id: "boss", token: "boss-tok", roles: ["admin"] },
+    ],
+  }), "utf8");
+
+  const rolePort = port + 11;
+  const roleUrl = `http://127.0.0.1:${rolePort}`;
+  const proc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+    cwd: rootDir,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      PORT: String(rolePort),
+      HOST: "127.0.0.1",
+      SCRIPTS_DIR: scriptsDir,
+      SECRETS_DIR: secretsDir,
+      RUNS_DIR: path.join(dataDir, "runs"),
+      ARTIFACTS_DIR: path.join(dataDir, "artifacts"),
+      STORAGE_STATE_DIR: path.join(dataDir, "storage-states"),
+      DATA_DIR: path.join(dataDir, "data"),
+      SCHEDULE_TICK_MS: "0",
+    },
+  });
+
+  const as = (token) => async (method, urlPath, body) => {
+    const response = await fetch(`${roleUrl}${urlPath}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, payload: await response.json().catch(() => null) };
+  };
+  const anon = as(null);
+  const kim = as("kim-tok");
+  const lee = as("lee-tok");
+  const ci = as("ci-tok");
+  const watcher = as("watch-tok");
+  const boss = as("boss-tok");
+
+  try {
+    await waitForHealth(roleUrl);
+
+    await check("a token resolves to a named identity with its roles", async () => {
+      assert((await anon("GET", "/api/runs")).status === 401, "an anonymous call was allowed");
+      assert((await as("not-a-token")("GET", "/api/runs")).status === 401, "a wrong token was allowed");
+
+      const who = (await kim("GET", "/api/whoami")).payload.data;
+      assert(who.principal.id === "kim@example.com", JSON.stringify(who.principal));
+      assert(who.principal.verified === true, "a named token should be verified");
+      assert(who.may.approve === true && who.may.administer === false, JSON.stringify(who.may));
+
+      const health = (await anon("GET", "/health")).payload.data;
+      assert(health.features.namedIdentities === true, "health does not report identities");
+      // No shared token here, so there must be no unattributable admin path.
+      assert(health.features.sharedTokenAdmin === false, "a shared-token backdoor was reported");
+    });
+
+    await check("a role is required, not assumed", async () => {
+      assert((await watcher("GET", "/api/runs")).status === 200, "a viewer cannot read");
+      assert((await watcher("POST", "/api/runs", { scriptKey: "checkout/order" })).status === 403,
+        "a viewer could create a run");
+      assert((await lee("POST", "/api/runs", { scriptKey: "checkout/order" })).status === 403,
+        "an approver could create a run");
+      assert((await ci("PUT", "/api/scripts/checkout/new", { content: spec })).status === 403,
+        "a runner could upload code");
+      assert((await ci("DELETE", "/api/runs/run_whatever")).status === 403,
+        "a runner could delete a run");
+      assert((await boss("PUT", "/api/scripts/checkout/extra", { content: spec })).status < 300,
+        "an admin could not upload code");
+    });
+
+    await check("a scope keeps one project out of another's work", async () => {
+      const mine = await ci("POST", "/api/runs", { scriptKey: "checkout/order", project: "chromium" });
+      if (mine.status !== 201) {
+        const message = mine.payload?.error?.message || `HTTP ${mine.status}`;
+        if (/Executable doesn't exist|playwright install/i.test(message) && !requireBrowser) {
+          record("role and scope checks", "skip", "no Playwright browser installed");
+          return "skip";
+        }
+        assert(false, message.split("\n")[0]);
+      }
+
+      const refused = await ci("POST", "/api/runs", { scriptKey: "payroll/salary", project: "chromium" });
+      assert(refused.status === 403 && refused.payload.error.code === "OUT_OF_SCOPE",
+        `${refused.status} ${refused.payload.error?.code}`);
+      // The refusal has to say what the caller may reach, or it is unactionable.
+      assert(/scopes are checkout\/\*/.test(refused.payload.error.message), refused.payload.error.message);
+
+      const visible = (await ci("GET", "/api/scripts")).payload.data.scripts.map((s) => s.scriptKey);
+      assert(visible.length > 0 && visible.every((key) => key.startsWith("checkout/")), JSON.stringify(visible));
+      const everything = (await boss("GET", "/api/scripts")).payload.data.scripts.map((s) => s.scriptKey);
+      assert(everything.some((key) => key.startsWith("payroll/")), JSON.stringify(everything));
+
+      const theirs = await boss("POST", "/api/runs", { scriptKey: "payroll/salary", project: "chromium" });
+      const theirRunId = theirs.payload.data.runId;
+      assert((await ci("GET", `/api/runs/${theirRunId}`)).status === 403,
+        "a scoped caller could read another scope's run");
+      assert((await ci("GET", `/api/runs/${mine.payload.data.runId}`)).status === 200,
+        "a scoped caller could not read its own run");
+      const listed = (await ci("GET", "/api/runs")).payload.data;
+      assert(listed.runs.every((run) => run.scriptKey.startsWith("checkout/")), JSON.stringify(listed.runs));
+      return undefined;
+    });
+
+    await check("an approval is attributed to the token that made it", async () => {
+      const session = await kim("POST", "/api/sessions", {});
+      if (session.status !== 201) {
+        return;
+      }
+      const sessionId = session.payload.data.sessionId;
+      try {
+        const contextId = (await kim("POST", `/api/sessions/${sessionId}/contexts`, {})).payload.data.contextId;
+        const pageId = (await kim("POST", `/api/sessions/${sessionId}/contexts/${contextId}/pages`, {}))
+          .payload.data.pageId;
+        await kim("POST", `/api/sessions/${sessionId}/pages/${pageId}/goto`, { url: `${roleUrl}/demo/test-page` });
+        const open = (approvers) => kim("POST", `/api/sessions/${sessionId}/execute`, {
+          pageId,
+          steps: [
+            { action: "approval", name: "finance", ...(approvers ? { approvers } : {}) },
+            { action: "click", locator: { testId: "increment-counter" } },
+          ],
+        });
+
+        let gateId = (await open()).payload.data.approval.gateId;
+        assert((await ci("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" }))
+          .status === 403, "a runner could decide an approval gate");
+
+        // The point of the whole exercise: no decidedBy in the body, and the
+        // record still names who did it, marked as proven.
+        const decided = await kim("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" });
+        assert(decided.status === 200, `${decided.status} ${decided.payload.error?.code}`);
+        assert(decided.payload.data.decidedBy === "kim@example.com", decided.payload.data.decidedBy);
+        assert(decided.payload.data.decidedByVerified === true, "a named decision was not marked verified");
+
+        gateId = (await open()).payload.data.approval.gateId;
+        const lying = await kim("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, {
+          decision: "approve", decidedBy: "someone-else@example.com",
+        });
+        // Silently overwriting the claim would let a client believe it recorded
+        // a different person's approval.
+        assert(lying.status === 400 && lying.payload.error.code === "DECIDED_BY_MISMATCH",
+          `${lying.status} ${lying.payload.error?.code}`);
+        await kim("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" });
+
+        gateId = (await open(["lee@example.com"])).payload.data.approval.gateId;
+        // The approvers list is now checked against a proven identity rather
+        // than against a string the caller supplied.
+        assert((await kim("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" }))
+          .status === 403, "an unlisted approver could decide");
+        assert((await lee("POST", `/api/sessions/${sessionId}/approvals/${gateId}/decide`, { decision: "approve" }))
+          .status === 200, "the listed approver could not decide");
+      } finally {
+        await kim("DELETE", `/api/sessions/${sessionId}`);
+      }
+    });
+
+    await check("mcp is not a way around the roles", async () => {
+      const open = async (token) => {
+        const init = await fetch(`${roleUrl}/mcp`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+        });
+        const mcpSessionId = init.headers.get("mcp-session-id");
+        return async (method, params) => {
+          const response = await fetch(`${roleUrl}/mcp`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Mcp-Session-Id": mcpSessionId,
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+          });
+          return response.json();
+        };
+      };
+
+      const asRunner = await open("ci-tok");
+      const runnerTools = (await asRunner("tools/list", {})).result.tools.map((tool) => tool.name);
+      assert(!runnerTools.includes("run_delete"), "a runner was offered run_delete");
+      assert(!runnerTools.includes("session_approval_decide"), "a runner was offered the approval decision");
+      assert(runnerTools.includes("run_create"), "a runner lost the tools it needs");
+
+      // The endpoint check only says the caller may speak MCP. Without a check
+      // at the tool, a runner would reach run_delete and the roles would be
+      // decoration.
+      const denied = await asRunner("tools/call", { name: "run_delete", arguments: { runId: "run_x" } });
+      assert(JSON.stringify(denied.result).includes("FORBIDDEN"), JSON.stringify(denied.result).slice(0, 200));
+
+      const asAdmin = await open("boss-tok");
+      const all = (await asAdmin("tools/list", {})).result.tools;
+      // Every tool must carry a role: one added later without a thought would
+      // otherwise default into whatever the fallback happens to be.
+      const missing = all.filter((tool) => !["viewer", "runner", "approver", "admin"].includes(tool.requiredRole));
+      assert(!missing.length, `tools without a role: ${missing.map((t) => t.name).join(", ")}`);
+      const byName = new Map(all.map((tool) => [tool.name, tool.requiredRole]));
+      // The destructive ones must not sit at runner.
+      for (const [name, expected] of [
+        ["run_delete", "admin"], ["script_upload", "admin"], ["script_delete", "admin"],
+        ["schedule_save", "admin"], ["environment_delete", "admin"], ["dataset_delete", "admin"],
+        ["session_approval_decide", "approver"],
+      ]) {
+        assert(byName.get(name) === expected, `${name} requires ${byName.get(name)}, expected ${expected}`);
+      }
+      assert(byName.get("run_list") === "viewer", `run_list requires ${byName.get("run_list")}`);
+    });
+  } finally {
+    proc.kill("SIGTERM");
+  }
+
+  // A broken principals file must stop the server, not quietly leave it running
+  // with an authorisation model nobody configured.
+  await check("a malformed principals file stops the server", async () => {
+    const brokenDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-badroles-"));
+    await fsPromises.mkdir(path.join(brokenDir, "secrets"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(brokenDir, "secrets", "principals.json"),
+      // Two principals sharing a token: whichever matched would be credited
+      // for the other's actions.
+      JSON.stringify({ principals: [
+        { id: "a", token: "same", roles: ["admin"] },
+        { id: "b", token: "same", roles: ["viewer"] },
+      ] }),
+      "utf8",
+    );
+    const badProc = spawn(process.execPath, [path.join(rootDir, "server.js")], {
+      cwd: rootDir,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        PORT: String(port + 12),
+        HOST: "127.0.0.1",
+        SCRIPTS_DIR: path.join(brokenDir, "scripts"),
+        SECRETS_DIR: path.join(brokenDir, "secrets"),
+        RUNS_DIR: path.join(brokenDir, "runs"),
+        DATA_DIR: path.join(brokenDir, "data"),
+        SCHEDULE_TICK_MS: "0",
+      },
+    });
+    let stderr = "";
+    badProc.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exitCode = await new Promise((resolve) => {
+      badProc.on("exit", (code) => resolve(code));
+      setTimeout(() => { badProc.kill("SIGKILL"); resolve("did-not-exit"); }, 20000);
+    });
+    assert(exitCode !== "did-not-exit" && exitCode !== 0, `the server kept running (exit ${exitCode})`);
+    assert(/shares a token/.test(stderr), `the reason was not reported: ${stderr.slice(0, 200)}`);
+    await fsPromises.rm(brokenDir, { recursive: true, force: true });
+  });
+
+  await fsPromises.rm(dataDir, { recursive: true, force: true });
+}
+
 async function runRetentionChecks() {
   const dataDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "pw-player-retain-"));
   const scriptsDir = path.join(dataDir, "scripts");
@@ -2762,6 +3039,7 @@ async function run() {
   await runApprovalLimitChecks();
   await runScriptBundleChecks();
   await runFailureAnalysisChecks();
+  await runRoleChecks();
 
   // ---- URL allowlist (needs its own server instance) -----------------------
   await runAllowlistChecks();

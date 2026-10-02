@@ -45,6 +45,10 @@ docker run -d --name ppcheck --init --ipc=host -p 3000:3000 \
 | 이미지에 `secrets/` 내용이 들어가지 않았는지 (`ls -A /app/secrets` → 0) | 비밀값이 이미지에 구워지면 이미지를 받은 모든 곳에 유출됩니다 |
 | `{{secret.NAME}}` 를 쓰는 실행의 로그에 값이 아니라 `***` 가 남는지 | 스크러빙이 꺼지면 조용히 평문이 저장됩니다 |
 | `/health` 의 `version` 이 `package.json` 과 같은지 | v0.13.0 이 `0.12.0` 으로 보고된 적이 있습니다. 이제 `package.json` 에서 읽으므로 버전은 한 곳만 올리면 됩니다 |
+| `principals.json` 을 준 컨테이너에서 역할·범위가 막히는지 (viewer 가 실행 생성 403, 범위 밖 스크립트 403) | 권한이 적용되지 않으면 적혀 있을 뿐입니다 |
+| 승인이 토큰에 귀속되고 `decidedByVerified: true` 로 기록되는지 | 증명할 수 없는 이름이 증명된 것처럼 보이면 이름이 없는 것보다 나쁩니다 |
+| MCP `tools/list` 가 역할에 따라 걸러지고 금지된 도구 호출이 `FORBIDDEN` 인지 | 도구 단위 검사가 없으면 `/mcp` 가 권한 우회로가 됩니다 |
+| `principals.json` 이 깨졌을 때 서버가 뜨지 않는지 | 아무도 설정하지 않은 권한 모델로 도는 것보다 낫습니다 |
 | `/runs` 실패 상세에서 사람이 원인 분석을 요청하고 가설·근거를 읽을 수 있는지 | 사람이 읽을 수 없는 분석은 쓸모가 없습니다 |
 | `LLM_BASE_URL` 없이 `analyze` 가 `503 LLM_NOT_CONFIGURED` 인지 | 설정이 비었을 때 조용히 아무것도 안 하면 운영자가 원인을 못 찾습니다 |
 | `LLM_BASE_URL` 를 준 컨테이너에서 `capabilities?probe=true` 가 reachable 을 보고하는지 | 환경변수만으로 설정하므로 값이 들어갔는지 확인할 수단이 필요합니다 |

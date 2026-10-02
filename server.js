@@ -3,7 +3,7 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { createRequire } from "node:module";
@@ -78,6 +78,9 @@ const config = {
   approvalTimeoutMs: parseInteger(process.env.APPROVAL_TIMEOUT_MS, 60 * 60 * 1000),
   maxPendingApprovals: parseInteger(process.env.MAX_PENDING_APPROVALS, 50),
   maxScriptBundleFiles: parseInteger(process.env.MAX_SCRIPT_BUNDLE_FILES, 50),
+  // Named identities with roles. Absent, the shared API_TOKEN keeps behaving
+  // exactly as before — this is opt-in.
+  principalsFile: (process.env.PRINCIPALS_FILE || "").trim(),
   // An OpenAI-compatible chat completions base, e.g. a vLLM server at
   // http://vllm:8000/v1. Configuration only: see the comment on FailureAnalyst
   // for why a request may not supply its own URL.
@@ -3701,6 +3704,251 @@ async function poll(timeoutMs, fn, onTimeoutMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// Identity and roles
+//
+// Until now the API had one shared secret: it said which client called, never
+// which person. That was fine for a runner and wrong for an approval gate,
+// where `decidedBy` was free text nobody could check. With a principals file
+// the decision is attributed to the token that made it, and the audit record
+// says whether the name was proven or merely claimed.
+//
+// Entirely opt-in: with no PRINCIPALS_FILE the shared token behaves exactly as
+// before, so an existing deployment is unaffected.
+// ---------------------------------------------------------------------------
+
+const ROLES = ["viewer", "runner", "approver", "admin"];
+
+// admin is everything. A runner and an approver cannot do their job blind, so
+// both can read.
+const IMPLIED_ROLES = {
+  admin: ["admin", "viewer", "runner", "approver"],
+  runner: ["runner", "viewer"],
+  approver: ["approver", "viewer"],
+  viewer: ["viewer"],
+};
+
+function expandRoles(roles) {
+  const expanded = new Set();
+  for (const role of roles) {
+    for (const implied of IMPLIED_ROLES[role] || []) {
+      expanded.add(implied);
+    }
+  }
+  return [...expanded].sort();
+}
+
+// Compared as fixed-length digests: comparing raw strings leaks their common
+// prefix length, and timingSafeEqual throws outright on a length difference.
+function secretEquals(left, right) {
+  return timingSafeEqual(
+    Buffer.from(sha256Hex(String(left ?? "")), "hex"),
+    Buffer.from(sha256Hex(String(right ?? "")), "hex"),
+  );
+}
+
+function parsePrincipals(raw, label) {
+  let parsed;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    throw new ApiError(500, "INVALID_PRINCIPALS", `${label} is not valid JSON`);
+  }
+
+  const list = Array.isArray(parsed) ? parsed : parsed?.principals;
+  if (!Array.isArray(list) || !list.length) {
+    throw new ApiError(500, "INVALID_PRINCIPALS", `${label} must contain a non-empty principals array`);
+  }
+
+  const seenIds = new Set();
+  const seenDigests = new Set();
+  return list.map((entry, index) => {
+    const at = `${label}[${index}]`;
+    const id = String(entry?.id ?? "").trim();
+    if (!id) {
+      throw new ApiError(500, "INVALID_PRINCIPALS", `${at}: id is required`);
+    }
+    if (seenIds.has(id)) {
+      throw new ApiError(500, "INVALID_PRINCIPALS", `${at}: duplicate id ${id}`);
+    }
+    seenIds.add(id);
+
+    const digest = entry.tokenSha256
+      ? String(entry.tokenSha256).trim().toLowerCase()
+      : (entry.token ? sha256Hex(String(entry.token)) : "");
+    if (!/^[0-9a-f]{64}$/.test(digest)) {
+      throw new ApiError(500, "INVALID_PRINCIPALS", `${at}: needs token, or tokenSha256 as 64 hex characters`);
+    }
+    // Two principals sharing a token would make the audit trail a lie:
+    // whichever matched would be credited for the other's actions.
+    if (seenDigests.has(digest)) {
+      throw new ApiError(500, "INVALID_PRINCIPALS", `${at}: shares a token with another principal`);
+    }
+    seenDigests.add(digest);
+
+    const roles = Array.isArray(entry.roles) ? entry.roles.map(String) : [];
+    if (!roles.length) {
+      throw new ApiError(500, "INVALID_PRINCIPALS", `${at}: needs at least one role`);
+    }
+    const unknown = roles.filter((role) => !ROLES.includes(role));
+    if (unknown.length) {
+      throw new ApiError(
+        500,
+        "INVALID_PRINCIPALS",
+        `${at}: unknown role ${unknown.join(", ")}. Use one of ${ROLES.join(", ")}`,
+      );
+    }
+
+    const scopes = Array.isArray(entry.scopes) && entry.scopes.length ? entry.scopes.map(String) : ["*"];
+    return {
+      id,
+      name: entry.name ? String(entry.name) : id,
+      digest,
+      roles: expandRoles(roles),
+      scopes,
+      verified: true,
+    };
+  });
+}
+
+async function loadPrincipals(options) {
+  const filePath = options.principalsFile
+    || path.join(options.secretsDir, "principals.json");
+  const raw = await fsPromises.readFile(filePath, "utf8").catch((error) => {
+    // An explicitly configured file that cannot be read is a misconfiguration,
+    // not a reason to fall back to a shared secret.
+    if (options.principalsFile) {
+      throw new ApiError(500, "PRINCIPALS_UNREADABLE", `PRINCIPALS_FILE could not be read: ${error.message}`);
+    }
+    return null;
+  });
+  if (raw === null) {
+    return null;
+  }
+  const principals = parsePrincipals(raw, path.basename(filePath));
+  console.log(`[auth] ${principals.length} principal(s) loaded from ${filePath}`);
+  for (const principal of principals) {
+    console.log(`[auth]   ${principal.id} roles=${principal.roles.join(",")} scopes=${principal.scopes.join(",")}`);
+  }
+  return principals;
+}
+
+function findPrincipal(principals, token) {
+  if (!token || !principals?.length) {
+    return null;
+  }
+  const digest = Buffer.from(sha256Hex(String(token)), "hex");
+  // Every candidate is compared so the time taken reveals neither which
+  // position matched nor how many principals precede it.
+  let found = null;
+  for (const principal of principals) {
+    if (timingSafeEqual(digest, Buffer.from(principal.digest, "hex"))) {
+      found = principal;
+    }
+  }
+  return found;
+}
+
+function hasRole(principal, role) {
+  return Boolean(principal?.roles?.includes(role));
+}
+
+// `checkout/*` matches keys under checkout/; `*` matches everything; a bare
+// `checkout` matches that key alone. The trailing slash is kept so `checkout/*`
+// cannot leak into a sibling directory named `checkout-admin`.
+function scopeAllows(scopes, scriptKey) {
+  const key = String(scriptKey ?? "");
+  return (scopes || []).some((scope) => {
+    if (scope === "*") {
+      return true;
+    }
+    if (scope.endsWith("/*")) {
+      return key.startsWith(scope.slice(0, -1));
+    }
+    return key === scope;
+  });
+}
+
+function serializePrincipal(principal) {
+  if (!principal) {
+    return null;
+  }
+  return {
+    id: principal.id,
+    name: principal.name,
+    roles: principal.roles,
+    scopes: principal.scopes,
+    // The distinction the audit trail depends on: a named token proves who
+    // acted, the shared token only proves that someone held it.
+    verified: Boolean(principal.verified),
+  };
+}
+
+
+// What each route needs. Evaluated in order against the path with the API
+// prefix stripped, first match winning. Anything unmatched requires admin, so a
+// route added later is locked down rather than quietly open.
+const ROUTE_ROLES = [
+  // Must precede the generic sessions rule: deciding a gate is the one action
+  // a runner must not be able to take on its own work.
+  { method: "POST", pattern: /^\/sessions\/[^/]+\/approvals\/[^/]+\/decide$/, role: "approver" },
+  // Uploading or removing code, schedules, environments and datasets.
+  { method: "PUT", pattern: /^\/(scripts|environments|datasets|schedules)\//, role: "admin" },
+  { method: "DELETE", pattern: /^\/(scripts|environments|datasets|schedules)\//, role: "admin" },
+  // Deleting a run destroys evidence.
+  { method: "DELETE", pattern: /^\/runs\/[^/]+$/, role: "admin" },
+  // Reading a diagnosis is reading. Someone who can see a failure should be
+  // able to understand it.
+  { method: "POST", pattern: /^\/runs\/[^/]+\/analyze$/, role: "viewer" },
+  { method: "POST", pattern: /^\/(runs|sessions|scripts|schedules|assist)(\/|$)/, role: "runner" },
+  { method: "DELETE", pattern: /^\/sessions(\/|$)/, role: "runner" },
+  { method: "GET", pattern: /.*/, role: "viewer" },
+];
+
+function routeRole(method, apiPath) {
+  for (const rule of ROUTE_ROLES) {
+    if (rule.method === method && rule.pattern.test(apiPath)) {
+      return rule.role;
+    }
+  }
+  return "admin";
+}
+
+// An MCP session can reach every tool, so the role model has to apply there too
+// or /mcp becomes a way around it. Anything not listed needs runner; the
+// read-only and the destructive ones are named explicitly, and a suite check
+// asserts every registered tool is covered and that the sensitive ones are not
+// left at runner.
+const MCP_TOOL_ROLES = {
+  session_approval_decide: "approver",
+  run_delete: "admin",
+  script_upload: "admin",
+  script_delete: "admin",
+  schedule_save: "admin",
+  schedule_delete: "admin",
+  environment_save: "admin",
+  environment_delete: "admin",
+  dataset_save: "admin",
+  dataset_delete: "admin",
+};
+
+const MCP_VIEWER_TOOLS = new Set([
+  "analysis_capabilities", "assist_capabilities", "assist_examples", "assist_plan", "assist_scaffold",
+  "dataset_get", "dataset_list", "environment_get", "environment_list",
+  "run_analyze", "run_artifacts", "run_get", "run_list", "run_logs", "run_queue", "run_report",
+  "schedule_get", "schedule_list", "script_get", "script_list",
+  "session_actions", "session_approvals", "session_artifacts", "session_downloads",
+  "session_get", "session_list", "session_timeline",
+]);
+
+function mcpToolRole(name) {
+  if (MCP_TOOL_ROLES[name]) {
+    return MCP_TOOL_ROLES[name];
+  }
+  return MCP_VIEWER_TOOLS.has(name) ? "viewer" : "runner";
+}
+
+
+// ---------------------------------------------------------------------------
 // Workflow control flow
 //
 // A batch used to be a flat list: every step ran, in order, always. Real office
@@ -6985,6 +7233,8 @@ class SessionManager {
       status: record.status,
       decision: record.decision,
       decidedBy: record.decidedBy,
+      // null until decided; false means the name was claimed, not proven.
+      decidedByVerified: record.decidedByVerified ?? null,
       decidedAt: record.decidedAt,
       comment: record.comment,
       createdAt: record.createdAt,
@@ -7040,10 +7290,13 @@ class SessionManager {
       .map((record) => this.serializeApproval(record));
   }
 
-  // Records the decision. `decidedBy` is an audit field, not an identity: the
-  // API token says which client called, not which person approved. Tying a gate
-  // to an authenticated user is the per-project roles work, still to come.
-  decideApproval(sessionId, gateId, request = {}) {
+  // Records the decision. With a named principal the decision is attributed to
+  // the token that made it and the body cannot claim someone else; with only a
+  // shared token there is no identity to prove, so the caller still supplies a
+  // name and the record says it was not verified. The difference is kept in the
+  // data rather than described in the docs, because an unverifiable name that
+  // looks verified is worse than no name at all.
+  decideApproval(sessionId, gateId, request = {}, principal = null) {
     const record = this.getApproval(gateId, sessionId);
     if (record.status !== "pending") {
       throw new ApiError(409, "APPROVAL_ALREADY_DECIDED", `${gateId} was already ${record.status}`);
@@ -7054,10 +7307,29 @@ class SessionManager {
       throw new ApiError(400, "INVALID_DECISION", `decision must be approve or reject (got ${request.decision})`);
     }
 
-    const decidedBy = String(request.decidedBy || "").trim();
-    if (!decidedBy) {
-      throw new ApiError(400, "INVALID_REQUEST", "decidedBy is required so the decision can be attributed");
+    const claimed = String(request.decidedBy || "").trim();
+    let decidedBy;
+    let verified;
+    if (principal?.verified) {
+      decidedBy = principal.id;
+      verified = true;
+      // Silently overwriting a mismatching claim would let a client believe it
+      // recorded someone else's approval.
+      if (claimed && claimed !== principal.id) {
+        throw new ApiError(
+          400,
+          "DECIDED_BY_MISMATCH",
+          `decidedBy says ${claimed} but this token is ${principal.id}. Omit decidedBy; it is taken from the token.`,
+        );
+      }
+    } else {
+      decidedBy = claimed;
+      verified = false;
+      if (!decidedBy) {
+        throw new ApiError(400, "INVALID_REQUEST", "decidedBy is required so the decision can be attributed");
+      }
     }
+
     if (record.approvers && !record.approvers.includes(decidedBy)) {
       throw new ApiError(
         403,
@@ -7069,9 +7341,10 @@ class SessionManager {
     record.status = decision === "approve" ? "approved" : "rejected";
     record.decision = record.status;
     record.decidedBy = decidedBy;
+    record.decidedByVerified = verified;
     record.decidedAt = toIso();
     record.comment = request.comment ? truncate(String(request.comment), 1000) : null;
-    console.log(`[approval] ${record.status} gateId=${gateId} by=${decidedBy}`);
+    console.log(`[approval] ${record.status} gateId=${gateId} by=${decidedBy}${verified ? "" : " (unverified)"}`);
     return this.serializeApproval(record);
   }
 
@@ -8661,6 +8934,17 @@ function buildOpenApiSpec(req) {
           },
         }),
       },
+      [`${api}/whoami`]: {
+        get: operation({
+          tag: "Runs",
+          summary: "Who this token is, and what it may do",
+          description:
+            "With a principals file this names the authenticated principal, its roles and its scopes. With only "
+            + "a shared API token it reports id api-token and verified false, because the token proves someone "
+            + "held the secret and nothing more. `may` saves probing every route for a 403.",
+          responses: { 200: { description: "Principal, roles, scopes and a may summary" } },
+        }),
+      },
       [`${api}/analysis/capabilities`]: {
         get: operation({
           tag: "Runs",
@@ -8909,6 +9193,18 @@ function buildOpenApiSpec(req) {
 
 const scriptRegistry = new ScriptRegistry(config);
 await scriptRegistry.refresh();
+// Loaded before the app so a malformed principals file stops the server rather
+// than leaving it running with an authorisation model nobody configured.
+const principals = await loadPrincipals(config);
+if (principals && config.apiToken) {
+  // Not silently tolerated: with identities configured, the shared token is a
+  // full-access path that no audit record can attribute to a person.
+  console.warn(
+    "[auth] API_TOKEN is set alongside PRINCIPALS: the shared token still grants admin and its actions "
+    + "cannot be attributed to anyone. Unset API_TOKEN to require named identities.",
+  );
+}
+
 const failureAnalyst = new FailureAnalyst(config);
 const runManager = new RunManager({
   ...config,
@@ -9014,16 +9310,85 @@ const publicPaths = new Set([
   documentationPaths.runs,
   "/demo/test-page",
 ]);
+// The shared token, when one is set, stands for "somebody held the secret" and
+// nothing more. It is kept so an existing deployment keeps working, and it is
+// reported as such rather than presented as an identity.
+const SHARED_TOKEN_PRINCIPAL = {
+  id: "api-token",
+  name: "shared API token",
+  roles: expandRoles(["admin"]),
+  scopes: ["*"],
+  verified: false,
+};
+
+// A principal limited to `checkout/*` must not reach another team's scripts,
+// either to run them or to read what they produced. Enforced at the routes that
+// name a script key, and on reads by looking the run's key up first.
+function assertScopeAllows(principal, scriptKey, action) {
+  if (!principals || !principal) {
+    return;
+  }
+  if (!scopeAllows(principal.scopes, scriptKey)) {
+    throw new ApiError(
+      403,
+      "OUT_OF_SCOPE",
+      `${principal.id} may not ${action} ${scriptKey}; its scopes are ${principal.scopes.join(", ")}`,
+    );
+  }
+}
+
+function resolveRequestToken(req) {
+  const header = req.headers.authorization || "";
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  return bearer || req.headers["x-api-token"] || "";
+}
+
 app.use((req, res, next) => {
-  if (!config.apiToken || publicPaths.has(req.path) || req.path.startsWith(documentationPaths.swaggerAssets)) {
+  const isPublic = publicPaths.has(req.path) || req.path.startsWith(documentationPaths.swaggerAssets);
+  if (isPublic) {
+    return next();
+  }
+  // Nothing configured: unchanged from before principals existed.
+  if (!config.apiToken && !principals) {
     return next();
   }
 
-  const header = req.headers.authorization || "";
-  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const token = bearer || req.headers["x-api-token"] || "";
-  if (token !== config.apiToken) {
+  const token = resolveRequestToken(req);
+  const principal = findPrincipal(principals, token);
+  if (principal) {
+    req.principal = principal;
+  } else if (config.apiToken && token && secretEquals(token, config.apiToken)) {
+    req.principal = SHARED_TOKEN_PRINCIPAL;
+  } else {
     return next(new ApiError(401, "UNAUTHORIZED", "A valid API token is required"));
+  }
+
+  // Authorisation only applies once identities exist. With just a shared token
+  // the single secret has always meant full access, and silently narrowing it
+  // would break deployments that rely on that.
+  if (!principals) {
+    return next();
+  }
+
+  const apiPrefix = config.apiBasePath;
+  if (req.path === config.mcpBasePath || req.path.startsWith(`${config.mcpBasePath}/`)) {
+    // Individual tools are checked at invocation, where the tool name is known.
+    if (!hasRole(req.principal, "viewer")) {
+      return next(new ApiError(403, "FORBIDDEN", `${req.principal.id} may not use the MCP endpoint`));
+    }
+    return next();
+  }
+  if (!req.path.startsWith(apiPrefix)) {
+    return next();
+  }
+
+  const required = routeRole(req.method, req.path.slice(apiPrefix.length) || "/");
+  if (!hasRole(req.principal, required)) {
+    return next(new ApiError(
+      403,
+      "FORBIDDEN",
+      `${req.method} ${req.path} needs the ${required} role; ${req.principal.id} has ${req.principal.roles.join(", ")}`,
+    ));
   }
 
   return next();
@@ -9087,6 +9452,10 @@ app.get("/health", asyncRoute(async (req, res) => {
       scheduler: config.scheduleTickMs > 0,
       workflowControlFlow: ["if", "repeat", "forEach", "while", "break", "continue", "approval"],
       failureAnalysis: failureAnalyst.available,
+      namedIdentities: Boolean(principals),
+      // Reported rather than hidden: with identities configured this is a
+      // full-access path whose actions cannot be attributed to a person.
+      sharedTokenAdmin: Boolean(principals && config.apiToken),
       // Gates live in memory with the session they suspended, so a restart
       // cancels them rather than silently resuming later.
       approvalGatesPersistAcrossRestart: false,
@@ -9100,8 +9469,11 @@ app.get("/health", asyncRoute(async (req, res) => {
 }));
 
 app.get(`${config.apiBasePath}/scripts`, asyncRoute(async (req, res) => {
+  const visible = principals && req.principal
+    ? scriptRegistry.list().filter((script) => scopeAllows(req.principal.scopes, script.scriptKey))
+    : scriptRegistry.list();
   ok(res, {
-    scripts: scriptRegistry.list(),
+    scripts: visible,
   });
 }));
 
@@ -9190,13 +9562,56 @@ app.get(`${config.apiBasePath}/scripts/:scriptKey(*)`, asyncRoute(async (req, re
   ok(res, scriptRegistry.get(req.params.scriptKey));
 }));
 
+// Every route that names a run goes through here, so scope is enforced in one
+// place instead of nine. Runs on an unknown id too, which keeps the existing
+// 404 behaviour: the run is looked up, not guessed at.
+app.param("scriptKey", (req, res, next, scriptKey) => {
+  if (!principals || !req.principal) {
+    return next();
+  }
+  try {
+    assertScopeAllows(req.principal, scriptKey, "use the script");
+  } catch (error) {
+    return next(error);
+  }
+  return next();
+});
+
+app.param("runId", (req, res, next, runId) => {
+  if (!principals || !req.principal) {
+    return next();
+  }
+  let run;
+  try {
+    run = runManager.getRun(runId);
+  } catch (error) {
+    return next(error);
+  }
+  try {
+    // 403 rather than 404: run ids are random, so admitting one exists reveals
+    // nothing an operator should be denied while debugging.
+    assertScopeAllows(req.principal, run.scriptKey, "read or change runs for");
+  } catch (error) {
+    return next(error);
+  }
+  return next();
+});
+
 app.get(`${config.apiBasePath}/runs`, asyncRoute(async (req, res) => {
-  ok(res, runManager.listRuns({
+  const listed = runManager.listRuns({
     status: req.query.status,
     scriptKey: req.query.scriptKey,
     limit: req.query.limit,
     offset: req.query.offset,
-  }));
+  });
+  if (!principals || !req.principal) {
+    ok(res, listed);
+    return;
+  }
+  // Filtered rather than refused: a scoped caller asking for the list wants
+  // its own runs, not an error.
+  const runs = (listed.runs || []).filter((run) => scopeAllows(req.principal.scopes, run.scriptKey));
+  ok(res, { ...listed, runs, total: runs.length, filteredByScope: runs.length !== (listed.runs || []).length });
 }));
 
 app.get(`${config.apiBasePath}/queue`, asyncRoute(async (req, res) => {
@@ -9207,6 +9622,7 @@ app.get(`${config.apiBasePath}/queue`, asyncRoute(async (req, res) => {
 // when one is used and with a single run otherwise.
 app.post(`${config.apiBasePath}/runs`, asyncRoute(async (req, res) => {
   const { request, environment } = await runManager.composeRequest(req.body || {});
+  assertScopeAllows(req.principal, request.scriptKey, "run");
   const expanded = await runManager.expandDataset(request);
 
   if (!request.dataset) {
@@ -9404,6 +9820,21 @@ app.post(`${config.apiBasePath}/runs/:runId/analyze`, asyncRoute(async (req, res
   ok(res, await runManager.analyzeRun(req.params.runId, req.body || {}));
 }));
 
+app.get(`${config.apiBasePath}/whoami`, asyncRoute(async (req, res) => {
+  ok(res, {
+    identities: Boolean(principals),
+    principal: serializePrincipal(req.principal),
+    roles: ROLES,
+    // So a caller can tell what it may do without probing every route for a 403.
+    may: {
+      read: hasRole(req.principal, "viewer") || !principals,
+      run: hasRole(req.principal, "runner") || !principals,
+      approve: hasRole(req.principal, "approver") || !principals,
+      administer: hasRole(req.principal, "admin") || !principals,
+    },
+  });
+}));
+
 app.get(`${config.apiBasePath}/analysis/capabilities`, asyncRoute(async (req, res) => {
   // probe=true reaches the configured endpoint; without it this stays a
   // zero-dependency read of the configuration.
@@ -9423,7 +9854,7 @@ app.get(`${config.apiBasePath}/sessions/:sessionId/approvals/:gateId`, asyncRout
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/approvals/:gateId/decide`, asyncRoute(async (req, res) => {
-  ok(res, sessionManager.decideApproval(req.params.sessionId, req.params.gateId, req.body || {}));
+  ok(res, sessionManager.decideApproval(req.params.sessionId, req.params.gateId, req.body || {}, req.principal));
 }));
 
 app.post(`${config.apiBasePath}/sessions/:sessionId/contexts`, asyncRoute(async (req, res) => {
@@ -10098,7 +10529,7 @@ const mcpTools = [
   ),
   defineTool(
     "session_approval_decide",
-    "Approve or reject a workflow waiting at a gate. decidedBy is recorded for the audit trail; it is not verified, so do not invent a name — pass the one the person gave you.",
+    "Approve or reject a workflow waiting at a gate. With named identities configured the decision is attributed to your own token and decidedBy must be omitted or match it. Without them decidedBy is recorded unverified, so do not invent a name — pass the one the person gave you.",
     {
       type: "object",
       properties: {
@@ -10110,7 +10541,7 @@ const mcpTools = [
       },
       required: ["sessionId", "gateId", "decision", "decidedBy"],
     },
-    async (args) => sessionManager.decideApproval(args.sessionId, args.gateId, args),
+    async (args, principal) => sessionManager.decideApproval(args.sessionId, args.gateId, args, principal),
   ),
   defineTool(
     "session_execute_resume",
@@ -10378,19 +10809,37 @@ async function handleMcpRequest(req, message) {
       return jsonRpcResult(message.id ?? null, {});
     case "tools/list":
       return jsonRpcResult(message.id ?? null, {
-        tools: mcpTools.map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema,
-        })),
+        // With identities configured, a tool the caller cannot use is left out
+        // rather than offered and then refused: an agent would otherwise spend
+        // calls discovering what it is not allowed to do.
+        tools: mcpTools
+          .filter((tool) => !principals || hasRole(req.principal, mcpToolRole(tool.name)))
+          .map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            requiredRole: principals ? mcpToolRole(tool.name) : undefined,
+          })),
       });
     case "tools/call": {
       const tool = mcpToolMap.get(message.params?.name);
       if (!tool) {
         return jsonRpcError(message.id ?? null, -32601, `Unknown tool: ${message.params?.name}`);
       }
+      // Checked here, where the tool is known. The endpoint-level check only
+      // establishes that the caller may speak MCP at all, so without this a
+      // runner could reach run_delete and the role model would be decoration.
+      const toolRole = mcpToolRole(tool.name);
+      if (principals && !hasRole(req.principal, toolRole)) {
+        return jsonRpcResult(message.id ?? null, toolResult({
+          error: {
+            code: "FORBIDDEN",
+            message: `${tool.name} needs the ${toolRole} role; ${req.principal.id} has ${req.principal.roles.join(", ")}`,
+          },
+        }, true));
+      }
       try {
-        const output = await tool.handler(message.params?.arguments || {});
+        const output = await tool.handler(message.params?.arguments || {}, req.principal);
         return jsonRpcResult(message.id ?? null, toolResult(output));
       } catch (error) {
         const apiError = toApiError(error);

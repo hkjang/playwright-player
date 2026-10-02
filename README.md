@@ -24,6 +24,7 @@
 - cron 예약 실행, 배포 파이프라인 트리거, 실패 알림 콜백
 - 조건 분기·반복·승인 대기를 지원하는 업무 흐름(`if`/`repeat`/`forEach`/`while`/`break`/`continue`/`approval`)
 - OpenAI 호환 로컬 LLM(vLLM 등)으로 실패 원인 가설 제시 — 진단만 하고 아무것도 고치지 않습니다
+- 이름 있는 신원·역할·업무 범위(`principals.json`) — 승인이 토큰에 귀속되고 감사 기록에 증명 여부가 남습니다
 - 브라우저 언어 기반 `ko/en` 전환 지원 홈, 플레이그라운드, 데모 페이지
 - Streamable MCP `POST /mcp`, `DELETE /mcp`
 - `API_TOKEN` 기반 선택적 인증, 경로 탈출 차단, 동시 실행/세션 상한
@@ -254,6 +255,7 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_PENDING_APPROVALS` | `50` | 동시에 승인을 기다릴 수 있는 워크플로 수. 초과 시 `429 APPROVAL_LIMIT_EXCEEDED` |
 | `MAX_SCRIPT_BUNDLE_FILES` | `50` | 스냅샷이 담을 수 있는 모듈 수 |
 | `MAX_SCRIPT_BUNDLE_BYTES` | `8388608` | 스냅샷 전체 크기 상한 |
+| `PRINCIPALS_FILE` | `SECRETS_DIR/principals.json` | 이름 있는 신원·역할 정의. 없으면 공유 `API_TOKEN` 이 이전과 같이 동작합니다. 명시 지정한 파일을 읽을 수 없으면 서버가 뜨지 않습니다 |
 | `LLM_BASE_URL` | 없음 | OpenAI 호환 chat completions base (예: `http://vllm:8000/v1`). 비우면 실패 분석이 `503 LLM_NOT_CONFIGURED` 를 반환합니다 |
 | `LLM_MODEL` | 없음 | 비우면 `/v1/models` 의 첫 모델을 사용합니다 |
 | `LLM_API_KEY` | 없음 | vLLM 을 `--api-key` 로 띄운 경우 |
@@ -574,6 +576,108 @@ POST /api/sessions/{sessionId}/contexts/{contextId}/request
 
 **캡처가 비어 있으면 거부합니다.** 클릭 직후 캡처하면 페이지가 값을 채우기 전일 수 있고, 그대로 치환하면 `/api/orders/` 같은 URL 이 되어 원인과 무관한 404 가 납니다. `EMPTY_CAPTURED_VALUE` 로 먼저 상태를 단언하라고 알려줍니다.
 
+## 신원과 권한
+
+지금까지 API 는 공유 비밀 하나였습니다. **어느 클라이언트가 호출했는지만 말해주고 누가 했는지는 말해주지 않습니다.** 실행기에는 충분하지만 승인 게이트에는 틀렸습니다 — `decidedBy` 가 아무도 확인할 수 없는 자유 문자열이었습니다.
+
+`principals.json` 을 두면 결정이 **그 결정을 내린 토큰에 귀속**되고, 감사 기록에 그 이름이 **증명된 것인지 주장된 것인지** 남습니다.
+
+**완전히 선택사항입니다.** 파일이 없으면 공유 `API_TOKEN` 이 이전과 정확히 같이 동작합니다.
+
+```jsonc
+// SECRETS_DIR/principals.json (또는 PRINCIPALS_FILE)
+{
+  "principals": [
+    { "id": "kim@example.com", "name": "Kim",
+      "tokenSha256": "9f86d0818884...",       // 권장: 해시만 저장
+      "roles": ["approver"], "scopes": ["checkout/*"] },
+    { "id": "ci", "token": "평문도-됩니다",
+      "roles": ["runner"], "scopes": ["checkout/*"] },
+    { "id": "boss", "token": "...", "roles": ["admin"] }
+  ]
+}
+```
+
+`SECRETS_DIR` 안에 두므로 API 로 노출되지 않습니다. `tokenSha256` 를 권장합니다 — `sha256sum` 으로 만듭니다. 토큰 비교는 **고정 길이 다이제스트로** 하고 후보 전체를 비교합니다. 원문 문자열 비교는 공통 접두사 길이를, 조기 반환은 어느 위치에서 맞았는지를 흘립니다.
+
+### 권한
+
+| 역할 | 할 수 있는 것 |
+| --- | --- |
+| `viewer` | 실행·스크립트·증적·타임라인 조회, **실패 원인 분석 요청** |
+| `runner` | 실행 생성·재시도·취소, 세션과 워크플로 |
+| `approver` | 승인 게이트 결정 |
+| `admin` | 스크립트 업로드·삭제, 실행 삭제, 예약·환경·데이터셋 |
+
+`runner` 와 `approver` 는 **눈을 가리고 일할 수 없으므로** `viewer` 를 포함합니다. `admin` 은 전부입니다.
+
+**실행기가 자기 작업을 스스로 승인하지 못합니다.** `runner` 는 `approver` 를 포함하지 않습니다 — 그게 게이트의 존재 이유입니다.
+
+표에 없는 경로는 **`admin` 을 요구합니다.** 나중에 추가되는 경로가 조용히 열려 있는 것보다 잠겨 있는 편이 낫습니다.
+
+### 업무 범위
+
+`scopes` 는 스크립트 키에 적용됩니다. `checkout/*` 는 `checkout/` 아래를, `*` 는 전부를, `checkout` 은 그 키 하나만 매칭합니다. **`checkout/*` 가 `checkout-admin/` 으로 새지 않습니다** — 접두사에 슬래시를 유지합니다.
+
+```
+ci (scopes: checkout/*)
+  POST /api/runs {"scriptKey":"checkout/order"}   → 201
+  POST /api/runs {"scriptKey":"payroll/salary"}   → 403 OUT_OF_SCOPE
+  GET  /api/runs/<payroll 실행>                    → 403
+  GET  /api/scripts                               → checkout/* 만
+  GET  /api/runs                                  → 자기 범위만 (filteredByScope: true)
+```
+
+목록은 **거부하지 않고 걸러냅니다** — 범위가 제한된 호출자가 목록을 달라는 것은 자기 것을 보려는 것이지 오류를 받으려는 게 아닙니다. 특정 실행을 지목하면 `403` 이고, 실행 id 는 무작위라 존재를 알려주는 것이 디버깅을 막을 이유가 되지 않습니다.
+
+### 승인이 달라지는 점
+
+```jsonc
+// 이름이 있는 토큰: 본문에 decidedBy 를 쓰지 않습니다
+POST /api/sessions/{id}/approvals/{gateId}/decide   { "decision": "approve" }
+→ { "decidedBy": "kim@example.com", "decidedByVerified": true }
+
+// 공유 토큰: 증명할 신원이 없으므로 이름을 받고, 증명되지 않았다고 기록합니다
+→ { "decidedBy": "anyone-at-all", "decidedByVerified": false }
+```
+
+**다른 사람 이름을 주장하면 무시하지 않고 거부합니다**(`400 DECIDED_BY_MISMATCH`). 조용히 덮어쓰면 클라이언트는 남의 승인을 기록했다고 믿게 됩니다.
+
+게이트의 `approvers` 목록도 이제 **증명된 신원과** 비교합니다. 호출자가 보낸 문자열이 아닙니다.
+
+이 구분을 문서가 아니라 **데이터에 남깁니다.** 증명할 수 없는 이름이 증명된 것처럼 보이는 것은 이름이 없는 것보다 나쁩니다.
+
+### MCP 도 같은 규칙입니다
+
+MCP 세션은 모든 도구에 닿을 수 있으므로, 거기에도 역할이 적용되지 않으면 `/mcp` 가 우회로가 됩니다. **도구 이름을 아는 지점에서** 검사합니다 — 엔드포인트 검사는 "MCP 를 쓸 수 있다"까지만 말해줍니다.
+
+`tools/list` 는 호출자가 쓸 수 없는 도구를 **빼고** 보여주고(에이전트가 못 하는 일을 발견하는 데 호출을 쓰지 않도록) 각 도구에 `requiredRole` 을 붙입니다. `runner` 에게는 71개 중 61개가 보이고 `run_delete` 와 `session_approval_decide` 는 없습니다.
+
+스위트가 **모든 도구에 역할이 있는지, 파괴적인 도구가 `runner` 에 남아 있지 않은지** 확인합니다. 생각 없이 추가된 도구가 기본값으로 흘러들어가지 않게 하는 안전망입니다.
+
+### 공유 토큰은 숨기지 않습니다
+
+`principals.json` 과 `API_TOKEN` 을 함께 두면 공유 토큰은 **계속 admin 으로 동작합니다**(기존 배포 호환). 대신 숨기지 않습니다:
+
+- 부팅 시 경고 로그
+- `/health` → `features.sharedTokenAdmin: true`
+- `/api/whoami` → `principal.verified: false`, `id: "api-token"`
+
+**이름 있는 신원을 요구하려면 `API_TOKEN` 을 비우세요.** 조용한 전체 권한 백도어가 가장 나쁜 결과입니다.
+
+### 누구인지 확인
+
+```
+GET /api/whoami
+→ { "identities": true,
+    "principal": { "id": "kim@example.com", "roles": ["approver","viewer"], "scopes": ["checkout/*"], "verified": true },
+    "may": { "read": true, "run": false, "approve": true, "administer": false } }
+```
+
+경로마다 403 을 받아보며 알아낼 필요가 없습니다.
+
+**`principals.json` 이 깨져 있으면 서버가 뜨지 않습니다.** 중복 id, 공유된 토큰, 없는 역할, 토큰 없는 항목 모두 거부합니다. 아무도 설정하지 않은 권한 모델로 서버가 돌고 있는 것보다 낫습니다. 두 주체가 토큰을 공유하면 감사 기록이 거짓이 되므로(먼저 맞은 쪽이 다른 쪽 행위로 기록됨) 특히 거부합니다.
+
 ## 실패 분석 (로컬 LLM)
 
 실패한 실행에는 오류 메시지, 단계 타임라인, 로그가 남습니다. 그걸 읽는 것이 느린 작업이고, 로컬 모델이 1차 분류에는 쓸 만합니다. vLLM 처럼 **OpenAI 호환 `/v1/chat/completions`** 를 제공하는 서버를 가리키면 됩니다.
@@ -722,7 +826,7 @@ POST /api/sessions/{sessionId}/execute/resume              { gateId }
 
 `/playground` 의 **업무 흐름과 승인** 패널에서 대기 중인 게이트를 사람이 직접 승인·반려할 수 있습니다. 결정 후 `resume` 까지 이어서 호출합니다.
 
-**`decidedBy` 는 감사 기록이고 인증이 아닙니다.** API 토큰은 어느 클라이언트가 호출했는지만 말해주고, 누가 승인했는지는 말해주지 않습니다. `approvers` 목록도 같은 성격의 확인이지 신원 검증이 아닙니다. 게이트를 인증된 사용자에 묶는 것은 프로젝트별 권한 작업이고 아직 없습니다.
+**`decidedBy` 는 `principals.json` 을 설정하면 증명됩니다.** 이름 있는 토큰으로 결정하면 본문에 `decidedBy` 를 쓰지 않고, 기록에 `decidedByVerified: true` 가 남습니다. 공유 토큰만 쓰면 이전처럼 이름을 받고 `decidedByVerified: false` 로 남습니다 — 증명할 신원이 없기 때문입니다. [신원과 권한](#신원과-권한) 을 보세요.
 
 멈춘 워크플로는 프로그램·캡처값·결과를 메모리에 들고 있으므로 개수를 제한합니다(`MAX_PENDING_APPROVALS`, 기본 50). 아무것도 결정하지 않는 호출자가 서버를 무한히 키우지 못하게 하는 상한이고, 하나를 결정하면 자리가 다시 납니다.
 
