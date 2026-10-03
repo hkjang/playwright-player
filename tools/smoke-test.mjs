@@ -4092,12 +4092,22 @@ async function run() {
       await settle("/click completed");
       await act("click", { locator: { css: "#sendMessageBtn" } });
       await act("wait-for", { sleepMs: 1500 });
-      await act("click", { locator: { css: "#refreshRecordingBtn" } });
-
-      const rendered = await act("wait-for", {
-        locator: { css: "[data-testid='recording-step']" }, state: "visible", timeoutMs: 20000,
-      });
-      assert(rendered.status === 200, "no recorded step rendered in the panel");
+      // Waiting for *a* step row to be visible is satisfied before the refresh
+      // lands, because the start button already rendered the opening `goto`
+      // row; the read then returned the pre-refresh panel and saw only that
+      // row. The panel changes only when a refresh resolves, so waiting for it
+      // to hold what this check is about has to be able to ask again. The
+      // button disables itself for the length of its handler, so every click
+      // after the first also waits out the refresh before it.
+      let rendered = { status: 0 };
+      for (let attempt = 0; attempt < 10 && rendered.status !== 200; attempt += 1) {
+        await act("click", { locator: { css: "#refreshRecordingBtn" } });
+        rendered = await act("assert/text", {
+          locator: { css: "[data-testid='recording-steps']" },
+          expected: "testId=", match: "contains", timeoutMs: 2000,
+        });
+      }
+      assert(rendered.status === 200, "no recorded step with a verified locator rendered in the panel");
       const rows = (await act("locator/query", {
         locator: { css: "[data-testid='recording-step']" }, operation: "allTextContents",
       })).payload.data.values || [];
@@ -4106,12 +4116,20 @@ async function run() {
       assert(rows.some((row) => /testId=/.test(row)), JSON.stringify(rows));
 
       const before = rows.length;
+      // Four actions were driven onto the page, so a panel showing one row is a
+      // stale read rather than a recording worth editing.
+      assert(before > 1, `the panel rendered ${before} step row: ${JSON.stringify(rows)}`);
       // The third control on a row is its delete button.
       await act("click", { locator: { css: "[data-testid='recording-step'] button", nth: 2 } });
-      await act("wait-for", { sleepMs: 1200 });
-      const after = (await act("locator/query", {
-        locator: { css: "[data-testid='recording-step']" }, operation: "count",
-      })).payload.data.count;
+      // The edit re-renders the panel from its own response, so the row going
+      // away is something to wait for rather than to guess the duration of.
+      let after = before;
+      for (let attempt = 0; attempt < 40 && after === before; attempt += 1) {
+        await act("wait-for", { sleepMs: 250 });
+        after = (await act("locator/query", {
+          locator: { css: "[data-testid='recording-step']" }, operation: "count",
+        })).payload.data.count;
+      }
       assert(after === before - 1, `deleting from the panel left ${after} of ${before} steps`);
 
       await act("click", { locator: { css: "#stopRecordingBtn" } });
