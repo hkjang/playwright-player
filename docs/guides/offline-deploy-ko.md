@@ -59,6 +59,18 @@ docker run -d `
 | `http://127.0.0.1:3000/playground` | API Playground |
 | `http://127.0.0.1:3000/demo/test-page` | 내장 데모 테스트 페이지 |
 
+### 실제 실행 환경 검사
+
+Playground의 **실행 환경 점검** 또는 아래 명령으로 브라우저 실행·화면 렌더링·PNG 픽셀·파일 저장을 확인할 수 있습니다. 실행 중인 컨테이너에서 호출하므로 이미지에 포함된 브라우저와 실행 사용자의 권한을 그대로 검사합니다.
+
+```bash
+docker exec playwright-player npm run --silent doctor -- --json
+```
+
+`status: "ok"`이면 여섯 항목이 모두 통과한 것입니다. 실패 항목의 `errorCode`와 `remediation`으로 조치할 수 있습니다. 외부 사이트에 접속하거나 브라우저를 내려받지 않으며, 점검용 세션과 파일은 정리합니다. 이미 사용 중인 세션은 닫지 않습니다. CLI 종료 코드 `0`은 통과, `1`은 실패·일부 확인 불가, `2`는 접속·인증 실패입니다. 원격 실행에는 `--url`과 `API_TOKEN` 환경변수를 사용하세요.
+
+REST `POST /api/diagnostics`와 MCP `diagnostics_run`도 같은 결과를 반환합니다. HTTP 200이어도 보고서 `status`를 확인해야 합니다. Playground에서 JSON 보고서를 내려받을 수 있습니다. `/health`에는 실행 중 외에 `pendingSessionCount`, `closingSessionCount`가 표시되며 이들도 세션 상한에 포함됩니다.
+
 ## 5. 데모 테스트 페이지 검증
 
 `/demo/test-page`는 외부 네트워크 없이 동작하는 내장 페이지입니다.
@@ -80,33 +92,21 @@ docker run -d `
 
 > 위 세 단계가 모두 성공하면 오프라인 환경에서 브라우저 자동화가 정상 동작하는 것입니다.
 
-## 6. Docker 환경 Chromium 자동 설정 (v0.1.4+)
+## 6. 오프라인 스크린샷과 브라우저 설정
 
-오프라인 Docker 환경에서 `docker run`으로 실행할 때 세션은 생성되지만 `goto`, `inspect`, `screenshot` 등 페이지 조작이 실패하는 문제가 있었습니다.
+서버는 Docker에서 기존과 같이 `channel=chromium`을 선택하고 컨테이너 실행 인자를 적용합니다. headless shell도 페이지 이동과 스크린샷을 지원하므로, 캡처 실패를 바이너리 종류만으로 단정하지 마세요. 설치된 브라우저와 Playwright 패키지 버전이 맞는지 먼저 확인합니다.
 
-### 원인: `chromium-headless-shell` 바이너리
+오프라인망에서는 외부 웹폰트나 스크립트 요청이 끝나지 않을 수 있습니다. 스크린샷은 별도의 `DOMContentLoaded` 대기를 하지 않으며, 기본적으로 웹폰트 로딩 완료를 기다리지 않고 현재 렌더링된 화면을 캡처합니다.
 
-Playwright 1.58 이상에서 `headless: true`(기본값)로 실행하면 full Chromium 대신 **`chromium-headless-shell`** 경량 바이너리를 사용합니다. 이 바이너리는 일부 페이지 조작 기능(`page.goto`, `page.evaluate`, `page.screenshot`)이 Docker 환경에서 정상 동작하지 않을 수 있습니다.
+- `SCREENSHOT_TIMEOUT_MS=30000`: 기본 캡처 시간 제한. 양수 `timeoutMs`로 재정의할 수 있습니다.
+- `SCREENSHOT_WAIT_FOR_FONTS=false`: 기본값. 웹폰트까지 기다려야 한다면 접근 가능한 내부 경로에 폰트를 배포한 뒤 `true`로 설정하세요.
+- `FAILURE_ARTIFACT_TIMEOUT_MS=5000`: 실패 증적 수집 시간 제한. 스크린샷 자체 실패 시 같은 캡처를 다시 시도하지 않습니다.
 
-- 브라우저 프로세스 자체는 시작되므로 **세션 생성은 성공**합니다.
-- 하지만 페이지 렌더링이 필요한 조작은 **renderer 프로세스가 올바르게 동작하지 않아 실패**합니다.
+화면 준비가 필요한 업무는 먼저 `browser_wait_for` 또는 REST assertion으로 필요한 텍스트/요소를 확인하고 캡처하세요. 탐색 자체가 외부 리소스 때문에 타임아웃되면 REST `goto`의 `waitUntil`을 `domcontentloaded` 또는 `commit`으로 지정하고, 필요한 요소를 별도로 기다릴 수 있습니다.
 
-### 수정: full Chromium 바이너리 자동 선택
+MCP에서는 `browser_navigate` → `browser_snapshot` → `browser_take_screenshot` 순서로 세션/페이지 ID 없이 사용할 수 있습니다. `browser_take_screenshot`과 기존 `page_screenshot` 모두 표준 MCP 이미지 블록을 반환합니다. `filename`은 서버 아티팩트 이름이며 클라이언트의 로컬 저장 경로가 아닙니다. REST 다운로드에는 `API_TOKEN` 인증이 계속 적용됩니다.
 
-v0.1.4부터 서버가 Docker 환경을 자동 감지하면 `channel=chromium`을 설정하여 full Chromium 바이너리를 사용합니다. `--no-sandbox`, `--disable-dev-shm-usage` 등 필수 플래그는 Playwright가 자동으로 추가합니다.
-
-서버 시작 로그에 아래 메시지가 출력되면 자동 감지가 동작한 것입니다:
-
-```
-Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell
-```
-
-수동으로 channel을 지정하려면 세션 생성 시 `channel` 파라미터를 전달합니다:
-
-```json
-POST /api/sessions
-{ "channel": "chromium" }
-```
+내장 UI와 Swagger 자산은 로컬에서 제공되며 Swagger의 외부 검증 서버 호출은 비활성화되어 있습니다. 네트워크 없는 환경에 반입할 이미지는 인터넷이 연결된 빌드 환경에서 의존성과 브라우저를 포함해 미리 빌드해야 합니다. 런타임에 `npx ...@latest` 또는 브라우저 설치 명령을 실행할 필요가 없습니다.
 
 ## 7. 운영 팁
 
@@ -117,11 +117,13 @@ POST /api/sessions
 
 ## 8. 트러블슈팅
 
-| 증상 | 원인 | 해결 |
+| 증상 | 확인 사항 | 조치 |
 | --- | --- | --- |
-| 세션은 생성되지만 goto/inspect/screenshot 실패 | `chromium-headless-shell` 바이너리가 Docker에서 페이지 조작 미지원 | v0.1.4 이상 사용 (자동으로 full Chromium 선택), 또는 세션 생성 시 `"channel": "chromium"` 지정 |
-| `Target closed` 또는 `Browser closed` 오류 | `/dev/shm` 64MB 초과 | `--ipc=host` 추가 (Playwright가 `--disable-dev-shm-usage`를 이미 기본 적용) |
-| 스크린샷이 빈 화면 | headless-shell 렌더링 제한 | `"channel": "chromium"` 으로 full Chromium 사용 |
-| 컨테이너 시작 직후 crash | 이미지 아키텍처 불일치 | `docker inspect` 로 이미지 arch 확인 (amd64 필요) |
+| 캡처가 오래 대기함 | 외부 폰트 요청, 페이지 준비 상태, 요청 시간 제한 | 기본 폰트 대기 생략 유지, `timeoutMs` 설정, 필요한 요소만 명시적으로 대기 |
+| MCP에서 파일 경로만 보임 | 서버 버전 및 클라이언트의 MCP 이미지 지원 | 변경된 서버 사용, `content`의 `image` 블록 확인 또는 인증된 REST 다운로드 |
+| 미리보기/다운로드가 401 | API 토큰 누락 | UI의 API 토큰 입력 또는 Authorization 헤더 설정 |
+| 화면이 비어 있음 | 캡처 시점에 DOM/업무 데이터가 준비됐는지 | `browser_snapshot`과 console/network 도구로 확인 후 필요한 요소 대기 |
+| `Target closed` 또는 `Browser closed` | 컨테이너 메모리, 공유 메모리, 브라우저 로그 | 로그 확인 후 메모리 조정, 환경에 맞게 `--ipc=host` 또는 `--shm-size` 적용 |
+| 브라우저 실행 파일이 없음 | 패키지/브라우저 버전 및 이미지 빌드 내용 | 고정 버전 브라우저를 포함한 이미지를 외부 빌드 환경에서 다시 만들어 반입 |
 
 > 상세 절차는 저장소의 `docs/OFFLINE_DOCKER_GUIDE_KO.md`와 `tools/offline-load-run.ps1`를 함께 참고하면 됩니다.

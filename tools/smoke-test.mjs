@@ -4066,17 +4066,21 @@ async function run() {
 
     await check("a person can record and edit a scenario from the playground page", async () => {
       const act = (action, body) => call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
-      const settle = (fragment) => act("assert/text", {
-        locator: { css: "#statusBox" }, expected: fragment, match: "contains", timeoutMs: 20000,
-      });
+      const settle = async (fragment) => {
+        const result = await act("assert/text", {
+          locator: { css: "#statusBox:not(.error)" }, expected: fragment, match: "contains", timeoutMs: 20000,
+        });
+        assert(result.status === 200, `expected playground status ${JSON.stringify(fragment)}: ${result.status} ${result.payload.error?.message || ""}`);
+        return result;
+      };
 
       await act("goto", { url: `${baseUrl}/playground?lang=ko`, waitUntil: "domcontentloaded" });
       await act("fill", { locator: { css: "#apiToken" }, value: token });
       for (const [button, fragment] of [
-        ["#createSessionBtn", "/api/sessions completed"],
-        ["#createContextBtn", "/contexts completed"],
-        ["#createPageBtn", "/pages completed"],
-        ["#gotoDemoBtn", "/goto completed"],
+        ["#createSessionBtn", "/api/sessions 완료"],
+        ["#createContextBtn", "/contexts 완료"],
+        ["#createPageBtn", "/pages 완료"],
+        ["#gotoDemoBtn", "/goto 완료"],
       ]) {
         await act("click", { locator: { css: button } });
         await settle(fragment);
@@ -4089,7 +4093,7 @@ async function run() {
       // Driving the playground's own buttons makes the inner session act, which
       // is the context being recorded.
       await act("click", { locator: { css: "#clickPrimaryBtn" } });
-      await settle("/click completed");
+      await settle("/assert/text 완료");
       await act("click", { locator: { css: "#sendMessageBtn" } });
       await act("wait-for", { sleepMs: 1500 });
       await act("click", { locator: { css: "#refreshRecordingBtn" } });
@@ -4123,20 +4127,24 @@ async function run() {
       // An approval whose only interface is curl is not an approval: the whole
       // point of stopping is that somebody looks at it.
       const act = (action, body) => call("POST", `/api/sessions/${sessionId}/pages/${pageId}/${action}`, body);
-      const settle = (fragment) => act("assert/text", {
-        locator: { css: "#statusBox" }, expected: fragment, match: "contains", timeoutMs: 20000,
-      });
+      const settle = async (fragment) => {
+        const result = await act("assert/text", {
+          locator: { css: "#statusBox:not(.error)" }, expected: fragment, match: "contains", timeoutMs: 20000,
+        });
+        assert(result.status === 200, `expected playground status ${JSON.stringify(fragment)}: ${result.status} ${result.payload.error?.message || ""}`);
+        return result;
+      };
 
       await act("goto", { url: `${baseUrl}/playground?lang=ko`, waitUntil: "domcontentloaded" });
       await act("fill", { locator: { css: "#apiToken" }, value: token });
       // Each button stores its id only after its fetch resolves, so the next
       // click has to wait for the status line instead of firing immediately.
       await act("click", { locator: { css: "#createSessionBtn" } });
-      await settle("/api/sessions completed");
+      await settle("/api/sessions 완료");
       await act("click", { locator: { css: "#createContextBtn" } });
-      await settle("/contexts completed");
+      await settle("/contexts 완료");
       await act("click", { locator: { css: "#createPageBtn" } });
-      await settle("/pages completed");
+      await settle("/pages 완료");
 
       await act("fill", { locator: { css: "#decidedBy" }, value: "kim@example.com" });
       await act("click", { locator: { css: "#runWorkflowBtn" } });
@@ -4145,19 +4153,20 @@ async function run() {
       });
       assert(listed.status === 200, `the gate never appeared: ${listed.payload.error?.message}`);
       // The status the person needs must survive the queue refresh that follows it.
-      const waiting = await act("assert/text", {
-        locator: { css: "#statusBox" }, expected: "awaiting_approval", match: "contains", timeoutMs: 10000,
-      });
-      assert(waiting.status === 200, "the page did not report that it is waiting for approval");
+      await settle("워크플로 상태: awaiting_approval");
 
       for (let pass = 0; pass < 2; pass += 1) {
+        const current = await act("locator/query", { locator: { css: "#resultBox" }, operation: "innerText" });
+        assert(current.status === 200, `could not inspect the approval queue: ${current.status}`);
+        const gateId = JSON.parse(current.payload.data.value).data.approvals[0]?.gateId;
+        assert(gateId, "the approval queue did not identify its pending gate");
         await act("click", { locator: { css: "[data-testid='approve-approval']" } });
-        await settle("execute/resume completed");
+        // The first resume returns to awaiting_approval. Wait for the old gate
+        // to leave the visible API response before accepting that status again.
+        const refreshed = await act("wait-for", { textGone: gateId, timeoutMs: 10000 });
+        assert(refreshed.status === 200, `the approval queue did not advance beyond ${gateId}: ${refreshed.status}`);
+        await settle(`워크플로 상태: ${pass === 0 ? "awaiting_approval" : "completed"}`);
       }
-      const finished = await act("assert/text", {
-        locator: { css: "#statusBox" }, expected: "completed", match: "contains", timeoutMs: 10000,
-      });
-      assert(finished.status === 200, "approving twice did not finish the workflow");
 
       // The server refuses an unattributed decision; the page should say so
       // rather than send a request it knows will fail.

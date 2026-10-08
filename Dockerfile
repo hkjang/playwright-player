@@ -11,6 +11,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-fund --no-audit
 
 COPY server.js ./
+COPY playwright-mcp-compat.js ./
+COPY offline-diagnostics.js ./
+COPY tools/doctor.mjs ./tools/doctor.mjs
 COPY scripts ./scripts
 # The built-in pages live here now; without them every page returns
 # 500 UI_TEMPLATE_MISSING.

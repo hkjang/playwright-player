@@ -42,6 +42,19 @@ a, button {
 }
 button.secondary, a.secondary { background: #e5e7eb; color: #111827; }
 button.warn { background: var(--accent); }
+button:disabled { opacity: .55; cursor: wait; }
+button.secondary:disabled { cursor: default; }
+.panel .diagnostics-summary { margin: 14px 0 0; }
+.diagnostics-checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.diagnostics-checks:not(:empty) { margin-top: 14px; }
+.diagnostics-checks li { padding: 12px; border: 1px solid var(--line); border-radius: 14px; }
+.diagnostics-check-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.diagnostics-check-status { color: var(--muted); font-size: .85rem; white-space: nowrap; }
+.diagnostics-checks [data-status="passed"] .diagnostics-check-status { color: var(--primary); }
+.diagnostics-checks [data-status="failed"] .diagnostics-check-status,
+.diagnostics-checks [data-status="warning"] .diagnostics-check-status { color: var(--accent); }
+.diagnostics-checks p { margin: 8px 0 0; font-size: .9rem; overflow-wrap: anywhere; }
+.diagnostics-checks .diagnostics-remediation { color: var(--ink); }
 label { display: grid; gap: 6px; font-size: .94rem; font-weight: 600; }
 input, select, textarea, pre {
   width: 100%;

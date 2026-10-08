@@ -38,6 +38,17 @@
           </div>
         </section>
 
+        <section class="panel" aria-labelledby="diagnosticsTitle">
+          <h2 id="diagnosticsTitle">{{copy.diagnosticsTitle}}</h2>
+          <p>{{copy.diagnosticsBody}}</p>
+          <div class="row">
+            <button type="button" id="diagnosticsBtn">{{copy.diagnosticsButton}}</button>
+            <button type="button" id="downloadDiagnosticsBtn" class="secondary" disabled>{{copy.diagnosticsDownload}}</button>
+          </div>
+          <p id="diagnosticsSummary" role="status" aria-live="polite" class="diagnostics-summary">{{copy.diagnosticsIdle}}</p>
+          <ol id="diagnosticsChecks" class="diagnostics-checks" aria-label="{{copy.diagnosticsTitle}}"></ol>
+        </section>
+
         <section class="panel">
           <h2>{{copy.createRunTitle}}</h2>
           <p>{{copy.createRunBody}}</p>

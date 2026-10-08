@@ -9,6 +9,8 @@ import net from "node:net";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
+import { createPlaywrightMcpCompatibility } from "./playwright-mcp-compat.js";
+import { createOfflineDiagnostics } from "./offline-diagnostics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const rootDir = path.dirname(__filename);
@@ -62,6 +64,7 @@ const config = {
   sessionTtlMs: parseInteger(process.env.SESSION_TTL_MS, 30 * 60 * 1000),
   cleanupIntervalMs: parseInteger(process.env.SESSION_CLEANUP_INTERVAL_MS, 30 * 1000),
   maxSessions: parseInteger(process.env.MAX_SESSIONS, 10),
+  browserLaunchTimeoutMs: Math.max(1, parseInteger(process.env.BROWSER_LAUNCH_TIMEOUT_MS, 30 * 1000)),
   maxContextsPerSession: parseInteger(process.env.MAX_CONTEXTS_PER_SESSION, 5),
   maxPagesPerSession: parseInteger(process.env.MAX_PAGES_PER_SESSION, 10),
   maxConcurrentRuns: parseInteger(process.env.MAX_CONCURRENT_RUNS, 4),
@@ -118,6 +121,9 @@ const config = {
   maxApiResponseBodyBytes: parseInteger(process.env.MAX_API_RESPONSE_BODY_BYTES, 256 * 1024),
   apiRequestTimeoutMs: parseInteger(process.env.API_REQUEST_TIMEOUT_MS, 30 * 1000),
   captureFailureArtifacts: parseBoolean(process.env.CAPTURE_FAILURE_ARTIFACTS, true),
+  screenshotTimeoutMs: Math.max(1, parseInteger(process.env.SCREENSHOT_TIMEOUT_MS, 30 * 1000)),
+  screenshotWaitForFonts: parseBoolean(process.env.SCREENSHOT_WAIT_FOR_FONTS, false),
+  failureArtifactTimeoutMs: Math.max(1, parseInteger(process.env.FAILURE_ARTIFACT_TIMEOUT_MS, 5000)),
   purgeSessionArtifactsOnClose: parseBoolean(process.env.PURGE_SESSION_ARTIFACTS_ON_CLOSE, false),
   apiToken: process.env.API_TOKEN || "",
   urlAllowlist: parseCsv(process.env.URL_ALLOWLIST),
@@ -126,6 +132,13 @@ const config = {
   protocolVersion: "2025-03-26",
   playwrightCliPath: path.join(rootDir, "node_modules", "playwright", "cli.js"),
 };
+
+// Playwright 1.58.2 waits for document.fonts.ready when capturing a screenshot.
+// A font hosted outside an air-gapped network can leave that promise pending
+// indefinitely. Use its existing opt-out once at startup (never toggle this
+// process-wide flag around individual calls, which would race other sessions).
+// Operators can restore font waiting when exact web-font rendering is needed.
+process.env.PW_TEST_SCREENSHOT_NO_FONTS_READY = config.screenshotWaitForFonts ? "" : "1";
 
 const browsers = {
   chromium,
@@ -934,6 +947,7 @@ const RUN_ENV_BASE_KEYS = [
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
   "SystemRoot", "SYSTEMROOT", "ComSpec", "COMSPEC", "USERPROFILE",
   "APPDATA", "LOCALAPPDATA", "PATHEXT", "WINDIR", "NUMBER_OF_PROCESSORS",
+  "PW_TEST_SCREENSHOT_NO_FONTS_READY",
 ];
 
 function buildRunEnv(extra = {}) {
@@ -4062,7 +4076,7 @@ const ROUTE_ROLES = [
   // Reading a diagnosis is reading. Someone who can see a failure should be
   // able to understand it.
   { method: "POST", pattern: /^\/runs\/[^/]+\/analyze$/, role: "viewer" },
-  { method: "POST", pattern: /^\/(runs|sessions|scripts|schedules|assist)(\/|$)/, role: "runner" },
+  { method: "POST", pattern: /^\/(runs|sessions|scripts|schedules|assist|diagnostics)(\/|$)/, role: "runner" },
   { method: "DELETE", pattern: /^\/sessions(\/|$)/, role: "runner" },
   { method: "GET", pattern: /.*/, role: "viewer" },
 ];
@@ -5114,6 +5128,11 @@ class SessionManager {
     // does not record in plain text.
     this.secretNamePattern = new RegExp(options.redactVariablePattern, "i");
     this.sessions = new Map();
+    // Reserve a slot before any asynchronous startup work. Counting only live
+    // sessions allowed concurrent requests to each launch past MAX_SESSIONS.
+    this.pendingSessionCreates = new Map();
+    this.closingSessions = new Map();
+    this.shuttingDown = false;
     // Artifacts outlive their session: the files stayed on disk but the only
     // index that could resolve an artifactId was thrown away on close, so
     // evidence collected during a run became unreachable the moment the
@@ -5132,7 +5151,11 @@ class SessionManager {
   }
 
   async shutdown() {
+    this.shuttingDown = true;
     clearInterval(this.cleanupTimer);
+    // A launch already in flight must finish its cleanup before shutdown can
+    // exit; otherwise its browser can be orphaned after the session snapshot.
+    await Promise.allSettled([...this.pendingSessionCreates.values()]);
     for (const sessionId of [...this.sessions.keys()]) {
       try {
         await this.closeSession(sessionId, "shutdown");
@@ -5140,6 +5163,7 @@ class SessionManager {
         console.error(`failed to close session ${sessionId}`, error);
       }
     }
+    await Promise.allSettled([...this.closingSessions.values()]);
   }
 
   serializeSession(session) {
@@ -5396,7 +5420,10 @@ class SessionManager {
   // A session owns a real browser process, so an unbounded count is a direct
   // path to exhausting the container.
   async createSession(request = {}) {
-    if (this.sessions.size >= this.options.maxSessions) {
+    if (this.shuttingDown) {
+      throw new ApiError(503, "SERVER_SHUTTING_DOWN", "Server is shutting down; no new browser sessions can be created.");
+    }
+    if (this.sessions.size + this.pendingSessionCreates.size + this.closingSessions.size >= this.options.maxSessions) {
       throw new ApiError(
         429,
         "SESSION_LIMIT_EXCEEDED",
@@ -5405,19 +5432,22 @@ class SessionManager {
     }
 
     const browserType = request.browserType || this.options.defaultBrowserType;
-    const launcher = browsers[browserType];
+    const launcher = Object.hasOwn(browsers, browserType) ? browsers[browserType] : undefined;
     if (!launcher) {
       throw new ApiError(400, "INVALID_BROWSER", `Unsupported browser type: ${browserType}`);
     }
 
+    const launchTimeoutMs = request.timeoutMs ?? this.options.browserLaunchTimeoutMs;
+    if (!Number.isFinite(launchTimeoutMs) || launchTimeoutMs <= 0) {
+      throw new ApiError(400, "INVALID_BROWSER_TIMEOUT", "timeoutMs must be a positive number.");
+    }
     const sessionId = createId("sess");
     const userArgs = [...this.options.launchArgs, ...(request.launchArgs || [])];
-    // In Docker, Playwright 1.58+ selects the lightweight "chromium-headless-shell"
-    // binary for headless mode by default. That binary lacks full page functionality
-    // (goto/evaluate/screenshot can fail). Force the full Chromium binary via
-    // channel="chromium" so all page operations work reliably in containers.
-    // Also inject --disable-gpu because full Chromium headless needs a GPU compositor
-    // that is unavailable in containers, causing blank screenshots and videos.
+    // Use the full Chromium bundled in our Docker image for consistent headless
+    // rendering. Playwright's default headless shell also supports screenshots;
+    // this channel selection is a container rendering choice, not a requirement.
+    // Container flags keep GPU and shared-memory constraints from varying with
+    // the host; callers can still select a different installed channel.
     const effectiveChannel = request.channel
       || (isDocker && browserType === "chromium" ? "chromium" : undefined);
     if (isDocker && browserType === "chromium") {
@@ -5427,50 +5457,81 @@ class SessionManager {
         }
       }
     }
-    const browser = await launcher.launch(
-      cleanObject({
-        headless: request.headless ?? this.options.defaultHeadless,
-        slowMo: request.slowMo,
-        channel: effectiveChannel,
-        proxy: request.proxy,
-        args: userArgs,
-      }),
-    );
+    let releaseReservation;
+    this.pendingSessionCreates.set(sessionId, new Promise((resolve) => { releaseReservation = resolve; }));
+    let browser;
+    try {
+      // Reject an unwritable artifact directory before starting a browser.
+      await ensureDir(path.join(this.options.artifactsDir, sessionId));
+      if (this.shuttingDown) {
+        throw new ApiError(503, "SERVER_SHUTTING_DOWN", "Server is shutting down; browser session creation was cancelled.");
+      }
+      browser = await launcher.launch(
+        cleanObject({
+          headless: request.headless ?? this.options.defaultHeadless,
+          slowMo: request.slowMo,
+          channel: effectiveChannel,
+          proxy: request.proxy,
+          args: userArgs,
+          timeout: Math.min(launchTimeoutMs, this.options.browserLaunchTimeoutMs),
+        }),
+      );
 
-    const session = {
-      sessionId,
-      browserType,
-      browser,
-      status: "active",
-      ttlMs: request.ttlMs || this.options.sessionTtlMs,
-      createdAt: toIso(),
-      updatedAt: toIso(),
-      expiresAt: toIso(Date.now() + (request.ttlMs || this.options.sessionTtlMs)),
-      contexts: new Map(),
-      pages: new Map(),
-      artifacts: new Map(),
-      downloads: [],
-      actions: [],
-      actionSeq: 0,
-      events: [],
-      eventSeq: 0,
-      queue: Promise.resolve(),
-    };
+      if (this.shuttingDown) {
+        throw new ApiError(503, "SERVER_SHUTTING_DOWN", "Server is shutting down; browser session creation was cancelled.");
+      }
 
-    browser.on("disconnected", () => {
-      session.status = "disconnected";
-      session.updatedAt = toIso();
-    });
+      const session = {
+        sessionId,
+        browserType,
+        browser,
+        status: "active",
+        ttlMs: request.ttlMs || this.options.sessionTtlMs,
+        createdAt: toIso(),
+        updatedAt: toIso(),
+        expiresAt: toIso(Date.now() + (request.ttlMs || this.options.sessionTtlMs)),
+        contexts: new Map(),
+        pages: new Map(),
+        artifacts: new Map(),
+        downloads: [],
+        actions: [],
+        actionSeq: 0,
+        events: [],
+        eventSeq: 0,
+        queue: Promise.resolve(),
+      };
 
-    this.sessions.set(sessionId, session);
-    await ensureDir(path.join(this.options.artifactsDir, sessionId));
-    this.logAction(session, {
-      type: "session.create",
-      status: "ok",
-      input: request,
-    });
-    console.log(`[session] created sessionId=${sessionId} browser=${browserType} channel=${effectiveChannel || "default"}`);
-    return this.serializeSession(session);
+      browser.on("disconnected", () => {
+        session.status = "disconnected";
+        session.updatedAt = toIso();
+      });
+
+      this.sessions.set(sessionId, session);
+      this.logAction(session, {
+        type: "session.create",
+        status: "ok",
+        input: request,
+      });
+      console.log(`[session] created sessionId=${sessionId} browser=${browserType} channel=${effectiveChannel || "default"}`);
+      return this.serializeSession(session);
+    } catch (error) {
+      this.sessions.delete(sessionId);
+      if (browser) await browser.close().catch(() => undefined);
+      await removeDir(path.join(this.options.artifactsDir, sessionId)).catch(() => undefined);
+      if (!(error instanceof ApiError) && /Executable doesn't exist|distribution .+ is not found|Failed to launch.*ENOENT/i.test(error.message || "")) {
+        throw new ApiError(503, "BROWSER_NOT_INSTALLED",
+          `The ${browserType} browser${effectiveChannel ? ` (${effectiveChannel})` : ""} is not installed. Prepare the pinned Playwright browser with playwright install on a connected build host, then transfer the complete image or browser cache to the offline server.`,
+          { browserType, channel: effectiveChannel || null, cause: error.message,
+            remediation: "Use the same Playwright version, operating system and architecture as this server. Include browser system dependencies in the image; copying a cache alone does not install them. For a transferred cache, set PLAYWRIGHT_BROWSERS_PATH to its location. No download was attempted." });
+      }
+      if (!(error instanceof ApiError) && error.name === "TimeoutError") {
+        throw new ApiError(504, "BROWSER_LAUNCH_TIMEOUT", `Browser startup exceeded ${Math.min(launchTimeoutMs, this.options.browserLaunchTimeoutMs)} ms. Check browser dependencies and available memory.`, { browserType });
+      }
+      throw error;
+    } finally {
+      this.pendingSessionCreates.delete(sessionId);
+      releaseReservation();
+    }
   }
 
   async keepAlive(sessionId, ttlMs) {
@@ -5481,22 +5542,29 @@ class SessionManager {
   }
 
   async closeSession(sessionId, reason = "closed") {
+    if (this.closingSessions.has(sessionId)) return this.closingSessions.get(sessionId);
     const session = this.getSession(sessionId);
     this.sessions.delete(sessionId);
-    this.discardApprovals(sessionId, reason);
-    await session.browser.close().catch(() => undefined);
-    session.status = reason;
-    session.updatedAt = toIso();
-    if (this.options.purgeSessionArtifactsOnClose) {
-      await removeDir(path.join(this.options.artifactsDir, sessionId));
-      this.forgetSessionArtifacts(sessionId);
-    }
+    // A closing process still consumes memory. Keep its capacity reserved and
+    // share one close operation with simultaneous callers.
+    const closing = Promise.resolve().then(async () => {
+      this.discardApprovals(sessionId, reason);
+      await session.browser.close().catch(() => undefined);
+      session.status = reason;
+      session.updatedAt = toIso();
+      if (this.options.purgeSessionArtifactsOnClose) {
+        await removeDir(path.join(this.options.artifactsDir, sessionId));
+        this.forgetSessionArtifacts(sessionId);
+      }
 
-    return {
-      sessionId,
-      status: reason,
-      artifactsPurged: Boolean(this.options.purgeSessionArtifactsOnClose),
-    };
+      return {
+        sessionId,
+        status: reason,
+        artifactsPurged: Boolean(this.options.purgeSessionArtifactsOnClose),
+      };
+    }).finally(() => this.closingSessions.delete(sessionId));
+    this.closingSessions.set(sessionId, closing);
+    return closing;
   }
 
   listSessions() {
@@ -5992,7 +6060,13 @@ class SessionManager {
     const artifactId = createId("artifact");
     const sessionDir = path.join(this.options.artifactsDir, session.sessionId);
     await ensureDir(sessionDir);
-    const fileName = `${artifactId}-${safeFilename(request.type)}.${request.extension}`;
+    const requestedName = request.fileName
+      ? path.posix.parse(path.posix.basename(request.fileName.replace(/\\/g, "/"))).name
+      : request.type;
+    // Keep the actual format in the extension: REST downloads and MCP image
+    // blocks both derive their MIME type from it, even for a custom filename.
+    const suffix = `${safeFilename(requestedName).slice(0, 180)}.${request.extension}`;
+    const fileName = `${artifactId}-${suffix}`;
     const filePath = path.join(sessionDir, fileName);
 
     if (request.buffer) {
@@ -6046,25 +6120,41 @@ class SessionManager {
       return artifacts;
     }
 
-    try {
-      const screenshot = await pageRecord.page.screenshot({
-        fullPage: true,
-        type: "png",
-      });
-      artifacts.screenshot = await this.saveArtifact(session, {
-        contextId: pageRecord.contextId,
-        pageId: pageRecord.pageId,
-        type: "error-screenshot",
-        extension: "png",
-        buffer: screenshot,
-        metadata: { actionType },
-      });
-    } catch {
-      // ignore artifact capture failures
+    const deadline = monotonicNow() + this.options.failureArtifactTimeoutMs;
+    // A screenshot timeout must not immediately start a second screenshot on
+    // the same stalled page. All other failure captures share a finite budget.
+    if (actionType !== "page.screenshot") {
+      try {
+        const screenshot = await pageRecord.page.screenshot({
+          fullPage: true,
+          type: "png",
+          timeout: Math.max(1, Math.ceil(deadline - monotonicNow())),
+        });
+        artifacts.screenshot = await this.saveArtifact(session, {
+          contextId: pageRecord.contextId,
+          pageId: pageRecord.pageId,
+          type: "error-screenshot",
+          extension: "png",
+          buffer: screenshot,
+          metadata: { actionType },
+        });
+      } catch {
+        // The original automation error is more useful than a capture error.
+      }
     }
 
+    let timer;
     try {
-      const html = await pageRecord.page.content();
+      const remaining = Math.ceil(deadline - monotonicNow());
+      if (remaining <= 0) return artifacts;
+      // page.content has no timeout option; bound this read-only operation so
+      // a broken renderer cannot keep the session command queue locked forever.
+      const html = await Promise.race([
+        pageRecord.page.content(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Failure artifact capture timed out")), remaining);
+        }),
+      ]);
       artifacts.dom = await this.saveArtifact(session, {
         contextId: pageRecord.contextId,
         pageId: pageRecord.pageId,
@@ -6075,6 +6165,8 @@ class SessionManager {
       });
     } catch {
       // ignore artifact capture failures
+    } finally {
+      clearTimeout(timer);
     }
 
     return artifacts;
@@ -7048,12 +7140,33 @@ class SessionManager {
     return this.runLocked(sessionId, lockedSession, async (session) => {
       return this.runPageCommandLocked(session, pageId, "page.screenshot", request, async (pageRecord) => {
         const extension = request.type || "png";
-        await pageRecord.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-        const buffer = await pageRecord.page.screenshot(cleanObject({
-          fullPage: request.fullPage ?? true,
-          timeout: request.timeoutMs || 30000,
+        if (!["png", "jpeg"].includes(extension)) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_TYPE", "type must be png or jpeg");
+        }
+        if (request.timeoutMs !== undefined && (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 0)) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_TIMEOUT", "timeoutMs must be a non-negative integer; 0 uses the server default");
+        }
+        if (request.quality !== undefined && (extension !== "jpeg" || !Number.isInteger(request.quality) || request.quality < 0 || request.quality > 100)) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_QUALITY", "quality must be an integer from 0 to 100 and requires type jpeg");
+        }
+        if (request.scale !== undefined && !["css", "device"].includes(request.scale)) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_SCALE", "scale must be css or device");
+        }
+        if (request.filename !== undefined && (typeof request.filename !== "string" || !request.filename.trim())) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_FILENAME", "filename must be a non-empty string");
+        }
+        if (request.locator && request.fullPage === true) {
+          throw new ApiError(400, "INVALID_SCREENSHOT_OPTIONS", "fullPage cannot be combined with an element locator");
+        }
+        const target = request.locator ? resolveLocator(pageRecord.page, request.locator) : pageRecord.page;
+        // Capture the rendered page without an extra load-state wait: blocked
+        // scripts/styles in an offline network may prevent DOMContentLoaded.
+        const buffer = await target.screenshot(cleanObject({
+          fullPage: request.locator ? undefined : request.fullPage ?? true,
+          timeout: request.timeoutMs || this.options.screenshotTimeoutMs,
           omitBackground: request.omitBackground,
           quality: request.quality,
+          scale: request.scale,
           type: extension,
         }));
         const artifact = await this.saveArtifact(session, {
@@ -7061,6 +7174,7 @@ class SessionManager {
           pageId,
           type: "screenshot",
           extension,
+          fileName: request.filename,
           buffer,
           metadata: request,
         });
@@ -8568,6 +8682,7 @@ function buildOpenApiSpec(req) {
             browserType: { type: "string", enum: ["chromium", "firefox", "webkit"], default: "chromium" },
             headless: { type: "boolean", default: true },
             ttlMs: { type: "integer", example: 1800000 },
+            timeoutMs: { type: "number", exclusiveMinimum: 0, description: "Browser startup timeout in milliseconds, capped by BROWSER_LAUNCH_TIMEOUT_MS." },
           },
         },
         CreateContextRequest: {
@@ -8753,6 +8868,18 @@ function buildOpenApiSpec(req) {
           tags: ["Docs"],
           summary: "Health check",
           responses: { 200: { description: "Service health summary" } },
+        },
+      },
+      [`${api}/diagnostics`]: {
+        post: {
+          tags: ["Docs"],
+          summary: "Verify local browser rendering, screenshot pixels, and artifact storage",
+          description: "Runs a temporary isolated browser check with page networking blocked. Does not visit user pages or download browsers. Concurrent requests share one check. Inspect data.status and data.checks even when HTTP status is 200. Temporary resources are cleaned up afterward. Requires the runner role when identities are configured.",
+          responses: {
+            200: { description: "Diagnostic report: data.status is ok, degraded, or failed; checks include elapsed time, errorCode, and remediation when applicable." },
+            401: { description: "API authentication required" },
+            403: { description: "Runner role required" },
+          },
         },
       },
       [`${api}/scripts`]: {
@@ -9310,10 +9437,30 @@ function buildOpenApiSpec(req) {
         post: {
           tags: ["Sessions"],
           summary: "Capture a screenshot",
+          description: "Captures the current rendered page without waiting for document load or remote fonts. Font waiting can be enabled with SCREENSHOT_WAIT_FOR_FONTS. Returns a downloadable artifact.",
           parameters: [
             { name: "sessionId", in: "path", required: true, schema: { type: "string" } },
             { name: "pageId", in: "path", required: true, schema: { type: "string" } },
           ],
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string", enum: ["png", "jpeg"], default: "png" },
+                    fullPage: { type: "boolean", default: true, description: "Page capture only; cannot be true with locator." },
+                    locator: { $ref: "#/components/schemas/Locator" },
+                    filename: { type: "string", description: "Optional artifact filename; sanitized basename is prefixed with a unique artifact ID and uses the selected image format extension." },
+                    timeoutMs: { type: "integer", minimum: 0, description: "Capture timeout in milliseconds; 0 or omitted uses SCREENSHOT_TIMEOUT_MS (30000 by default)." },
+                    omitBackground: { type: "boolean" },
+                    quality: { type: "integer", minimum: 0, maximum: 100, description: "JPEG only." },
+                    scale: { type: "string", enum: ["css", "device"] },
+                  },
+                },
+              },
+            },
+          },
           responses: { 200: { description: "Created screenshot artifact" } },
         },
       },
@@ -9752,6 +9899,7 @@ await loadUiAssets();
 await runManager.restore();
 runManager.startScheduler();
 const sessionManager = new SessionManager(config);
+const offlineDiagnostics = createOfflineDiagnostics({ sessionManager, config, ApiError });
 const scriptAssistant = new ScriptAssistant({
   ...config,
   registry: scriptRegistry,
@@ -9967,9 +10115,12 @@ app.get("/health", asyncRoute(async (req, res) => {
     queuedRunCount: runManager.countQueuedRuns(),
     scheduleCount: (await runManager.schedules.list().catch(() => [])).length,
     sessionCount: sessionManager.sessions.size,
+    pendingSessionCount: sessionManager.pendingSessionCreates.size,
+    closingSessionCount: sessionManager.closingSessions.size,
     mcpSessionCount: mcpSessions.size,
     limits: {
       maxSessions: config.maxSessions,
+      browserLaunchTimeoutMs: config.browserLaunchTimeoutMs,
       maxContextsPerSession: config.maxContextsPerSession,
       maxPagesPerSession: config.maxPagesPerSession,
       maxConcurrentRuns: config.maxConcurrentRuns,
@@ -10003,6 +10154,10 @@ app.get("/health", asyncRoute(async (req, res) => {
       runTimeoutMs: config.runTimeoutMs,
     },
   });
+}));
+
+app.post(`${config.apiBasePath}/diagnostics`, asyncRoute(async (req, res) => {
+  ok(res, await offlineDiagnostics.run());
 }));
 
 app.get(`${config.apiBasePath}/scripts`, asyncRoute(async (req, res) => {
@@ -10787,7 +10942,24 @@ function toolResult(payload, isError = false) {
   };
 }
 
+async function mcpSuccessResult(tool, payload) {
+  const result = toolResult(payload);
+  // MCP clients cannot render a container-local path or fetch a protected REST
+  // URL on their own. Send the captured bytes using the protocol's image block,
+  // while retaining the artifact metadata for existing clients and downloads.
+  if (["page_screenshot", "browser_take_screenshot"].includes(tool.name) && payload?.artifact) {
+    const artifact = sessionManager.getArtifact(payload.artifact.sessionId, payload.artifact.artifactId);
+    const mimeType = INLINE_ARTIFACT_TYPES[path.extname(artifact.fileName).toLowerCase()];
+    if (mimeType?.startsWith("image/")) {
+      const buffer = await fsPromises.readFile(artifact.absolutePath);
+      result.content.push({ type: "image", mimeType, data: buffer.toString("base64") });
+    }
+  }
+  return result;
+}
+
 const mcpTools = [
+  defineTool("diagnostics_run", "Check local browser launch, rendering, screenshot pixels, and artifact storage without visiting external sites. Returns individual checks and recovery steps; temporary resources are cleaned up.", { type: "object", properties: {}, additionalProperties: false }, async () => offlineDiagnostics.run()),
   defineTool("script_list", "List registered Playwright scripts.", { type: "object", properties: {} }, async () => ({
     scripts: scriptRegistry.list(),
   })),
@@ -11074,7 +11246,7 @@ const mcpTools = [
   ),
   defineTool("run_delete", "Delete a finished run and reclaim its artifacts from disk.", { type: "object", properties: { runId: { type: "string" } }, required: ["runId"] }, async (args) => runManager.deleteRun(args.runId)),
   defineTool("session_list", "List active browser sessions.", { type: "object", properties: {} }, async () => ({ sessions: sessionManager.listSessions() })),
-  defineTool("session_create", "Create a low-level browser session for debugging.", { type: "object", properties: { browserType: { type: "string" }, headless: { type: "boolean" }, ttlMs: { type: "number" } } }, async (args) => sessionManager.createSession(args)),
+  defineTool("session_create", "Create a low-level browser session for debugging.", { type: "object", properties: { browserType: { type: "string" }, headless: { type: "boolean" }, ttlMs: { type: "number" }, timeoutMs: { type: "number", exclusiveMinimum: 0, description: "Browser startup timeout, capped by BROWSER_LAUNCH_TIMEOUT_MS." } } }, async (args) => sessionManager.createSession(args)),
   defineTool("session_get", "Get one browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.serializeSession(sessionManager.getSession(args.sessionId))),
   defineTool("session_delete", "Close a browser session.", { type: "object", properties: { sessionId: { type: "string" } }, required: ["sessionId"] }, async (args) => sessionManager.closeSession(args.sessionId, "closed")),
   defineTool("session_keepalive", "Extend a browser session TTL.", { type: "object", properties: { sessionId: { type: "string" }, ttlMs: { type: "number" } }, required: ["sessionId"] }, async (args) => sessionManager.keepAlive(args.sessionId, args.ttlMs)),
@@ -11305,12 +11477,16 @@ const mcpTools = [
   ),
   defineTool(
     "page_screenshot",
-    "Capture a screenshot and store it as a downloadable artifact.",
+    "Capture a screenshot, return an inline MCP image, and store a downloadable artifact.",
     sessionPageSchema({
       fullPage: { type: "boolean", default: true },
       type: { type: "string", enum: ["png", "jpeg"], default: "png" },
       quality: { type: "integer", description: "jpeg only, 0-100" },
       omitBackground: { type: "boolean" },
+      locator: LOCATOR_SCHEMA,
+      filename: { type: "string", description: "Suggested filename inside the server artifact directory." },
+      scale: { type: "string", enum: ["css", "device"] },
+      timeoutMs: { type: "integer", minimum: 0, description: "Capture timeout in milliseconds; 0 uses SCREENSHOT_TIMEOUT_MS." },
     }),
     async (args) => sessionManager.screenshot(args.sessionId, args.pageId, args),
   ),
@@ -11328,6 +11504,8 @@ const mcpTools = [
   ),
 ];
 
+const playwrightMcpCompatibility = createPlaywrightMcpCompatibility({ sessionManager, ApiError, rootDir });
+mcpTools.push(...playwrightMcpCompatibility.tools);
 const mcpToolMap = new Map(mcpTools.map((tool) => [tool.name, tool]));
 
 function createMcpSession() {
@@ -11340,13 +11518,20 @@ function createMcpSession() {
   return sessionId;
 }
 
-// MCP sessions are just bookkeeping, but clients rarely send DELETE /mcp, so
-// they have to age out or the map grows for the lifetime of the process.
+async function closeMcpSession(sessionId) {
+  const session = mcpSessions.get(sessionId);
+  if (!session) return;
+  mcpSessions.delete(sessionId);
+  await playwrightMcpCompatibility.dispose(session);
+}
+
+// Clients rarely send DELETE /mcp. Expiration also releases the browser owned
+// by the compatibility tools, rather than leaving it until the browser TTL.
 const mcpCleanupTimer = setInterval(() => {
   const cutoff = Date.now() - config.mcpSessionTtlMs;
   for (const [sessionId, session] of mcpSessions) {
     if (Date.parse(session.updatedAt) <= cutoff) {
-      mcpSessions.delete(sessionId);
+      closeMcpSession(sessionId).catch((error) => console.error("MCP session cleanup failed", error.message));
     }
   }
 }, Math.min(config.mcpSessionTtlMs, 5 * 60 * 1000));
@@ -11438,8 +11623,8 @@ async function handleMcpRequest(req, message) {
         }, true));
       }
       try {
-        const output = await tool.handler(message.params?.arguments || {}, req.principal);
-        return jsonRpcResult(message.id ?? null, toolResult(output));
+        const output = await tool.handler(message.params?.arguments || {}, req.principal, mcpSessions.get(req.header("Mcp-Session-Id")));
+        return jsonRpcResult(message.id ?? null, await mcpSuccessResult(tool, output));
       } catch (error) {
         const apiError = toApiError(error);
         return jsonRpcResult(message.id ?? null, toolResult({
@@ -11472,7 +11657,7 @@ app.delete(config.mcpBasePath, asyncRoute(async (req, res) => {
   if (!sessionId || !mcpSessions.has(sessionId)) {
     throw new ApiError(404, "MCP_SESSION_NOT_FOUND", "MCP session not found");
   }
-  mcpSessions.delete(sessionId);
+  await closeMcpSession(sessionId);
   res.status(204).send();
 }));
 

@@ -15,6 +15,14 @@ const deleteBtn = document.getElementById('deleteBtn');
 
 const TERMINAL = ['completed', 'failed', 'cancelled', 'interrupted'];
 let currentRunId = null;
+let evidenceVersion = 0;
+const evidenceObjectUrls = new Set();
+
+function clearEvidencePreviews() {
+  evidenceVersion += 1;
+  for (const url of evidenceObjectUrls) URL.revokeObjectURL(url);
+  evidenceObjectUrls.clear();
+}
 
 function setStatus(message, isError) {
   statusBox.hidden = !message;
@@ -42,6 +50,7 @@ function fact(label, value) {
 
 async function showList() {
   currentRunId = null;
+  clearEvidencePreviews();
   detailView.hidden = true;
   listView.hidden = false;
   setStatus('');
@@ -160,6 +169,7 @@ function renderTest(test) {
 }
 
 async function renderEvidence(runId, tests) {
+  const version = evidenceVersion;
   const attachments = [];
   for (const test of tests || []) {
     for (const attachment of test.attachments || []) {
@@ -177,18 +187,29 @@ async function renderEvidence(runId, tests) {
 
   const gallery = element('div', { className: 'evidence' });
   for (const attachment of attachments) {
-    const downloadPath = `${CONFIG.apiBasePath}/runs/${runId}/artifacts/${attachment.path}`;
+    const artifactPath = attachment.path.split('/').map(encodeURIComponent).join('/');
+    const downloadPath = `${CONFIG.apiBasePath}/runs/${runId}/artifacts/${artifactPath}`;
     const caption = element('figcaption', { textContent: `${attachment.name} · ${attachment.path}` });
     const figure = element('figure', {}, [caption]);
 
     if ((attachment.contentType || '').startsWith('image/')) {
       const image = element('img', { alt: attachment.name });
+      image.addEventListener('error', () => {
+        caption.textContent = `${attachment.name} (preview unavailable)`;
+      });
       figure.prepend(image);
       // The route needs an Authorization header when API_TOKEN is set, which an
       // <img src> cannot send, so fetch it and preview the blob.
       artifactObjectUrl(downloadPath, true)
-        .then((url) => { image.src = url; })
-        .catch(() => { caption.textContent = `${attachment.name} (preview unavailable)`; });
+        .then((url) => {
+          if (version !== evidenceVersion) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          evidenceObjectUrls.add(url);
+          image.src = url;
+        })
+        .catch((error) => { caption.textContent = `${attachment.name}: ${error.message}`; });
     }
 
     const button = element('button', { type: 'button', className: 'secondary', textContent: COPY.download });
@@ -304,6 +325,8 @@ function renderAnalysis(runId, run) {
 
 async function showDetail(runId) {
   currentRunId = runId;
+  clearEvidencePreviews();
+  const version = evidenceVersion;
   listView.hidden = true;
   detailView.hidden = false;
   detailBody.replaceChildren();
@@ -313,6 +336,7 @@ async function showDetail(runId) {
   try {
     run = (await api('GET', `${CONFIG.apiBasePath}/runs/${runId}`)).data;
   } catch (error) {
+    if (version !== evidenceVersion) return;
     // A 404 is about this run, so it belongs in the panel. Anything else is
     // about the request itself — most often a missing API token — and belongs
     // next to the token field, not buried in a panel the user may not look at.
@@ -323,6 +347,7 @@ async function showDetail(runId) {
     }
     return;
   }
+  if (version !== evidenceVersion) return;
 
   const isTerminal = TERMINAL.includes(run.status);
   retryBtn.hidden = !isTerminal;

@@ -114,6 +114,25 @@ powershell -ExecutionPolicy Bypass -File .\tools\offline-load-run.ps1 `
 
 기본 prefix 는 `/api` 입니다.
 
+### 실행 환경 점검
+
+`/health`는 서버 프로세스 상태를 확인합니다. 실제 브라우저와 스크린샷이 동작하는지 확인하려면 Playground의 **실행 환경 점검**을 사용하세요. 설정, 브라우저 실행, 로컬 화면 렌더링, PNG의 실제 색상, 파일 저장·재읽기, 임시 자원 정리를 검사하며 문제가 있는 항목에는 조치 방법이 표시됩니다. 결과를 JSON으로 내려받아 반입 환경 간 비교나 장애 접수에 사용할 수 있습니다.
+
+동일한 검사를 `POST /api/diagnostics`, MCP `diagnostics_run`, 또는 실행 중인 서버에 대한 CLI로 호출할 수 있습니다.
+
+```bash
+npm run doctor
+npm run --silent doctor -- --json
+npm run doctor -- --url http://127.0.0.1:3000
+docker exec playwright-player npm run --silent doctor -- --json
+```
+
+인증을 사용하는 서버에는 `API_TOKEN` 환경변수를 설정합니다. 이름 있는 신원을 사용하는 경우 runner 권한이 필요합니다. 주소 기본값은 `PLAYWRIGHT_PLAYER_URL` 또는 `http://127.0.0.1:$PORT`(`PORT` 기본값 3000), API 경로는 `API_BASE_PATH`(기본 `/api`)입니다. CLI 종료 코드는 전체 통과 `0`, 실패·일부 확인 불가 `1`, 접속·인증 실패 `2`입니다.
+
+검사는 외부 요청이 차단된 전용 컨텍스트에서 수행하며 브라우저를 다운로드하지 않습니다. 동시 점검 요청은 한 번의 검사 결과를 공유하고, 점검 후 임시 세션과 파일을 정리합니다. 사용자 세션과 증적은 건드리지 않습니다. 세션이 가득 찬 경우 실행 중 작업을 종료하지 않고 재시도를 안내합니다. API의 HTTP 200은 보고서 수신 성공이므로 실제 판정은 `data.status`(`ok`/`degraded`/`failed`)와 `data.checks`를 확인하세요. 서버 응답은 정리 시간을 포함해 최대 20초로 제한됩니다.
+
+이 검사는 내장 화면과 로컬 실행 환경을 검증합니다. 대상 업무 시스템의 접속·인증·업무 성공 여부는 해당 시나리오로 별도 검증해야 합니다. 결과에는 토큰이나 서버 디렉터리 경로를 담지 않습니다.
+
 ### Script Registry
 
 - `GET /api/scripts`
@@ -203,6 +222,8 @@ MCP endpoint 는 `/mcp` 입니다.
 
 제공 도구:
 
+- Microsoft Playwright MCP 호환: `browser_navigate`, `browser_navigate_back`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_hover`, `browser_drag`, `browser_fill_form`, `browser_select_option`, `browser_press_key`, `browser_wait_for`, `browser_resize`, `browser_tabs`, `browser_close`, `browser_evaluate`, `browser_take_screenshot`, `browser_console_messages`, `browser_network_requests`, `browser_handle_dialog`, `browser_file_upload`
+- `diagnostics_run`: 외부 사이트 접속 없이 실제 렌더링·캡처·파일 저장을 확인하는 실행 환경 점검
 - `script_list`, `script_get`, `script_sync`, `script_upload`, `script_delete`, `script_validate`
 - `assist_capabilities`, `assist_examples`, `assist_plan`, `assist_scaffold`
 - `schedule_list`, `schedule_get`, `schedule_save`, `schedule_delete`, `schedule_trigger`
@@ -218,6 +239,16 @@ MCP endpoint 는 `/mcp` 입니다.
 - `page_navigate`, `page_action`, `page_assert`, `page_wait_for`
 - `page_screenshot`, `page_pdf`
 - `session_trace`, `session_execute`, `session_artifacts`, `session_actions`
+
+`browser_*`는 [Microsoft Playwright MCP](https://github.com/microsoft/playwright-mcp)의 핵심 브라우저 도구명과 호출 인자를 지원합니다. MCP 연결별로 브라우저와 현재 탭을 관리하므로 `sessionId`/`pageId` 없이 호출할 수 있습니다. `browser_snapshot`의 참조는 기존 `ref`와 새 `target` 인자로 사용할 수 있고, `target`에는 고유한 selector도 전달할 수 있습니다. 기존 `page_*`, `session_*` 도구는 계속 지원됩니다. MCP 연결 종료(`DELETE /mcp`) 또는 만료 시 해당 연결의 브라우저도 닫힙니다.
+
+클릭·Enter 제출·스크립트가 팝업을 열면 새 탭을 선택하고 그 화면의 스냅샷을 반환합니다. 닫으면 이전 탭으로 돌아갑니다. 브라우저 충돌, 만료, REST 삭제 후에는 다음 호출에서 필요한 브라우저·컨텍스트를 다시 생성합니다. 이전 로그인·페이지 상태를 복원하거나 실패한 클릭·제출을 자동 재실행하지 않습니다. `DELETE /mcp`는 끝나지 않는 호출 뒤에서 기다리지 않고 브라우저를 닫아 진행 중 호출과 대기 중 호출을 취소합니다.
+
+`browser_take_screenshot`과 `page_screenshot`은 다운로드 메타데이터와 함께 MCP `image` content에 PNG/JPEG 바이트를 직접 반환합니다. 클라이언트가 컨테이너 파일 경로에 접근하거나 이미지 URL에 인증 헤더를 따로 붙일 필요가 없습니다. REST 아티팩트 다운로드에는 기존과 같이 API 인증이 적용됩니다.
+
+호환 범위는 위 핵심 도구이며 공식 서버의 전체 확장 기능을 복제하지 않습니다. 브라우저 설치 도구나 서버에서 임의 코드를 실행하는 도구는 제공하지 않습니다. 스크린샷은 PNG/JPEG를 지원하며, 파일은 서버 아티팩트 디렉터리에 보관됩니다. 사용 예시는 [LLM + MCP 가이드](docs/guides/llm-mcp-ko.md)를 참고하세요.
+
+외부 사이트 없이 MCP 호환성과 오프라인 캡처 회귀 테스트만 실행하려면 `npm run test:mcp`를 사용하세요. 브라우저 미설치를 실패로 처리하려면 `SMOKE_REQUIRE_BROWSER=1 npm run test:mcp`로 실행합니다.
 
 ## 환경 변수
 
@@ -269,7 +300,8 @@ MCP endpoint 는 `/mcp` 입니다.
 | `MAX_API_RESPONSE_BODY_BYTES` | `262144` | 응답 본문을 인라인으로 돌려주는 상한. 전체는 아티팩트로 보관됩니다 |
 | `API_REQUEST_TIMEOUT_MS` | `30000` | `contexts/{id}/request` 기본 타임아웃 |
 | `SCRIPTS_DIR` / `RUNS_DIR` / `ARTIFACTS_DIR` / `STORAGE_STATE_DIR` | `./scripts`, `./data/runs`, `./data/artifacts`, `./storage-states` | 업로드·실행 산출물·스토리지 상태가 놓이는 루트입니다. 요청으로 전달된 경로는 이 루트 밖으로 나갈 수 없습니다. |
-| `MAX_SESSIONS` | `10` | 동시 브라우저 세션 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED` |
+| `MAX_SESSIONS` | `10` | 실행 중·생성 중·종료 중 브라우저를 합산한 상한. 초과 시 `429 SESSION_LIMIT_EXCEEDED`. 동시 요청도 이 상한을 넘을 수 없습니다. |
+| `BROWSER_LAUNCH_TIMEOUT_MS` | `30000` | 브라우저 시작 시간 제한. 세션 생성의 양수 `timeoutMs`로 줄일 수 있으며 서버 상한을 늘릴 수는 없습니다. 미설치는 `503 BROWSER_NOT_INSTALLED`, 시작 시간 초과는 `504 BROWSER_LAUNCH_TIMEOUT`으로 구분합니다. |
 | `MAX_CONTEXTS_PER_SESSION` | `5` | 세션당 컨텍스트 상한 |
 | `MAX_PAGES_PER_SESSION` | `10` | 세션당 페이지 상한 |
 | `MAX_CONCURRENT_RUNS` | `4` | 동시 실행 상한. 초과분은 대기열로 들어갑니다 |
@@ -279,6 +311,9 @@ MCP endpoint 는 `/mcp` 입니다.
 | `SESSION_TTL_MS` | `1800000` | 세션 만료 시간 |
 | `MCP_SESSION_TTL_MS` | `3600000` | MCP 세션 기록 만료 시간 |
 | `CAPTURE_FAILURE_ARTIFACTS` | `true` | 실패 시 스크린샷/DOM 저장 여부. 요청 본문이 잘못된 `4xx` 는 저장하지 않고, 타임아웃과 실제 자동화 실패만 저장합니다. |
+| `SCREENSHOT_TIMEOUT_MS` | `30000` | 세션 스크린샷 기본 시간 제한. 요청의 양수 `timeoutMs`로 재정의하며 `0`은 서버 기본값을 사용합니다. |
+| `SCREENSHOT_WAIT_FOR_FONTS` | `false` | 외부 웹폰트 로딩 완료를 기다릴지. 기본값은 현재 렌더링된 폰트로 캡처해 오프라인망의 폰트 요청 지연을 피합니다. 정확한 웹폰트가 필요하고 해당 리소스에 접근할 수 있으면 `true`로 설정합니다. 세션과 스크립트 실행 모두 적용됩니다. |
+| `FAILURE_ARTIFACT_TIMEOUT_MS` | `5000` | 세션 자동화 실패 후 스크린샷/DOM 수집의 공유 시간 제한. 스크린샷 자체 실패 시에는 캡처를 다시 시도하지 않습니다. |
 | `PURGE_SESSION_ARTIFACTS_ON_CLOSE` | `false` | `true` 면 세션 종료 시 아티팩트 디렉터리를 삭제합니다. |
 | `DEFAULT_BROWSER_TYPE` | `chromium` | 기본 브라우저 |
 | `DEFAULT_HEADLESS` | `true` | 기본 headless 여부 |

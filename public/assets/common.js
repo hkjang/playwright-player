@@ -37,9 +37,12 @@
   // <img src> and <a href> cannot carry an Authorization header, so an artifact
   // has to be fetched and turned into a blob URL when a token is in play.
   async function artifactObjectUrl(downloadPath, inline) {
-    const response = await fetch(downloadPath + (inline ? '?disposition=inline' : ''), { headers: authHeaders() });
+    const url = new URL(downloadPath, window.location.href);
+    if (inline) url.searchParams.set('disposition', 'inline');
+    const response = await fetch(url, { headers: authHeaders() });
     if (!response.ok) {
-      throw new Error('artifact fetch failed (' + response.status + ')');
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error?.message || 'artifact fetch failed (' + response.status + ')');
     }
     return URL.createObjectURL(await response.blob());
   }

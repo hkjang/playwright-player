@@ -59,6 +59,18 @@ docker run -d `
 | `http://127.0.0.1:3000/playground` | API Playground |
 | `http://127.0.0.1:3000/demo/test-page` | Built-in demo test page |
 
+### Verify actual browser readiness
+
+Use **Check the execution environment** in the Playground, or run the following command inside the running container. It tests browser startup, rendering, PNG pixels, and file write/read using the installed browser and actual service permissions.
+
+```bash
+docker exec playwright-player npm run --silent doctor -- --json
+```
+
+A report with `status: "ok"` has passed all six checks. Failures include `errorCode` and `remediation`. The check blocks page networking, downloads nothing, and removes its temporary session and files. Existing sessions stay open. Exit codes are `0` for success, `1` for failed/incomplete checks, and `2` for connection/authentication failure. For remote operation, use `--url` and the `API_TOKEN` environment variable.
+
+REST `POST /api/diagnostics` and MCP `diagnostics_run` return the same report. Inspect its `status` even when HTTP is 200. The Playground can download the JSON report. `/health` also exposes `pendingSessionCount` and `closingSessionCount`; these count toward session capacity.
+
 ## 5. Demo test page verification
 
 `/demo/test-page` is a built-in page that works without any external network.
@@ -80,33 +92,21 @@ Follow these steps to quickly verify that the session API is working:
 
 > If all three steps succeed, browser automation is fully operational in your offline environment.
 
-## 6. Docker Chromium auto-configuration (v0.1.4+)
+## 6. Offline screenshots and browser configuration
 
-In offline Docker environments, sessions could be created but page operations (`goto`, `inspect`, `screenshot`) would fail.
+In Docker, the server keeps selecting `channel=chromium` and applying its container launch flags. Headless shell also supports navigation and screenshots, so the binary choice alone does not explain a capture failure. Check that the installed browser matches the pinned Playwright package first.
 
-### Root cause: `chromium-headless-shell` binary
+External fonts or scripts may never finish loading on an isolated network. Screenshots no longer add a `DOMContentLoaded` wait and, by default, capture the currently rendered page without waiting for webfonts.
 
-Starting from Playwright 1.58, running with `headless: true` (the default) selects the lightweight **`chromium-headless-shell`** binary instead of full Chromium. This binary lacks full page functionality and may fail on `page.goto`, `page.evaluate`, and `page.screenshot` inside Docker containers.
+- `SCREENSHOT_TIMEOUT_MS=30000`: default capture deadline; override with a positive request `timeoutMs`.
+- `SCREENSHOT_WAIT_FOR_FONTS=false`: default. If exact webfonts are required, serve them from reachable internal URLs and set this to `true`.
+- `FAILURE_ARTIFACT_TIMEOUT_MS=5000`: shared deadline for failure evidence. A failed screenshot is not immediately retried as failure evidence.
 
-- The browser main process starts successfully, so **session creation succeeds**.
-- However, page operations fail because the **renderer process does not work correctly**.
+Wait for the required text or element using `browser_wait_for` or REST assertions before capture. If navigation itself stalls on resources, use REST `goto` with `waitUntil: "domcontentloaded"` or `"commit"`, then wait for the required elements separately.
 
-### Fix: automatic full Chromium selection
+MCP clients can call `browser_navigate` → `browser_snapshot` → `browser_take_screenshot` without explicit session/page IDs. Both screenshot tool names return standard MCP image content. `filename` names a server artifact, not a client-local path. REST artifact downloads still require the configured API authentication.
 
-Starting from v0.1.4, the server auto-detects the Docker environment and sets `channel=chromium` to force the full Chromium binary. Essential flags like `--no-sandbox` and `--disable-dev-shm-usage` are already added automatically by Playwright.
-
-When the server starts, the following log confirms auto-detection:
-
-```
-Docker environment detected — Chromium will use full browser (channel=chromium) instead of headless-shell
-```
-
-To manually specify the channel, pass it when creating a session:
-
-```json
-POST /api/sessions
-{ "channel": "chromium" }
-```
+Built-in UI and Swagger assets are served locally, and Swagger's external validator is disabled. Build the image with dependencies and browsers in a connected build environment before transferring it. Runtime operation does not require `npx ...@latest` or a browser installation command.
 
 ## 7. Operational notes
 
@@ -117,11 +117,13 @@ POST /api/sessions
 
 ## 8. Troubleshooting
 
-| Symptom | Cause | Fix |
+| Symptom | Check | Action |
 | --- | --- | --- |
-| Session created but goto/inspect/screenshot fail | `chromium-headless-shell` binary lacks full page functionality in Docker | Use v0.1.4+ (auto-selects full Chromium), or pass `"channel": "chromium"` when creating a session |
-| `Target closed` or `Browser closed` error | `/dev/shm` exceeded 64MB | Add `--ipc=host` (Playwright already applies `--disable-dev-shm-usage` by default) |
-| Screenshot is blank | headless-shell rendering limitation | Use `"channel": "chromium"` for full Chromium |
-| Container crashes immediately after start | Image architecture mismatch | Check image arch with `docker inspect` (amd64 required) |
+| Capture stalls | External font requests, readiness, timeout | Keep font waiting disabled, set `timeoutMs`, explicitly wait for required elements |
+| MCP shows only a file path | Server version and client image support | Use the updated server and inspect `content` image blocks, or fetch the authenticated artifact |
+| Preview/download returns 401 | Missing API token | Enter the token in the UI or supply the Authorization header |
+| Blank screenshot | DOM/application data readiness | Inspect snapshot, console, and network output; wait for the required elements |
+| `Target closed` or `Browser closed` | Container memory, shared memory, browser logs | Inspect logs, adjust memory, and use `--ipc=host` or `--shm-size` as appropriate |
+| Browser executable missing | Package/browser version and image contents | Rebuild with the pinned browser in a connected environment and transfer the image |
 
 > For the full procedure, pair this guide with `docs/OFFLINE_DOCKER_GUIDE_KO.md` and `tools/offline-load-run.ps1` in the repository.

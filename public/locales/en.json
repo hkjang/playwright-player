@@ -110,7 +110,31 @@
     "recordingStopped": "Recording stopped.",
     "recordingExported": "Steps exported — see the JSON result below.",
     "recordingExportedAmbiguous": "Exported, but some locators are not unique:",
-    "recordingMasked": "replaced with a secret reference — supply the value through SECRETS_DIR"
+    "recordingMasked": "replaced with a secret reference — supply the value through SECRETS_DIR",
+    "diagnosticsTitle": "Check the execution environment",
+    "diagnosticsBody": "Test browser startup, rendering, screenshots, and file storage. The check opens only its own local page and does not visit external sites.",
+    "diagnosticsButton": "Run environment check",
+    "diagnosticsDownload": "Download report",
+    "diagnosticsIdle": "Run a check to see each result and any recommended action.",
+    "diagnosticsRunning": "Checking browser startup, rendering, screenshots, and file storage…",
+    "diagnosticsOk": "All checks passed.",
+    "diagnosticsDegraded": "Some checks could not be completed. Review the details below.",
+    "diagnosticsFailed": "The check found a problem. Review the suggested action below.",
+    "diagnosticsLabels": {
+      "configuration": "Execution settings",
+      "browser_launch": "Browser startup",
+      "page_render": "Page rendering",
+      "screenshot_capture": "Screenshot pixels",
+      "artifact_roundtrip": "File write and read",
+      "cleanup": "Resource cleanup"
+    },
+    "diagnosticsStatuses": {
+      "passed": "Passed",
+      "warning": "Check needed",
+      "failed": "Failed",
+      "skipped": "Skipped"
+    },
+    "diagnosticsRemediation": {}
   },
   "demo": {
     "title": "Playwright Player Demo Page",

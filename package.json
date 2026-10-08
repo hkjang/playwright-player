@@ -1,14 +1,19 @@
 {
   "name": "playwright-player",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "private": true,
   "type": "module",
   "description": "Stateful Playwright REST API with script runs, Streamable MCP support, and an offline-friendly playground",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js",
-    "test": "node tools/smoke-test.mjs"
+    "check": "node --check server.js && node --check playwright-mcp-compat.js && node --check offline-diagnostics.js && node --check tools/doctor.mjs",
+    "test": "node tools/smoke-test.mjs && node tools/mcp-compat-test.mjs && node tools/mcp-resilience-test.mjs && node tools/session-capacity-test.mjs && node tools/diagnostics-test.mjs && node tools/ui-offline-test.mjs",
+    "test:mcp": "node tools/mcp-compat-test.mjs && node tools/mcp-resilience-test.mjs",
+    "test:ui-offline": "node tools/ui-offline-test.mjs",
+    "test:diagnostics": "node tools/diagnostics-test.mjs",
+    "test:capacity": "node tools/session-capacity-test.mjs",
+    "doctor": "node tools/doctor.mjs"
   },
   "engines": {
     "node": ">=22"

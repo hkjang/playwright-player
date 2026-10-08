@@ -8,6 +8,9 @@ const scriptKeySelect = document.getElementById('scriptKey');
 const sessionIdInput = document.getElementById('sessionId');
 const contextIdInput = document.getElementById('contextId');
 const pageIdInput = document.getElementById('pageId');
+let previewObjectUrl = null;
+let previewVersion = 0;
+let diagnosticReport = null;
 
 function setStatus(message, isError) {
   statusBox.textContent = message;
@@ -27,10 +30,12 @@ function syncInputs() {
 // <img src> and <a href> cannot carry an Authorization header, so with
 // API_TOKEN set both have to go through fetch and a blob URL.
 async function fetchArtifactBlob(downloadPath, inline) {
-  const url = downloadPath + (inline ? '?disposition=inline' : '');
+  const url = new URL(downloadPath, window.location.href);
+  if (inline) url.searchParams.set('disposition', 'inline');
   const response = await fetch(url, { headers: authHeaders() });
   if (!response.ok) {
-    throw new Error(COPY.requestFailed + ' (' + response.status + ')');
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || COPY.requestFailed + ' (' + response.status + ')');
   }
   return URL.createObjectURL(await response.blob());
 }
@@ -46,18 +51,42 @@ async function downloadArtifact(artifact) {
   setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 30000);
 }
 
-function showArtifact(artifact) {
+function clearPreview() {
+  previewVersion += 1;
+  if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+  previewObjectUrl = null;
+  preview.textContent = COPY.noScreenshot;
+}
+
+async function showArtifact(artifact) {
+  clearPreview();
   if (!artifact || !artifact.downloadPath) {
-    preview.textContent = COPY.noScreenshot;
     return;
   }
+  const version = previewVersion;
   preview.replaceChildren();
   const image = document.createElement('img');
   image.alt = COPY.screenshotAlt;
+  image.addEventListener('error', function () {
+    if (version !== previewVersion) return;
+    clearPreview();
+    preview.textContent = COPY.requestFailed;
+    setStatus(COPY.requestFailed, true);
+  });
   preview.append(image);
-  fetchArtifactBlob(artifact.downloadPath, true)
-    .then(function (objectUrl) { image.src = objectUrl; })
-    .catch(function (error) { preview.textContent = error.message; });
+  try {
+    const objectUrl = await fetchArtifactBlob(artifact.downloadPath, true);
+    if (version !== previewVersion) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    previewObjectUrl = objectUrl;
+    image.src = objectUrl;
+  } catch (error) {
+    if (version !== previewVersion) return;
+    preview.textContent = error.message;
+    throw error;
+  }
 }
 
 function authHeaders() {
@@ -128,6 +157,70 @@ function onClick(id, handler) {
 }
 
 onClick('healthBtn', async () => { await api('GET', '/health'); });
+onClick('diagnosticsBtn', async () => {
+  const summary = document.getElementById('diagnosticsSummary');
+  const checks = document.getElementById('diagnosticsChecks');
+  const download = document.getElementById('downloadDiagnosticsBtn');
+  diagnosticReport = null;
+  download.disabled = true;
+  checks.replaceChildren();
+  summary.textContent = COPY.diagnosticsRunning;
+  summary.dataset.status = 'running';
+  checks.setAttribute('aria-busy', 'true');
+  try {
+    const payload = await api('POST', CONFIG.apiBasePath + '/diagnostics', {});
+    diagnosticReport = payload.data;
+    const messages = { ok: COPY.diagnosticsOk, degraded: COPY.diagnosticsDegraded, failed: COPY.diagnosticsFailed };
+    summary.textContent = (messages[diagnosticReport.status] || COPY.diagnosticsFailed) + ' (' + diagnosticReport.durationMs + ' ms)';
+    summary.dataset.status = diagnosticReport.status;
+    for (const check of diagnosticReport.checks || []) {
+      const row = document.createElement('li');
+      row.dataset.status = check.status;
+      row.dataset.check = check.id;
+      const heading = document.createElement('div');
+      heading.className = 'diagnostics-check-heading';
+      const label = document.createElement('strong');
+      label.textContent = COPY.diagnosticsLabels[check.id] || check.id;
+      const status = document.createElement('span');
+      status.className = 'diagnostics-check-status';
+      status.textContent = (COPY.diagnosticsStatuses[check.status] || check.status) + ' · ' + check.durationMs + ' ms';
+      heading.append(label, status);
+      row.append(heading);
+      if (check.message && check.status !== 'passed') {
+        const message = document.createElement('p');
+        message.textContent = check.message;
+        row.append(message);
+      }
+      const remediation = COPY.diagnosticsRemediation[check.errorCode] || check.remediation;
+      if (remediation) {
+        const help = document.createElement('p');
+        help.className = 'diagnostics-remediation';
+        help.textContent = remediation;
+        row.append(help);
+      }
+      checks.append(row);
+    }
+    download.disabled = false;
+    setStatus(summary.textContent, diagnosticReport.status !== 'ok');
+  } catch (error) {
+    summary.textContent = error.message || COPY.requestFailed;
+    summary.dataset.status = 'failed';
+    throw error;
+  } finally {
+    checks.setAttribute('aria-busy', 'false');
+  }
+});
+onClick('downloadDiagnosticsBtn', async () => {
+  if (!diagnosticReport) return;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(diagnosticReport, null, 2)], { type: 'application/json' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = 'playwright-player-diagnostics-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+});
 onClick('syncScriptsBtn', async () => {
   await api('POST', CONFIG.apiBasePath + '/scripts/sync', {});
   await refreshScripts();
@@ -161,6 +254,7 @@ onClick('createSessionBtn', async () => {
   state.contextId = '';
   state.pageId = '';
   syncInputs();
+  clearPreview();
 });
 onClick('createContextBtn', async () => {
   requireValue(state.sessionId, COPY.createSessionFirst);
@@ -217,7 +311,7 @@ onClick('takeScreenshotBtn', async () => {
     fullPage: true,
     type: 'png'
   });
-  showArtifact(payload && payload.data && payload.data.artifact);
+  await showArtifact(payload && payload.data && payload.data.artifact);
 });
 onClick('closeSessionBtn', async () => {
   requireValue(state.sessionId, COPY.createSessionFirst);
@@ -226,7 +320,7 @@ onClick('closeSessionBtn', async () => {
   state.contextId = '';
   state.pageId = '';
   syncInputs();
-  preview.textContent = COPY.noScreenshot;
+  clearPreview();
 });
 
 onClick('listArtifactsBtn', async () => {
