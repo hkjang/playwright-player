@@ -1,0 +1,94 @@
+# The repository's own verification commands, run on GitHub.
+#
+# Nothing here is new: these are the commands this project is already verified
+# with by hand, in the same order, with the same environment variables.
+#   - `npm run check` — the syntax check over the four entry points.
+#   - `SMOKE_REQUIRE_BROWSER=1 npm test` — the six suites that
+#     docs/RELEASE_CHECKLIST.md section 1 gates a release on.
+# Sections 2-5 of that checklist (docker build, the container verification
+# table, packaging, publishing) are still done by hand at release time. This
+# workflow does not replace them and does not build the image.
+name: CI
+
+on:
+  # Pushes to main, and every pull request. A pull request branch is already
+  # covered by the pull_request event, so push is limited to main to avoid
+  # running the same commit twice.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The syntax check. It needs the dependency tree but no browser, so it
+  # reports in well under a minute and fails fast on a broken edit.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json engines: node >=22.
+          node-version: '22'
+          cache: npm
+
+      # npm ci installs the exact resolved tree from package-lock.json, the way
+      # the Dockerfile does. npm install would re-resolve the ranges.
+      - run: npm ci
+
+      - run: npm run check
+
+  # The full suite: smoke, MCP compatibility, MCP resilience, session capacity,
+  # offline diagnostics, offline UI. Every one of them boots the real server on
+  # a scratch port with scratch data directories and contacts no external
+  # service, so they run as-is on a hosted runner.
+  test:
+    runs-on: ubuntu-latest
+    # Measured at 3m15s on this machine with the browser already downloaded;
+    # the download itself takes a few minutes more on a cold runner.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # The suites drive real browser sessions. Without chromium the
+      # browser-dependent smoke checks report SKIP instead of running, which is
+      # why the release checklist passes SMOKE_REQUIRE_BROWSER=1 — a missing
+      # browser has to be a failure, not a silent pass. --with-deps adds the
+      # system libraries the hosted image does not ship.
+      - run: npx playwright install --with-deps chromium
+
+      # Exactly the release-checklist command: reporting, but not yet gating.
+      #
+      # On this revision the suite is green but not reliably green. Three runs
+      # of it here (2026-10-18, v0.17.0, idle machine): `150 passed, 0 failed,
+      # 0 skipped` twice, then `149 passed, 1 failed` on the third —
+      #   FAIL  a run records per-step durations and the step that failed —
+      #   negative step duration: [... "durationMs":-203 ...]
+      # That is a defect that predates this workflow: the API passes a
+      # Playwright step duration through unclamped. Requiring the job would
+      # red-X pull requests at random for it, so the failure is reported
+      # instead of enforced.
+      #
+      # Promotion: once the negative duration is clamped, drop the
+      # continue-on-error below and this becomes the real gate. Also watch "a
+      # person can record and edit a scenario from the playground page" — it
+      # passed 3 of 3 here but has failed on a loaded machine before.
+      - run: npm test
+        continue-on-error: true
+        env:
+          SMOKE_REQUIRE_BROWSER: '1'
